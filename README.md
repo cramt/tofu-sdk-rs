@@ -69,34 +69,43 @@ schema boilerplate, no stringly-typed field plumbing.
 
 ## Status
 
-This is an early, in-progress implementation.
+The original 5-phase MVP is complete: a plain Rust struct plus a `Resource`
+impl is a working provider, exercised end-to-end against **real OpenTofu**
+(`apply` / `plan` / `destroy` / replacement). It is not yet production-hardened.
 
 - **Phase 1 ✅** — reflection → provider IR → `tfplugin6` schema emission
 - **Phase 2 ✅** — `tfplugin6` gRPC server, go-plugin handshake, auto-mTLS,
   `GetProviderSchema` (verified end-to-end against real OpenTofu)
-- **Phase 3 ✅** — `cty` `DynamicValue` msgpack codec (known/unknown/null) and
-  typed encode (Rust value → dynamic value via reflection); typed decode folds
-  into Phase 4
-- **Phase 4 ✅** — the `Resource` trait (create/read/update/delete), typed
-  decode, and the full lifecycle (`ConfigureProvider`, validation,
-  `UpgradeResourceState`, `PlanResourceChange`, `ReadResource`,
-  `ApplyResourceChange`) — verified by a real `tofu apply`/`destroy` test
+- **Phase 3 ✅** — `cty` `DynamicValue` codec (msgpack + JSON, known/unknown/null)
+  and typed encode/decode between Rust values and the dynamic value tree
+- **Phase 4 ✅** — the `Resource` trait (create/read/update/delete) and the full
+  lifecycle (`ConfigureProvider`, validation, `UpgradeResourceState`,
+  `PlanResourceChange`, `ReadResource`, `ApplyResourceChange`) — verified by a
+  real `tofu apply`/`destroy` test
 - **Phase 5 ✅** — planning engine: changing a `force_new` attribute emits
   `requires_replace` (destroy + create), computed attributes go unknown on
   replacement — verified by a real `tofu` replacement test
+
+### Not yet implemented
+
+Data sources, provider configuration plumbed into handlers (`ConfigureProvider`
+is currently a no-op), nested blocks end-to-end, functions, ephemeral resources,
+import/move, and a `TfValue<T>` field wrapper to preserve known/unknown/null
+through decode (today `Unknown` decodes to the type's zero value). Numbers are
+held as `f64`. Not all `cty` corner cases are covered.
 
 ## Workspace layout
 
 | Crate | Role |
 |-------|------|
-| `terraform-value` | The `cty` type system and `TfValue` (known/unknown/null) |
+| `terraform-value` | The `cty` type system, the dynamic `Value` tree, and `TfValue` (known/unknown/null) |
 | `terraform-ir` | Backend-agnostic provider IR (the stable internal contract) |
 | `terraform-attrs` | The `#[facet(terraform::…)]` attribute namespace |
 | `terraform-reflect` | `facet::Shape` → IR |
 | `terraform-tfplugin6` | Vendored protocol + IR → Terraform schema emitter + gRPC service |
-| `terraform-runtime` | Provider builder, gRPC service impl, handshake/serve |
+| `terraform-runtime` | Provider/`Resource` API, gRPC service impl, planning, handshake/serve |
 | `terraform-provider` | The public, author-facing facade |
-| `terraform-codec` | DynamicValue codecs (Phase 3) |
+| `terraform-codec` | `DynamicValue` codec (cty msgpack/JSON) + typed encode/decode |
 | `terraform-macros` | Reserved for convenience derives |
 | `example-aws` | A minimal example provider + the OpenTofu contract test |
 
