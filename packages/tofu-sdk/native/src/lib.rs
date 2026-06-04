@@ -23,8 +23,8 @@ use napi_derive::napi;
 use terraform_codec::{decode_json, encode_json};
 use terraform_ir::{AttributeSchema, Block};
 use terraform_runtime::{
-    async_trait, serve as serve_provider, Diag, Diagnostics, DynDataSource, DynResource,
-    Provider as RtProvider,
+    async_trait, serve as serve_provider, Diag, Diagnostics, DynConfigure, DynDataSource,
+    DynResource, Provider as RtProvider,
 };
 use terraform_value::{Type, Value};
 
@@ -191,6 +191,20 @@ impl DynDataSource for JsDataSource {
     }
 }
 
+/// The provider-configure callback: a single async JS handler that receives the
+/// decoded provider config (and sets up JS-side state the handlers read).
+struct JsConfigure {
+    configure: Handler,
+}
+
+#[async_trait]
+impl DynConfigure for JsConfigure {
+    async fn configure(&self, config: Value) -> std::result::Result<(), Diagnostics> {
+        call_handler(&self.configure, &config, "configure").await?;
+        Ok(())
+    }
+}
+
 // --- the JS-facing provider -------------------------------------------------
 
 /// A registered resource, ready to hand to the builder at serve time.
@@ -207,11 +221,18 @@ struct DataSourceReg {
     handler: Arc<dyn DynDataSource>,
 }
 
+/// The provider-level config block and its configure handler.
+struct ProviderConfigReg {
+    block: Block,
+    handler: Arc<dyn DynConfigure>,
+}
+
 /// The provider definition assembled from JS, then served over tfplugin6.
 #[napi]
 pub struct Provider {
     resources: Vec<ResourceReg>,
     data_sources: Vec<DataSourceReg>,
+    config: Option<ProviderConfigReg>,
 }
 
 fn napi_err(e: impl std::fmt::Display) -> Error {
@@ -228,7 +249,25 @@ impl Provider {
         Provider {
             resources: Vec::new(),
             data_sources: Vec::new(),
+            config: None,
         }
+    }
+
+    /// Declare the provider's configuration block and the async `configure`
+    /// handler that receives it on `ConfigureProvider`. The handler typically
+    /// stores state the resource/data-source handlers close over.
+    #[napi]
+    pub fn config(
+        &mut self,
+        schema_json: String,
+        configure: ThreadsafeFunction<String, Promise<String>>,
+    ) -> Result<()> {
+        let block = block_from_schema_json(&schema_json).map_err(napi_err)?;
+        self.config = Some(ProviderConfigReg {
+            block,
+            handler: Arc::new(JsConfigure { configure }),
+        });
+        Ok(())
     }
 
     /// Register a managed resource: its `type_name`, a schema description
@@ -285,6 +324,11 @@ impl Provider {
     #[napi]
     pub async fn serve(&self) -> Result<()> {
         let mut builder = RtProvider::builder();
+        if let Some(cfg) = &self.config {
+            builder = builder
+                .dyn_provider_config(cfg.block.clone())
+                .dyn_configure(Arc::clone(&cfg.handler));
+        }
         for r in &self.resources {
             builder = builder.dyn_resource(r.name.clone(), r.block.clone(), Arc::clone(&r.handler));
         }

@@ -33,10 +33,22 @@ use terraform_reflect::{
 use terraform_value::{Type, Value};
 use tokio::sync::OnceCell;
 
+use async_trait::async_trait;
+
 use crate::data_source::{
     DataSource, DataSourceAdapter, DataSourceList, DataSourceListAdapter, DynDataSource,
 };
 use crate::resource::{Diag, Diagnostics, DynResource, Resource, ResourceAdapter};
+
+/// An erased provider-configure callback, the dynamic-seam counterpart to
+/// [`ProviderBuilder::configure`]. It runs side effects from the decoded provider
+/// config (e.g. a non-Rust frontend setting up its own client/state); unlike the
+/// typed `configure`, it produces no Rust meta. Paired with
+/// [`ProviderBuilder::dyn_provider_config`].
+#[async_trait]
+pub trait DynConfigure: Send + Sync {
+    async fn configure(&self, config: Value) -> Result<(), Diagnostics>;
+}
 
 /// A `Send` boxed future, the erased form of a handler/closure's async result.
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -104,6 +116,9 @@ pub struct Provider {
     configure: Option<Arc<ConfigureFn>>,
     /// The meta-backed handlers, populated once `ConfigureProvider` runs.
     configured: Arc<OnceCell<Configured>>,
+    /// A dynamic-seam configure callback (e.g. the Node binding), run on
+    /// `ConfigureProvider`. Independent of the typed `configure` above.
+    dyn_configure: Option<Arc<dyn DynConfigure>>,
 }
 
 impl Provider {
@@ -174,12 +189,16 @@ impl Provider {
     /// shared meta and meta-backed handlers exactly once. A no-op (and `Ok`) for
     /// providers without a `configure` step.
     pub(crate) async fn configure(&self, config: Value) -> Result<(), Diagnostics> {
-        let Some(configure) = self.configure.clone() else {
-            return Ok(());
-        };
-        self.configured
-            .get_or_try_init(|| configure(config))
-            .await?;
+        // Dynamic-seam callback first (it sets up the frontend's own state that
+        // the eager handlers read), then the typed meta build, if any.
+        if let Some(dyn_configure) = &self.dyn_configure {
+            dyn_configure.configure(config.clone()).await?;
+        }
+        if let Some(configure) = self.configure.clone() {
+            self.configured
+                .get_or_try_init(|| configure(config))
+                .await?;
+        }
         Ok(())
     }
 }
@@ -194,6 +213,7 @@ pub struct ProviderBuilder<M = ()> {
     factories: Vec<(String, ResourceFactory<M>)>,
     data_factories: Vec<(String, DataSourceFactory<M>)>,
     configure: Option<MetaFn<M>>,
+    dyn_configure: Option<Arc<dyn DynConfigure>>,
     error: Option<BuildError>,
 }
 
@@ -207,6 +227,7 @@ impl<M> Default for ProviderBuilder<M> {
             factories: Vec::new(),
             data_factories: Vec::new(),
             configure: None,
+            dyn_configure: None,
             error: None,
         }
     }
@@ -363,6 +384,23 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
     // the seam non-Rust frontends use (e.g. the Node binding builds the IR from
     // a JS schema description and implements [`DynResource`] by calling into JS).
 
+    /// Set the provider-level configuration block from a hand-built schema,
+    /// bypassing facet reflection. Pair with [`ProviderBuilder::dyn_configure`]
+    /// to receive the decoded config on `ConfigureProvider`.
+    pub fn dyn_provider_config(mut self, block: Block) -> Self {
+        self.provider = Some(block);
+        self
+    }
+
+    /// Register a dynamic-seam configure callback, run with the decoded provider
+    /// config on `ConfigureProvider`. The dynamic counterpart to
+    /// [`ProviderBuilder::configure`] — it produces no Rust meta (a non-Rust
+    /// frontend manages its own state).
+    pub fn dyn_configure(mut self, handler: Arc<dyn DynConfigure>) -> Self {
+        self.dyn_configure = Some(handler);
+        self
+    }
+
     /// Register a managed resource from a hand-built schema `block` and an
     /// erased [`DynResource`] handler, bypassing facet reflection.
     pub fn dyn_resource(
@@ -448,6 +486,7 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
             config_ty,
             configure,
             configured: Arc::new(OnceCell::new()),
+            dyn_configure: self.dyn_configure,
         })
     }
 
@@ -499,6 +538,7 @@ impl ProviderBuilder<()> {
             factories: Vec::new(),
             data_factories: Vec::new(),
             configure: Some(meta_fn),
+            dyn_configure: self.dyn_configure,
             error: self.error,
         }
     }

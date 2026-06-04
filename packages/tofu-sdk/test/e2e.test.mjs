@@ -67,6 +67,10 @@ terraform {
   }
 }
 
+provider "aws" {
+  region = "eu-west-1"
+}
+
 variable "bucket_name" {
   type    = string
   default = "e2e-bucket"
@@ -85,6 +89,10 @@ output "arn" {
   value = aws_s3_bucket.test.arn
 }
 
+output "region" {
+  value = aws_s3_bucket.test.region
+}
+
 output "data_arn" {
   value = data.aws_s3_bucket.looked_up.arn
 }
@@ -100,6 +108,7 @@ output "data_arn" {
     assert.equal(out.status, 0, out.stderr);
     const outputs = JSON.parse(out.stdout);
     assert.equal(outputs.arn.value, "arn:aws:s3:::e2e-bucket", "resource computed arn");
+    assert.equal(outputs.region.value, "eu-west-1", "configured provider region reached the resource");
     assert.equal(outputs.data_arn.value, "arn:aws:s3:::queried", "data source computed arn");
 
     // Renaming the force_new `name` must plan a replacement.

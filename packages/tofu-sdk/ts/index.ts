@@ -32,6 +32,7 @@ import { join } from "node:path";
 type RawHandler = (err: Error | null, input: string) => Promise<string>;
 
 interface RawProvider {
+  config(schemaJson: string, configure: RawHandler): void;
   resource(
     typeName: string,
     schemaJson: string,
@@ -111,6 +112,16 @@ export interface DataSource<TConfig, TState = TConfig> {
   read(config: TConfig): Promise<TState>;
 }
 
+/**
+ * Provider-level configuration. `configure` runs once when the host configures
+ * the provider; use it to set up state (clients, credentials, defaults) that
+ * your resource and data-source handlers close over.
+ */
+export interface ProviderConfig<T> {
+  schema: Schema;
+  configure(config: T): Promise<void>;
+}
+
 function schemaToJson(schema: Schema): string {
   const attributes = Object.entries(schema).map(([name, a]) => ({
     name,
@@ -137,6 +148,16 @@ function adapt<A, R>(fn: (arg: A) => Promise<R>): RawHandler {
 /** A Terraform/OpenTofu provider authored in TypeScript. */
 export class Provider {
   private readonly raw: RawProvider = new native.Provider();
+
+  /** Declare the provider's configuration block and its `configure` handler. */
+  config<T extends Record<string, unknown>>(def: ProviderConfig<T>): this {
+    const configure = adapt(async (cfg: T) => {
+      await def.configure(cfg);
+      return null;
+    });
+    this.raw.config(schemaToJson(def.schema), configure);
+    return this;
+  }
 
   /** Register a managed resource under `typeName`. */
   resource<T extends Record<string, unknown>>(

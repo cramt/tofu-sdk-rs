@@ -118,6 +118,34 @@ Nested blocks end-to-end, functions, ephemeral resources, import/move, and a
 | `terraform-macros` | Reserved for convenience derives |
 | `example-aws` | A minimal example provider + the OpenTofu `tofu test` e2e suite |
 
+| Package | Role |
+|---------|------|
+| `packages/tofu-sdk` (`@tofu-sdk/core`) | Write providers in **TypeScript** — a napi-rs Node addon over the dynamic seam (`native/`) plus a typed wrapper |
+
+## Writing a provider in TypeScript
+
+The Rust core is just one frontend on top of the `terraform-ir` + `Value` seam;
+`@tofu-sdk/core` is another. You describe resources/data sources with a schema
+and async handlers, and the Rust runtime handles the protocol:
+
+```ts
+import { Provider } from "@tofu-sdk/core";
+
+await new Provider()
+  .resource("aws_s3_bucket", {
+    schema: {
+      name: { type: "string", required: true, forceNew: true },
+      arn: { type: "string", computed: true },
+    },
+    async create(planned) {
+      return { ...planned, arn: `arn:aws:s3:::${planned.name}` };
+    },
+  })
+  .serve();
+```
+
+See [`packages/tofu-sdk`](packages/tofu-sdk) (`pnpm build`, `pnpm test`).
+
 ## Developing
 
 A Nix flake provides the full toolchain (Rust, `protoc`, OpenTofu):

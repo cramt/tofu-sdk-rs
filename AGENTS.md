@@ -51,10 +51,35 @@ terraform-runtime   Resource trait, gRPC service impl, planning, handshake/serve
 terraform-provider  public author-facing facade (re-exports)
 terraform-macros    reserved (empty)
 example-aws         example provider binary + the real-tofu contract tests
+
+packages/tofu-sdk   @tofu-sdk/core — write providers in TypeScript
+  native/           napi-rs Node addon (cdylib) over the dynamic seam
+  ts/               typed wrapper compiled to dist/
 ```
 
 Keep `terraform-ir` free of Terraform protocol concerns. All Terraform-specific
 mapping lives in `terraform-tfplugin6` (the "backend").
+
+## Frontends & the dynamic seam
+
+The facet path (`terraform-reflect` + the typed `Resource`/`DataSource` traits)
+is **one frontend** over a backend-agnostic seam: the IR (`terraform-ir`), the
+dynamic `Value` (`terraform-value`), the JSON/msgpack codec (`terraform-codec`,
+incl. `encode_json`/`decode_json`), and the erased handler traits
+(`DynResource`/`DynDataSource`/`DynConfigure`). Nothing below the erasure ever
+sees a facet-derived user type — `plan.rs` and `service.rs` operate purely on IR
++ `Value`.
+
+`ProviderBuilder` exposes that seam directly: `dyn_resource` / `dyn_data_source`
+(hand-built `Block` + erased handler) and `dyn_provider_config` / `dyn_configure`.
+The **Node binding** (`packages/tofu-sdk/native`) is built entirely on it — it
+builds the IR from a JS schema description and implements the erased traits by
+calling async JS handlers over `ThreadsafeFunction<String, Promise<String>>`,
+marshalling `Value` ⇄ JSON through facet (never hand-rolled). All schema shaping
+(singular/plural data sources, search keys) stays in JS; Rust stays
+schema-agnostic. Build/test it with `pnpm build` / `pnpm test` inside the dev
+shell (it shells out to `cargo`, which needs `PROTOC`); `pnpm test` drives a real
+`tofu` through `examples/aws-provider.cjs`.
 
 ## Conventions & gotchas (read before changing these)
 
