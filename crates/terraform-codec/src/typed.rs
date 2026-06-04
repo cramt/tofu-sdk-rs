@@ -41,7 +41,7 @@ pub enum TypedError {
 }
 
 /// Reflect a Rust value into a [`Value`].
-pub fn to_value<'f, T: Facet<'f>>(value: &'f T) -> Result<Value, TypedError> {
+pub fn to_value<T: Facet<'static>>(value: &T) -> Result<Value, TypedError> {
     peek_to_value(Peek::new(value))
 }
 

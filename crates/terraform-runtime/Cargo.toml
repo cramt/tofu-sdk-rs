@@ -11,8 +11,11 @@ facet = { workspace = true }
 terraform-value = { workspace = true }
 terraform-ir = { workspace = true }
 terraform-reflect = { workspace = true }
+terraform-codec = { workspace = true }
 terraform-tfplugin6 = { workspace = true }
 thiserror = { workspace = true }
+serde_json = { workspace = true }
+async-trait = "0.1"
 
 tonic = { version = "0.14", default-features = false, features = [
     "server",

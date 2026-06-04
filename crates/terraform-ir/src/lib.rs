@@ -11,7 +11,7 @@
 //!                                                  ->  (future) TS / Ruby / WASM
 //! ```
 
-use terraform_value::Type;
+use terraform_value::{ObjectAttr, Type};
 
 /// The complete schema for a provider: its own configuration plus every resource
 /// and data source it exposes.
@@ -53,6 +53,42 @@ pub struct Block {
     pub attributes: Vec<AttributeSchema>,
     /// Nested blocks (repeatable or singleton sub-structures).
     pub nested_blocks: Vec<NestedBlock>,
+}
+
+impl Block {
+    /// The `cty` object type a value of this block takes on the wire.
+    ///
+    /// Used to drive the value codec for this block's `DynamicValue`s. An
+    /// attribute is optional in the object type unless it is required; each
+    /// nested block contributes an attribute typed by its nesting mode.
+    pub fn cty_type(&self) -> Type {
+        let mut attrs: Vec<ObjectAttr> = self
+            .attributes
+            .iter()
+            .map(|a| ObjectAttr {
+                name: a.name.clone(),
+                ty: a.ty.clone(),
+                optional: !a.required,
+            })
+            .collect();
+
+        for nested in &self.nested_blocks {
+            let inner = nested.block.cty_type();
+            let ty = match nested.nesting {
+                NestingMode::Single => inner,
+                NestingMode::List => Type::list(inner),
+                NestingMode::Set => Type::set(inner),
+                NestingMode::Map => Type::map(inner),
+            };
+            attrs.push(ObjectAttr {
+                name: nested.name.clone(),
+                ty,
+                optional: true,
+            });
+        }
+
+        Type::Object(attrs)
+    }
 }
 
 /// A single attribute within a [`Block`].

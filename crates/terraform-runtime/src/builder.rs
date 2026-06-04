@@ -1,16 +1,18 @@
 //! The provider definition and its builder.
 //!
 //! Authors describe their provider declaratively — registering a config type,
-//! resources, and data sources, each by Rust type + Terraform type name — and
-//! the builder reflects them into the backend-agnostic
-//! [`terraform_ir::ProviderSchema`] up front. The resulting [`Provider`] is what
-//! the gRPC service answers from.
+//! resources (each with a handler), and data sources — and the builder reflects
+//! the schema up front while keeping the resource handlers for dispatch.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use facet::Facet;
 use terraform_ir::{Block, ProviderSchema};
 use terraform_reflect::{reflect_block, reflect_data_source, reflect_resource, ReflectError};
+use terraform_value::Type;
+
+use crate::resource::{DynResource, Resource, ResourceAdapter};
 
 /// Error returned when a provider definition fails to build.
 #[derive(Debug, thiserror::Error)]
@@ -27,9 +29,10 @@ pub enum BuildError {
 }
 
 /// A fully-described provider, ready to be served.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Provider {
     schema: Arc<ProviderSchema>,
+    resources: Arc<HashMap<String, Arc<dyn DynResource>>>,
 }
 
 impl Provider {
@@ -42,6 +45,25 @@ impl Provider {
     pub fn schema(&self) -> &ProviderSchema {
         &self.schema
     }
+
+    /// The handler for resource type `name`, if registered.
+    pub(crate) fn resource_handler(&self, name: &str) -> Option<&Arc<dyn DynResource>> {
+        self.resources.get(name)
+    }
+
+    /// The `cty` object type of resource `name`, derived from its schema block.
+    pub(crate) fn resource_cty(&self, name: &str) -> Option<Type> {
+        self.resource_block(name).map(Block::cty_type)
+    }
+
+    /// The schema block of resource `name`.
+    pub(crate) fn resource_block(&self, name: &str) -> Option<&Block> {
+        self.schema
+            .resources
+            .iter()
+            .find(|r| r.name == name)
+            .map(|r| &r.block)
+    }
 }
 
 /// Incremental builder for a [`Provider`].
@@ -49,6 +71,7 @@ impl Provider {
 pub struct ProviderBuilder {
     provider: Option<Block>,
     schema: ProviderSchema,
+    resources: HashMap<String, Arc<dyn DynResource>>,
     error: Option<BuildError>,
 }
 
@@ -62,17 +85,21 @@ impl ProviderBuilder {
         self
     }
 
-    /// Register a managed resource type under `name` (e.g. `aws_s3_bucket`).
-    pub fn resource<T: Facet<'static>>(mut self, name: impl Into<String>) -> Self {
+    /// Register a managed resource type under `name` with its `handler`.
+    pub fn resource<R: Resource>(mut self, name: impl Into<String>, handler: R) -> Self {
         let name = name.into();
-        match reflect_resource::<T>(name.clone()) {
-            Ok(resource) => self.schema.resources.push(resource),
+        match reflect_resource::<R::Model>(name.clone()) {
+            Ok(resource) => {
+                self.schema.resources.push(resource);
+                self.resources
+                    .insert(name, ResourceAdapter::erased(handler));
+            }
             Err(source) => self.record(name, source),
         }
         self
     }
 
-    /// Register a data source type under `name`.
+    /// Register a data source type under `name` (schema only for now).
     pub fn data_source<T: Facet<'static>>(mut self, name: impl Into<String>) -> Self {
         let name = name.into();
         match reflect_data_source::<T>(name.clone()) {
@@ -90,6 +117,7 @@ impl ProviderBuilder {
         self.schema.provider = self.provider;
         Ok(Provider {
             schema: Arc::new(self.schema),
+            resources: Arc::new(self.resources),
         })
     }
 

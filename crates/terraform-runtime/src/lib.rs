@@ -10,10 +10,16 @@
 
 mod builder;
 pub mod handshake;
+mod resource;
 mod serve;
 mod service;
 mod tls;
 
 pub use builder::{BuildError, Provider, ProviderBuilder};
+pub use resource::{Resource, ResourceError};
 pub use serve::{serve, ServeError};
 pub use service::ProviderService;
+
+/// Re-export of `async_trait` so authors can `#[terraform_runtime::async_trait]`
+/// their `impl Resource`.
+pub use async_trait::async_trait;

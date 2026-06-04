@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use facet::Facet;
 use serde_json::{json, Value};
 use terraform_attrs as terraform;
-use terraform_runtime::{Provider, ProviderService};
+use terraform_runtime::{async_trait, Provider, ProviderService, Resource, ResourceError};
 use terraform_tfplugin6::tfplugin6::{self, provider_server::Provider as _};
 use tonic::{Code, Request};
 
@@ -27,6 +27,17 @@ struct Bucket {
     tags: HashMap<String, String>,
 }
 
+struct BucketResource;
+
+#[async_trait]
+impl Resource for BucketResource {
+    type Model = Bucket;
+
+    async fn create(&self, planned: Bucket) -> Result<Bucket, ResourceError> {
+        Ok(planned)
+    }
+}
+
 #[derive(Facet)]
 #[facet(terraform::data_source)]
 #[allow(dead_code)]
@@ -39,7 +50,7 @@ struct BucketLookup {
 
 fn service() -> ProviderService {
     let provider = Provider::builder()
-        .resource::<Bucket>("aws_s3_bucket")
+        .resource("aws_s3_bucket", BucketResource)
         .data_source::<BucketLookup>("aws_s3_bucket")
         .build()
         .expect("provider builds");
@@ -100,13 +111,109 @@ async fn get_metadata_lists_type_names() {
 #[tokio::test]
 async fn unimplemented_rpc_returns_unimplemented() {
     let svc = service();
+    // Data sources are not implemented yet.
     let status = svc
+        .read_data_source(Request::new(tfplugin6::read_data_source::Request::default()))
+        .await
+        .expect_err("read_data_source is not implemented yet");
+    assert_eq!(status.code(), Code::Unimplemented);
+}
+
+#[tokio::test]
+async fn configure_provider_accepts() {
+    let svc = service();
+    let resp = svc
         .configure_provider(Request::new(
             tfplugin6::configure_provider::Request::default(),
         ))
         .await
-        .expect_err("configure_provider is not implemented yet");
-    assert_eq!(status.code(), Code::Unimplemented);
+        .expect("configure succeeds")
+        .into_inner();
+    assert!(resp.diagnostics.is_empty());
+}
+
+#[tokio::test]
+async fn plan_then_apply_create_round_trips() {
+    let svc = service();
+
+    // Build a proposed new state: name set, computed arn null (as Terraform sends).
+    let cty_ty = terraform_value::Type::Object(vec![
+        terraform_value::ObjectAttr {
+            name: "name".into(),
+            ty: terraform_value::Type::String,
+            optional: false,
+        },
+        terraform_value::ObjectAttr {
+            name: "arn".into(),
+            ty: terraform_value::Type::String,
+            optional: true,
+        },
+        terraform_value::ObjectAttr {
+            name: "tags".into(),
+            ty: terraform_value::Type::map(terraform_value::Type::String),
+            optional: true,
+        },
+    ]);
+    let mut obj = std::collections::BTreeMap::new();
+    obj.insert(
+        "name".to_string(),
+        terraform_value::Value::String("b1".into()),
+    );
+    obj.insert("arn".to_string(), terraform_value::Value::Null);
+    obj.insert(
+        "tags".to_string(),
+        terraform_value::Value::Map(Default::default()),
+    );
+    let proposed = terraform_value::Value::Object(obj);
+    let proposed_dv = tfplugin6::DynamicValue {
+        msgpack: terraform_codec::encode_msgpack(&proposed, &cty_ty).unwrap(),
+        json: vec![],
+    };
+
+    // Plan: computed arn should become unknown.
+    let plan = svc
+        .plan_resource_change(Request::new(tfplugin6::plan_resource_change::Request {
+            type_name: "aws_s3_bucket".into(),
+            proposed_new_state: Some(proposed_dv.clone()),
+            ..Default::default()
+        }))
+        .await
+        .expect("plan")
+        .into_inner();
+    assert!(plan.diagnostics.is_empty());
+    let planned_state = plan.planned_state.expect("planned state");
+    let planned_value = terraform_codec::decode_msgpack(&planned_state.msgpack, &cty_ty).unwrap();
+    if let terraform_value::Value::Object(fields) = &planned_value {
+        assert!(
+            fields["arn"].is_unknown(),
+            "computed arn planned as unknown"
+        );
+    } else {
+        panic!("planned state should be an object");
+    }
+
+    // Apply (create): prior null, planned from the plan above.
+    let apply = svc
+        .apply_resource_change(Request::new(tfplugin6::apply_resource_change::Request {
+            type_name: "aws_s3_bucket".into(),
+            prior_state: None,
+            planned_state: Some(planned_state),
+            ..Default::default()
+        }))
+        .await
+        .expect("apply")
+        .into_inner();
+    assert!(apply.diagnostics.is_empty(), "{:?}", apply.diagnostics);
+    let new_state = apply.new_state.expect("new state");
+    let new_value = terraform_codec::decode_msgpack(&new_state.msgpack, &cty_ty).unwrap();
+    if let terraform_value::Value::Object(fields) = new_value {
+        assert_eq!(fields["name"], terraform_value::Value::String("b1".into()));
+        // The handler echoed planned; arn was unknown -> decoded as "" -> echoed.
+        // (A real handler would compute it; this confirms the round trip works.)
+        assert!(matches!(fields["arn"], terraform_value::Value::String(_)));
+    } else {
+        panic!("new state should be an object");
+    }
 }
 
 /// Decode the `cty` JSON type-constraint bytes from an attribute's `type` field.

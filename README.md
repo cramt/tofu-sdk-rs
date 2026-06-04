@@ -24,28 +24,38 @@ other backends later and keeps the dynamic protocol details out of your code.
 ```rust
 use facet::Facet;
 use terraform_provider::terraform;
-use terraform_runtime::{serve, Provider};
+use terraform_runtime::{async_trait, serve, Provider, Resource, ResourceError};
 
+/// The resource's schema, reflected from a plain Rust struct.
 #[derive(Facet)]
 #[facet(terraform::resource)]
 struct Bucket {
-    /// The globally-unique name of the bucket.
     #[facet(terraform::required)]
     #[facet(terraform::force_new)]
     name: String,
 
-    /// The ARN assigned after creation.
+    /// Computed: derived from `name` during create.
     #[facet(terraform::computed)]
     arn: String,
+}
 
-    /// Free-form tags.
-    tags: std::collections::HashMap<String, String>,
+struct BucketResource;
+
+#[async_trait]
+impl Resource for BucketResource {
+    type Model = Bucket;
+
+    async fn create(&self, mut planned: Bucket) -> Result<Bucket, ResourceError> {
+        planned.arn = format!("arn:aws:s3:::{}", planned.name);
+        Ok(planned)
+    }
+    // read defaults to a passthrough, delete to a no-op.
 }
 
 #[tokio::main]
 async fn main() {
     let provider = Provider::builder()
-        .resource::<Bucket>("aws_s3_bucket")
+        .resource("aws_s3_bucket", BucketResource)
         .build()
         .expect("provider definition is valid");
     serve(provider).await.expect("serve");
@@ -53,7 +63,8 @@ async fn main() {
 ```
 
 Point OpenTofu at the built binary with a `dev_overrides` CLI config and
-`tofu providers schema -json` returns the schema reflected from `Bucket` — no
+`tofu apply` creates the resource — the schema is reflected from `Bucket`, and
+the planned/prior state is decoded into `Bucket` and back automatically. No
 schema boilerplate, no stringly-typed field plumbing.
 
 ## Status
@@ -66,9 +77,12 @@ This is an early, in-progress implementation.
 - **Phase 3 ✅** — `cty` `DynamicValue` msgpack codec (known/unknown/null) and
   typed encode (Rust value → dynamic value via reflection); typed decode folds
   into Phase 4
-- **Phase 4 🚧** — the `Resource` trait, typed decode, `ConfigureProvider`,
-  `ReadResource`, `ApplyResourceChange`
-- **Phase 5** — planning engine (replacement semantics, unknown propagation)
+- **Phase 4 ✅** — the `Resource` trait (create/read/update/delete), typed
+  decode, and the full lifecycle (`ConfigureProvider`, validation,
+  `UpgradeResourceState`, `PlanResourceChange`, `ReadResource`,
+  `ApplyResourceChange`) — verified by a real `tofu apply`/`destroy` test
+- **Phase 5 🚧** — planning engine: `force_new` → replacement, unknown
+  propagation, richer plan/diff semantics
 
 ## Workspace layout
 
