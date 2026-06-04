@@ -26,11 +26,16 @@ use std::sync::Arc;
 use facet::Facet;
 use terraform_codec::from_value;
 use terraform_ir::{Block, ProviderSchema};
-use terraform_reflect::{reflect_block, reflect_data_source, reflect_resource, ReflectError};
+use terraform_reflect::{
+    reflect_block, reflect_data_source, reflect_data_source_list, reflect_resource,
+    PluralDataSource, ReflectError,
+};
 use terraform_value::{Type, Value};
 use tokio::sync::OnceCell;
 
-use crate::data_source::{DataSource, DataSourceAdapter, DynDataSource};
+use crate::data_source::{
+    DataSource, DataSourceAdapter, DataSourceList, DataSourceListAdapter, DynDataSource,
+};
 use crate::resource::{Diag, Diagnostics, DynResource, Resource, ResourceAdapter};
 
 /// A `Send` boxed future, the erased form of a handler/closure's async result.
@@ -290,6 +295,58 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
                 self.schema.data_sources.push(data_source);
                 let make: DataSourceFactory<M> =
                     Box::new(move |meta: Arc<M>| DataSourceAdapter::erased(factory(meta)));
+                self.data_factories.push((name, make));
+            }
+            Err(source) => self.record(name, source),
+        }
+        self
+    }
+
+    /// Register a **plural** data source under `name` with its `handler`: a
+    /// lookup by `search_key(shared)` fields that resolves to a `results` list.
+    /// Use this for data sources that need no provider configuration; for ones
+    /// that need the configured meta, use [`ProviderBuilder::data_source_list_with`].
+    pub fn data_source_list<D: DataSourceList>(
+        mut self,
+        name: impl Into<String>,
+        handler: D,
+    ) -> Self {
+        let name = name.into();
+        match reflect_data_source_list::<D::Model>(name.clone()) {
+            Ok(PluralDataSource {
+                schema,
+                shared_keys,
+            }) => {
+                self.schema.data_sources.push(schema);
+                self.data_sources
+                    .insert(name, DataSourceListAdapter::erased(handler, shared_keys));
+            }
+            Err(source) => self.record(name, source),
+        }
+        self
+    }
+
+    /// Register a **plural** data source whose handler is built from the
+    /// configured provider meta. `factory` receives the shared `Arc<M>` produced
+    /// by [`ProviderBuilder::configure`] and returns the data source handler.
+    ///
+    /// Requires a [`ProviderBuilder::configure`] step (which fixes `M`); building
+    /// without one is a [`BuildError::MissingConfigure`].
+    pub fn data_source_list_with<D, F>(mut self, name: impl Into<String>, factory: F) -> Self
+    where
+        D: DataSourceList,
+        F: Fn(Arc<M>) -> D + Send + Sync + 'static,
+    {
+        let name = name.into();
+        match reflect_data_source_list::<D::Model>(name.clone()) {
+            Ok(PluralDataSource {
+                schema,
+                shared_keys,
+            }) => {
+                self.schema.data_sources.push(schema);
+                let make: DataSourceFactory<M> = Box::new(move |meta: Arc<M>| {
+                    DataSourceListAdapter::erased(factory(meta), shared_keys.clone())
+                });
                 self.data_factories.push((name, make));
             }
             Err(source) => self.record(name, source),

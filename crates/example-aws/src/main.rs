@@ -8,8 +8,14 @@
 //!
 //! It also demonstrates **provider configuration**: the provider takes an
 //! optional `region`, and `configure` turns that into a shared `AwsClient`
-//! (the *meta*) handed to the resource handler, which stamps the region onto
-//! every bucket it creates.
+//! (the *meta*) handed to every handler, which stamps the region onto every
+//! bucket it creates.
+//!
+//! Finally it demonstrates **data sources projected from the same model**: the
+//! `Bucket` struct carries both `terraform::resource` and `terraform::data_source`
+//! markers, and its `search_key` fields drive two read-only lookups — a singular
+//! `data "aws_s3_bucket"` keyed by the unique `arn` (one object) and a plural
+//! `data "aws_s3_buckets"` keyed by the generic `name` (a `results` list).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,7 +23,8 @@ use std::sync::Arc;
 use facet::Facet;
 use terraform_provider::terraform;
 use terraform_runtime::{
-    async_trait, serve, DataSource, DataSourceError, Provider, Resource, ResourceError,
+    async_trait, serve, DataSource, DataSourceError, DataSourceList, Provider, Resource,
+    ResourceError,
 };
 
 /// Provider-level configuration.
@@ -35,18 +42,31 @@ struct AwsClient {
     region: String,
 }
 
-/// An S3-bucket-like resource.
+/// An S3-bucket-like resource — and, via the same model, a data source.
+///
+/// The `#[facet(terraform::data_source)]` marker and the `search_key` fields
+/// project this one model into data sources too: looking a bucket up by its
+/// unique `arn` (`exclusive`) yields a single object, while looking up by the
+/// generic `name` (`shared`) yields a list. The resource dispositions
+/// (`required`/`force_new`/`computed`) and the data source projection are
+/// independent — a field can be computed on the resource yet an input on a data
+/// source.
 #[derive(Facet)]
 #[facet(terraform::resource)]
+#[facet(terraform::data_source)]
 #[allow(dead_code)]
 struct Bucket {
-    /// The globally-unique name of the bucket.
+    /// The globally-unique name of the bucket. A generic data source key:
+    /// looking up by name may match any number of buckets.
     #[facet(terraform::required)]
     #[facet(terraform::force_new)]
+    #[facet(terraform::search_key(shared))]
     name: String,
 
-    /// The ARN, derived from the name after creation.
+    /// The ARN, derived from the name after creation. A unique data source key:
+    /// looking up by arn matches at most one bucket.
     #[facet(terraform::computed)]
+    #[facet(terraform::search_key(exclusive))]
     arn: String,
 
     /// The region the bucket lives in, taken from provider configuration.
@@ -92,40 +112,61 @@ impl Resource for BucketResource {
     }
 }
 
-/// A read-only lookup of a bucket's derived attributes by name. It mirrors the
-/// resource's computed attributes but is queried with `data "aws_s3_bucket"`,
-/// demonstrating a meta-backed data source (it reads the configured region from
-/// the same shared `AwsClient`).
-#[derive(Facet)]
-#[facet(terraform::data_source)]
-#[allow(dead_code)]
-struct BucketLookup {
-    /// The name of the bucket to look up.
-    #[facet(terraform::required)]
-    name: String,
+/// The strip-prefix used to derive a bucket name from its ARN, and vice versa.
+const ARN_PREFIX: &str = "arn:aws:s3:::";
 
-    /// The ARN, derived from the name.
-    #[facet(terraform::computed)]
-    arn: String,
-
-    /// The region, taken from provider configuration.
-    #[facet(terraform::computed)]
-    region: String,
-}
-
-/// The handler for the `aws_s3_bucket` data source, holding the configured client.
-struct BucketDataSource {
+/// The singular `aws_s3_bucket` data source: look a bucket up by its unique
+/// `arn` (the `exclusive` search key) and resolve to one object. Shares the
+/// `Bucket` model and the configured `AwsClient` with the resource.
+struct BucketByArn {
     client: Arc<AwsClient>,
 }
 
 #[async_trait]
-impl DataSource for BucketDataSource {
-    type Model = BucketLookup;
+impl DataSource for BucketByArn {
+    type Model = Bucket;
 
-    async fn read(&self, mut config: BucketLookup) -> Result<BucketLookup, DataSourceError> {
-        config.arn = format!("arn:aws:s3:::{}", config.name);
-        config.region = self.client.region.clone();
-        Ok(config)
+    async fn read(&self, mut query: Bucket) -> Result<Bucket, DataSourceError> {
+        // The query arrives with `arn` set (the exclusive key); recover the rest.
+        query.name = query
+            .arn
+            .strip_prefix(ARN_PREFIX)
+            .unwrap_or(&query.arn)
+            .to_string();
+        query.region = self.client.region.clone();
+        query.last_action = "read".to_string();
+        Ok(query)
+    }
+}
+
+/// The plural `aws_s3_buckets` data source: look buckets up by the generic
+/// `name` (the `shared` search key) and resolve to a `results` list. The example
+/// has no backing store, so it synthesizes a couple of matches to demonstrate
+/// the list shape.
+struct BucketsByName {
+    client: Arc<AwsClient>,
+}
+
+#[async_trait]
+impl DataSourceList for BucketsByName {
+    type Model = Bucket;
+
+    async fn list(&self, query: Bucket) -> Result<Vec<Bucket>, DataSourceError> {
+        let region = self.client.region.clone();
+        let matches = ["", "-staging"]
+            .iter()
+            .map(|suffix| {
+                let name = format!("{}{suffix}", query.name);
+                Bucket {
+                    arn: format!("{ARN_PREFIX}{name}"),
+                    region: region.clone(),
+                    last_action: "read".to_string(),
+                    tags: None,
+                    name,
+                }
+            })
+            .collect();
+        Ok(matches)
     }
 }
 
@@ -141,7 +182,10 @@ async fn main() {
         .resource_with("aws_s3_bucket", |client: Arc<AwsClient>| BucketResource {
             client,
         })
-        .data_source_with("aws_s3_bucket", |client: Arc<AwsClient>| BucketDataSource {
+        .data_source_with("aws_s3_bucket", |client: Arc<AwsClient>| BucketByArn {
+            client,
+        })
+        .data_source_list_with("aws_s3_buckets", |client: Arc<AwsClient>| BucketsByName {
             client,
         })
         .build()

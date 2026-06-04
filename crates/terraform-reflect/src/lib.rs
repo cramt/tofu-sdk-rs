@@ -5,14 +5,17 @@
 //! extension attributes (declared in `terraform-attrs`) to produce a
 //! [`terraform_ir::Block`].
 //!
-//! The attributes are read positionally by string key
-//! (`field.get_attr(Some("terraform"), "required")`), so this crate does not
-//! depend on `terraform-attrs` at all for the read path — only the tests do, to
-//! exercise real derived types.
+//! Unit flags are read positionally by string key
+//! (`field.has_attr(Some("terraform"), "required")`); the one structured
+//! attribute, `search_key(...)`, is decoded via `terraform_attrs::Attr`, so this
+//! crate depends on `terraform-attrs` for that single read.
 
 mod reader;
 
-pub use reader::{reflect_block, reflect_data_source, reflect_resource, ReflectError};
+pub use reader::{
+    reflect_block, reflect_data_source, reflect_data_source_list, reflect_resource,
+    PluralDataSource, ReflectError,
+};
 
 #[cfg(test)]
 mod spike_tests {

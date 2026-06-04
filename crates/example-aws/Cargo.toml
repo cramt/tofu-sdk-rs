@@ -18,6 +18,11 @@ path = "src/main.rs"
 facet = { workspace = true }
 terraform-provider = { workspace = true }
 terraform-runtime = { workspace = true }
+# A struct-payload attribute (`search_key(...)`) expands to code that names the
+# `terraform_attrs` crate by path, so consumers that use it need it as a direct
+# dependency (the same pattern as facet's own `testattrs`). Unit attributes work
+# through the `terraform_provider::terraform` re-export alone.
+terraform-attrs = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [dev-dependencies]

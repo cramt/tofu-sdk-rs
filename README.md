@@ -89,10 +89,12 @@ impl is a working provider, exercised end-to-end against **real OpenTofu**
   config block and a `configure` closure turns it into shared state (an
   `Arc<Meta>`, e.g. an API client) handed to every resource handler — verified
   by a real `tofu` test that flows a `provider` block region into a resource
-- **Data sources ✅** — a read-only `DataSource` trait (`read`) reflected from a
-  `Model` and dispatched on `ReadDataSource`; registered eagerly
-  (`data_source`) or meta-backed (`data_source_with`) like resources — verified
-  by a real `tofu test` `data` block read
+- **Data sources ✅** — read-only lookups dispatched on `ReadDataSource`,
+  projectable from the *same* `Model` as the resource via
+  `#[facet(terraform::search_key(exclusive|shared))]`: an `exclusive` key gives a
+  singular `DataSource` (`read -> Model`, one object), a `shared` key gives a
+  plural `DataSourceList` (`list -> Vec<Model>`, a `results` list) — both
+  verified by real `tofu test` `data` reads
 
 ### Not yet implemented
 

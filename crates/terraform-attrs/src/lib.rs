@@ -19,9 +19,14 @@
 //! }
 //! ```
 //!
-//! The metadata is read back at runtime by `terraform-reflect` via
-//! `field.get_attr(Some("terraform"), "<key>")` — it does not need to name the
-//! [`Attr`] type directly, which keeps this crate a pure declaration.
+//! Unit flags are read back at runtime by `terraform-reflect` via
+//! `field.has_attr(Some("terraform"), "<key>")`; the structured [`SearchKey`]
+//! payload is decoded with
+//! `field.get_attr(Some("terraform"), "search_key").get_as::<Attr>()`.
+
+// The grammar's struct-payload codegen refers to this crate by its own path
+// (`crate_path` below), so the crate must be able to name itself.
+extern crate self as terraform_attrs;
 
 facet::define_attr_grammar! {
     ns "terraform";
@@ -46,5 +51,23 @@ facet::define_attr_grammar! {
         Resource,
         /// Marks a struct as a data source.
         DataSource,
+        /// Marks a field as a data source lookup key. The [`SearchKey`] payload
+        /// records the cardinality of a match:
+        ///
+        /// - `#[facet(terraform::search_key(exclusive))]` — the key is unique, so
+        ///   a lookup yields at most one object (a singular data source).
+        /// - `#[facet(terraform::search_key(shared))]` — the key is generic, so a
+        ///   lookup may yield any number of objects (a plural data source whose
+        ///   result is a list).
+        SearchKey(SearchKey),
+    }
+
+    /// Cardinality payload for [`Attr::SearchKey`]. Exactly one of `exclusive`
+    /// or `shared` is expected; `terraform-reflect` rejects neither/both.
+    pub struct SearchKey {
+        /// A unique key — a lookup returns at most one object.
+        pub exclusive: bool,
+        /// A generic key — a lookup may return many objects.
+        pub shared: bool,
     }
 }

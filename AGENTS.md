@@ -105,13 +105,34 @@ each handler in an erased `DynResource` (`resource.rs`) that decodes the dynamic
 gRPC service (`service.rs`) dispatches by type name and drives the codec; the
 planning engine lives in `plan.rs`.
 
-Data sources mirror this exactly: the read-only `DataSource` trait (`read`) over
-a `Model`, erased as `DynDataSource` (`data_source.rs`), dispatched on
-`ReadDataSource`. Register eagerly with `ProviderBuilder::data_source` or
-meta-backed with `data_source_with` (same `Arc<Meta>` wiring as
-`resource`/`resource_with`). Resources and data sources share a type-name
+Data sources mirror this, and can be **projected from the same `Model` as the
+resource** (mark the struct `#[facet(terraform::resource)]` *and*
+`#[facet(terraform::data_source)]`). Which fields are lookup inputs is driven by
+`#[facet(terraform::search_key(exclusive|shared))]`, decoded from a struct
+payload (`terraform_attrs::SearchKey`) — the one structured attribute, so a
+consumer that uses it needs `terraform-attrs` as a direct dependency (facet's
+struct-payload codegen names the crate by path; unit attrs go through the
+`terraform_provider::terraform` re-export). The reflection projections live in
+`terraform-reflect` (`reflect_data_source` / `reflect_data_source_list`):
+
+- **`search_key(exclusive)`** → unique key, a lookup yields one object. Singular
+  data source: the exclusive keys are required inputs, every other field is
+  computed. Author implements `DataSource` (`read -> Model`), registered with
+  `data_source` / `data_source_with`.
+- **`search_key(shared)`** → generic key, a lookup yields many. Plural data
+  source: the shared keys are optional inputs plus a computed
+  `results = list(object(<model>))`. Author implements `DataSourceList`
+  (`list -> Vec<Model>`), registered with `data_source_list` /
+  `data_source_list_with`; the adapter assembles the `{inputs…, results}`
+  wrapper. A field's data-source role is independent of its resource
+  disposition — e.g. a `computed` resource field (an arn) can be the exclusive
+  input of its data source.
+
+Both shapes erase to `DynDataSource` (`data_source.rs`) and dispatch on
+`ReadDataSource` (`service.rs`). Resources and data sources share a type-name
 namespace per provider — `resource "aws_s3_bucket"` and `data "aws_s3_bucket"`
-can coexist (separate maps in the IR `ProviderSchema`).
+coexist (separate maps in the IR `ProviderSchema`); a plural data source
+conventionally takes the plural name (`aws_s3_buckets`).
 
 ## Testing approach
 

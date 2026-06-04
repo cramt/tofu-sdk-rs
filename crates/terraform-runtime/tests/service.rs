@@ -11,7 +11,8 @@ use std::sync::Arc;
 use facet::Facet;
 use terraform_attrs as terraform;
 use terraform_runtime::{
-    async_trait, DataSource, DataSourceError, Provider, ProviderService, Resource, ResourceError,
+    async_trait, DataSource, DataSourceError, DataSourceList, Provider, ProviderService, Resource,
+    ResourceError,
 };
 use terraform_tfplugin6::tfplugin6::{self, provider_server::Provider as _};
 use tonic::{Code, Request};
@@ -44,7 +45,7 @@ impl Resource for BucketResource {
 #[facet(terraform::data_source)]
 #[allow(dead_code)]
 struct BucketLookup {
-    #[facet(terraform::required)]
+    #[facet(terraform::search_key(exclusive))]
     name: String,
     #[facet(terraform::computed)]
     arn: String,
@@ -62,10 +63,38 @@ impl DataSource for BucketLookupDataSource {
     }
 }
 
+/// A plural data source model: looked up by a generic (`shared`) `cluster` key.
+#[derive(Facet)]
+#[facet(terraform::data_source)]
+#[allow(dead_code)]
+struct ServerLookup {
+    #[facet(terraform::search_key(shared))]
+    cluster: String,
+    #[facet(terraform::computed)]
+    id: String,
+}
+
+struct ServersByCluster;
+
+#[async_trait]
+impl DataSourceList for ServersByCluster {
+    type Model = ServerLookup;
+
+    async fn list(&self, query: ServerLookup) -> Result<Vec<ServerLookup>, DataSourceError> {
+        Ok((0..2)
+            .map(|i| ServerLookup {
+                id: format!("{}-{i}", query.cluster),
+                cluster: query.cluster.clone(),
+            })
+            .collect())
+    }
+}
+
 fn service() -> ProviderService {
     let provider = Provider::builder()
         .resource("aws_s3_bucket", BucketResource)
         .data_source("aws_s3_bucket", BucketLookupDataSource)
+        .data_source_list("servers", ServersByCluster)
         .build()
         .expect("provider builds");
     ProviderService::new(provider)
@@ -114,12 +143,13 @@ async fn get_metadata_lists_type_names() {
         .map(|r| r.type_name.as_str())
         .collect();
     assert_eq!(resources, vec!["aws_s3_bucket"]);
-    let data_sources: Vec<&str> = resp
+    let mut data_sources: Vec<&str> = resp
         .data_sources
         .iter()
         .map(|d| d.type_name.as_str())
         .collect();
-    assert_eq!(data_sources, vec!["aws_s3_bucket"]);
+    data_sources.sort_unstable();
+    assert_eq!(data_sources, vec!["aws_s3_bucket", "servers"]);
 }
 
 #[tokio::test]
@@ -188,6 +218,75 @@ async fn read_data_source_computes_state() {
     } else {
         panic!("data source state should be an object");
     }
+}
+
+#[tokio::test]
+async fn read_data_source_list_wraps_results() {
+    use terraform_value::{ObjectAttr, Type, Value};
+
+    let svc = service();
+
+    // The plural data source's wrapper cty: a `cluster` input plus a computed
+    // `results` list of `{ cluster, id }` objects.
+    let element = Type::Object(vec![
+        ObjectAttr {
+            name: "cluster".into(),
+            ty: Type::String,
+            optional: true,
+        },
+        ObjectAttr {
+            name: "id".into(),
+            ty: Type::String,
+            optional: true,
+        },
+    ]);
+    let cty = Type::Object(vec![
+        ObjectAttr {
+            name: "cluster".into(),
+            ty: Type::String,
+            optional: true,
+        },
+        ObjectAttr {
+            name: "results".into(),
+            ty: Type::list(element),
+            optional: true,
+        },
+    ]);
+
+    // Config: the shared `cluster` key set, `results` not yet known.
+    let mut obj = std::collections::BTreeMap::new();
+    obj.insert("cluster".to_string(), Value::String("prod".into()));
+    obj.insert("results".to_string(), Value::Null);
+    let config_dv = tfplugin6::DynamicValue {
+        msgpack: terraform_codec::encode_msgpack(&Value::Object(obj), &cty).unwrap(),
+        json: vec![],
+    };
+
+    let resp = svc
+        .read_data_source(Request::new(tfplugin6::read_data_source::Request {
+            type_name: "servers".into(),
+            config: Some(config_dv),
+            ..Default::default()
+        }))
+        .await
+        .expect("read_data_source")
+        .into_inner();
+    assert!(resp.diagnostics.is_empty(), "{:?}", resp.diagnostics);
+
+    let state = resp.state.expect("data source state");
+    let value = terraform_codec::decode_msgpack(&state.msgpack, &cty).unwrap();
+    let Value::Object(fields) = value else {
+        panic!("plural state should be an object");
+    };
+    let Value::List(results) = &fields["results"] else {
+        panic!("results should be a list");
+    };
+    assert_eq!(results.len(), 2, "list handler returned two matches");
+    let Value::Object(first) = &results[0] else {
+        panic!("result element should be an object");
+    };
+    assert_eq!(first["id"], Value::String("prod-0".into()));
+    assert_eq!(first["cluster"], Value::String("prod".into()));
 }
 
 #[tokio::test]

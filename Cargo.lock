@@ -246,6 +246,7 @@ dependencies = [
  "facet",
  "facet-json",
  "facet-value",
+ "terraform-attrs",
  "terraform-provider",
  "terraform-runtime",
  "tokio",

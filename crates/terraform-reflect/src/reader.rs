@@ -1,6 +1,7 @@
 //! Walk a [`facet::Shape`] and lower it into the provider [`terraform_ir`].
 
 use facet::{Def, Facet, Field, PrimitiveType, Shape, Type as FType, UserType};
+use terraform_attrs::Attr as TfAttr;
 use terraform_ir::{AttributeSchema, Block, DataSourceSchema, ResourceSchema};
 use terraform_value::{ObjectAttr, Type};
 
@@ -29,6 +30,12 @@ pub enum ReflectError {
         /// The key type's identifier.
         key_type: &'static str,
     },
+    /// A `#[facet(terraform::search_key(...))]` did not specify exactly one of
+    /// `exclusive` or `shared`.
+    InvalidSearchKey {
+        /// The offending field's name.
+        field: String,
+    },
 }
 
 impl core::fmt::Display for ReflectError {
@@ -43,6 +50,11 @@ impl core::fmt::Display for ReflectError {
             ReflectError::UnsupportedMapKey { field, key_type } => write!(
                 f,
                 "field `{field}` is a map with non-string key type `{key_type}`"
+            ),
+            ReflectError::InvalidSearchKey { field } => write!(
+                f,
+                "field `{field}` must use exactly one of \
+                 `search_key(exclusive)` or `search_key(shared)`"
             ),
         }
     }
@@ -65,13 +77,140 @@ pub fn reflect_resource<T: Facet<'static>>(
     })
 }
 
-/// Reflect a Rust type into a named [`DataSourceSchema`].
+/// Cardinality of a data source search key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchKind {
+    /// A unique key — a lookup yields at most one object (singular data source).
+    Exclusive,
+    /// A generic key — a lookup may yield many objects (plural data source).
+    Shared,
+}
+
+/// Read a field's `#[facet(terraform::search_key(...))]` cardinality, if any.
+/// Errors if the payload sets neither or both of `exclusive`/`shared`.
+fn search_kind(field: &'static Field) -> Result<Option<SearchKind>, ReflectError> {
+    let Some(attr) = field.get_attr(Some(NS), "search_key") else {
+        return Ok(None);
+    };
+    let invalid = || ReflectError::InvalidSearchKey {
+        field: field.name.to_string(),
+    };
+    let Some(TfAttr::SearchKey(sk)) = attr.get_as::<TfAttr>() else {
+        return Err(invalid());
+    };
+    match (sk.exclusive, sk.shared) {
+        (true, false) => Ok(Some(SearchKind::Exclusive)),
+        (false, true) => Ok(Some(SearchKind::Shared)),
+        _ => Err(invalid()),
+    }
+}
+
+/// Reflect a struct's fields into `(attribute, search-key cardinality)` pairs.
+fn model_attributes(
+    shape: &'static Shape,
+) -> Result<Vec<(AttributeSchema, Option<SearchKind>)>, ReflectError> {
+    let fields = struct_fields(shape)?;
+    let mut out = Vec::with_capacity(fields.len());
+    for field in fields {
+        out.push((attribute_from_field(field)?, search_kind(field)?));
+    }
+    Ok(out)
+}
+
+/// Project a model attribute into a read-only (computed) output: the disposition
+/// a non-key field takes in any data source.
+fn as_computed(mut attr: AttributeSchema) -> AttributeSchema {
+    attr.required = false;
+    attr.optional = false;
+    attr.computed = true;
+    attr.force_new = false;
+    attr
+}
+
+/// Project a model attribute into a settable lookup input.
+fn as_input(mut attr: AttributeSchema, required: bool) -> AttributeSchema {
+    attr.required = required;
+    attr.optional = !required;
+    attr.computed = false;
+    attr.force_new = false;
+    attr
+}
+
+/// Reflect a Rust type into a **singular** [`DataSourceSchema`]: the
+/// `search_key(exclusive)` fields become required lookup inputs and every other
+/// field becomes a computed output. The data source resolves to a single object.
 pub fn reflect_data_source<T: Facet<'static>>(
     name: impl Into<String>,
 ) -> Result<DataSourceSchema, ReflectError> {
+    let attributes = model_attributes(T::SHAPE)?
+        .into_iter()
+        .map(|(attr, kind)| match kind {
+            Some(SearchKind::Exclusive) => as_input(attr, true),
+            _ => as_computed(attr),
+        })
+        .collect();
     Ok(DataSourceSchema {
         name: name.into(),
-        block: reflect_block::<T>()?,
+        block: Block {
+            attributes,
+            nested_blocks: Vec::new(),
+        },
+    })
+}
+
+/// A reflected **plural** data source: its schema plus the names of the
+/// `search_key(shared)` fields that act as lookup inputs (the runtime needs
+/// these to project the wrapper back onto the model).
+pub struct PluralDataSource {
+    /// The reflected schema (shared-key inputs plus a computed `results` list).
+    pub schema: DataSourceSchema,
+    /// The `search_key(shared)` field names, in declaration order.
+    pub shared_keys: Vec<String>,
+}
+
+/// Reflect a Rust type into a **plural** data source: the `search_key(shared)`
+/// fields become optional lookup inputs and the result is a computed `results`
+/// list whose elements are objects of the full model. The data source resolves
+/// to any number of objects.
+pub fn reflect_data_source_list<T: Facet<'static>>(
+    name: impl Into<String>,
+) -> Result<PluralDataSource, ReflectError> {
+    let attributes = model_attributes(T::SHAPE)?;
+
+    // Each model field is a computed output inside every `results` element.
+    let element = Type::Object(
+        attributes
+            .iter()
+            .map(|(attr, _)| ObjectAttr {
+                name: attr.name.clone(),
+                ty: attr.ty.clone(),
+                optional: true,
+            })
+            .collect(),
+    );
+
+    let mut block_attrs = Vec::new();
+    let mut shared_keys = Vec::new();
+    for (attr, kind) in &attributes {
+        if *kind == Some(SearchKind::Shared) {
+            shared_keys.push(attr.name.clone());
+            block_attrs.push(as_input(attr.clone(), false));
+        }
+    }
+    block_attrs.push(AttributeSchema {
+        description: Some("Every object matching the search keys.".to_string()),
+        ..as_computed(AttributeSchema::new("results", Type::list(element)))
+    });
+
+    Ok(PluralDataSource {
+        schema: DataSourceSchema {
+            name: name.into(),
+            block: Block {
+                attributes: block_attrs,
+                nested_blocks: Vec::new(),
+            },
+        },
+        shared_keys,
     })
 }
 
@@ -320,5 +459,95 @@ mod tests {
     fn non_string_map_key_errors() {
         let err = reflect_block::<BadMap>().unwrap_err();
         assert!(matches!(err, ReflectError::UnsupportedMapKey { .. }));
+    }
+
+    // --- data source projections (search keys) ------------------------------
+
+    #[derive(Facet)]
+    #[facet(terraform::resource)]
+    #[facet(terraform::data_source)]
+    #[allow(dead_code)]
+    struct Server {
+        #[facet(terraform::required)]
+        #[facet(terraform::search_key(shared))]
+        name: String,
+
+        #[facet(terraform::computed)]
+        #[facet(terraform::search_key(exclusive))]
+        id: String,
+
+        #[facet(terraform::computed)]
+        status: String,
+    }
+
+    #[test]
+    fn singular_projection_inputs_exclusive_key_computes_rest() {
+        let ds = reflect_data_source::<Server>("server").expect("Server reflects");
+
+        let id = attr(&ds.block, "id");
+        assert!(
+            id.required && !id.computed,
+            "exclusive key is a required input"
+        );
+
+        let name = attr(&ds.block, "name");
+        assert!(
+            name.computed && !name.required && !name.optional,
+            "a non-exclusive field is a computed output"
+        );
+        assert!(attr(&ds.block, "status").computed);
+    }
+
+    #[test]
+    fn plural_projection_inputs_shared_key_wraps_results() {
+        let plural = reflect_data_source_list::<Server>("servers").expect("Server reflects");
+        assert_eq!(plural.shared_keys, vec!["name".to_string()]);
+
+        let name = attr(&plural.schema.block, "name");
+        assert!(
+            name.optional && !name.required && !name.computed,
+            "the shared key is an optional input"
+        );
+
+        // The exclusive-only key is not a plural input; it appears only inside
+        // each result object.
+        assert!(
+            plural
+                .schema
+                .block
+                .attributes
+                .iter()
+                .all(|a| a.name != "id"),
+            "exclusive key should not be a top-level plural input"
+        );
+
+        let results = attr(&plural.schema.block, "results");
+        assert!(results.computed);
+        match &results.ty {
+            Type::List(element) => match element.as_ref() {
+                Type::Object(attrs) => {
+                    let names: Vec<&str> = attrs.iter().map(|a| a.name.as_str()).collect();
+                    assert!(names.contains(&"id"));
+                    assert!(names.contains(&"name"));
+                    assert!(names.contains(&"status"));
+                }
+                other => panic!("results element should be an object, got {other:?}"),
+            },
+            other => panic!("results should be a list, got {other:?}"),
+        }
+    }
+
+    #[derive(Facet)]
+    #[facet(terraform::data_source)]
+    #[allow(dead_code)]
+    struct BadKey {
+        #[facet(terraform::search_key(exclusive, shared))]
+        key: String,
+    }
+
+    #[test]
+    fn search_key_with_both_cardinalities_errors() {
+        let err = reflect_data_source::<BadKey>("bad").unwrap_err();
+        assert!(matches!(err, ReflectError::InvalidSearchKey { .. }));
     }
 }

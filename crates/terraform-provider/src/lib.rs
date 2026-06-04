@@ -44,4 +44,7 @@ pub use terraform_ir as ir;
 pub use terraform_value as value;
 
 /// Reflection entry points: Rust types -> provider IR.
-pub use terraform_reflect::{reflect_block, reflect_data_source, reflect_resource, ReflectError};
+pub use terraform_reflect::{
+    reflect_block, reflect_data_source, reflect_data_source_list, reflect_resource,
+    PluralDataSource, ReflectError,
+};

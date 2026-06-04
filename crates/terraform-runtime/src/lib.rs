@@ -18,7 +18,7 @@ mod service;
 mod tls;
 
 pub use builder::{BuildError, Provider, ProviderBuilder};
-pub use data_source::{DataSource, DataSourceError};
+pub use data_source::{DataSource, DataSourceError, DataSourceList};
 pub use resource::{Resource, ResourceError};
 pub use serve::{serve, ServeError};
 pub use service::ProviderService;
