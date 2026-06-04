@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cramt/tofu-sdk-rs"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# External
+facet = "0.46"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+# Internal crates (path deps)
+terraform-attrs = { path = "crates/terraform-attrs" }
+terraform-value = { path = "crates/terraform-value" }
+terraform-ir = { path = "crates/terraform-ir" }
+terraform-reflect = { path = "crates/terraform-reflect" }
+terraform-codec = { path = "crates/terraform-codec" }
+terraform-runtime = { path = "crates/terraform-runtime" }
+terraform-tfplugin6 = { path = "crates/terraform-tfplugin6" }
+terraform-macros = { path = "crates/terraform-macros" }
+terraform-provider = { path = "crates/terraform-provider" }
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = "warn"

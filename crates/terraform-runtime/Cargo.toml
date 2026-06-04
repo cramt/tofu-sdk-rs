@@ -1,0 +1,14 @@
+[package]
+name = "terraform-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+terraform-value = { workspace = true }
+terraform-ir = { workspace = true }
+
+[lints]
+workspace = true

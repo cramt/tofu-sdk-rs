@@ -1,0 +1,14 @@
+[package]
+name = "terraform-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Reserved for SDK-specific proc-macros. Today the reflection metadata comes from
+# facet's own `#[derive(Facet)]`; this crate exists as a seam for future
+# convenience derives (e.g. `#[derive(Resource)]`).
+
+[lints]
+workspace = true

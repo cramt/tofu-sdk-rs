@@ -1,0 +1,19 @@
+[package]
+name = "terraform-attrs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# This crate exists solely to define the `terraform` facet extension-attribute
+# namespace. It must be a *separate* crate from its consumers: a grammar emits a
+# `#[macro_export]` dispatcher macro, and Rust forbids referring to such a macro
+# by path from within the crate that defines it (rust-lang/rust#52234). Authors
+# alias it as `terraform` (directly or via `terraform-provider`).
+
+[dependencies]
+facet = { workspace = true }
+
+[lints]
+workspace = true
