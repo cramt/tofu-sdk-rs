@@ -7,30 +7,35 @@ auto-mTLS, msgpack codec, planning) and drives your handlers with decoded
 values. No protocol, gRPC, or `cty` encoding to deal with.
 
 ```ts
+import { z } from "zod";
 import { Provider } from "@tofu-sdk/core";
 
-interface Bucket {
-  name: string;
-  arn: string;
-}
+const Bucket = z.object({
+  name: z.string(),
+  arn: z.string(),
+});
 
 await new Provider()
-  .resource<Bucket>("aws_s3_bucket", {
-    schema: {
-      name: { type: "string", required: true, forceNew: true },
-      arn: { type: "string", computed: true },
-    },
+  .resource("aws_s3_bucket", {
+    schema: Bucket,
+    forceNew: ["name"], // only "name" | "arn" type-checks here
+    computed: ["arn"],
     async create(planned) {
+      // planned is typed { name: string; arn: string }
       return { ...planned, arn: `arn:aws:s3:::${planned.name}` };
     },
   })
   .serve();
 ```
 
-`create` is required; `read` / `update` / `delete` are optional (sensible
-no-ops by default). `forceNew` attributes drive replacement in the Rust planning
-engine. `computed` attributes are filled by your handlers and surface as "known
-after apply" during planning.
+Schemas are [Zod](https://zod.dev) objects: you get runtime validation and
+inferred handler types for free, and the cty schema Terraform needs is derived
+from them. The Terraform-only dispositions Zod can't express — `computed`,
+`forceNew`, `sensitive` — are arrays of field names that are **type-checked
+against the schema** (a typo is a compile error). `create` is required;
+`read` / `update` / `delete` default to sensible no-ops. `forceNew` drives
+replacement in the planning engine; `computed` attributes are filled by your
+handlers and surface as "known after apply".
 
 ## The provider binary
 

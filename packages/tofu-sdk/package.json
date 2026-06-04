@@ -6,10 +6,15 @@
   "type": "commonjs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "files": ["dist", "binding"],
+  "files": [
+    "dist",
+    "binding"
+  ],
   "napi": {
     "binaryName": "tofu-sdk",
-    "targets": ["x86_64-unknown-linux-gnu"]
+    "targets": [
+      "x86_64-unknown-linux-gnu"
+    ]
   },
   "scripts": {
     "build": "pnpm run build:native && pnpm run build:ts",
@@ -21,5 +26,8 @@
     "@napi-rs/cli": "^3",
     "@types/node": "^22",
     "typescript": "^5"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
   }
 }

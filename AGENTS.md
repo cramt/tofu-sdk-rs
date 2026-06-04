@@ -81,6 +81,13 @@ schema-agnostic. Build/test it with `pnpm build` / `pnpm test` inside the dev
 shell (it shells out to `cargo`, which needs `PROTOC`); `pnpm test` drives a real
 `tofu` through `examples/aws-provider.cjs`.
 
+Schemas in the TS layer (`ts/index.ts`) are **Zod** objects: `z.toJSONSchema` →
+cty (the structural derivation Standard Schema can't provide), `z.infer` gives
+the handler types, and `safeParse` validates handler output. The Terraform-only
+dispositions Zod can't express (`computed`/`forceNew`/`sensitive`) are arrays
+typed as `(keyof z.infer<S>)[]`, so a bad field name is a compile error. This is
+entirely TS-side; it compiles down to the same cty-JSON the addon already takes.
+
 ## Conventions & gotchas (read before changing these)
 
 - **facet comes from crates.io** (`facet = "0.46"`, resolving to 0.46.5).

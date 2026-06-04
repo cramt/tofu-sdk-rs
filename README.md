@@ -129,14 +129,16 @@ The Rust core is just one frontend on top of the `terraform-ir` + `Value` seam;
 and async handlers, and the Rust runtime handles the protocol:
 
 ```ts
+import { z } from "zod";
 import { Provider } from "@tofu-sdk/core";
+
+const Bucket = z.object({ name: z.string(), arn: z.string() });
 
 await new Provider()
   .resource("aws_s3_bucket", {
-    schema: {
-      name: { type: "string", required: true, forceNew: true },
-      arn: { type: "string", computed: true },
-    },
+    schema: Bucket,            // Zod -> validation + inferred handler types + cty schema
+    forceNew: ["name"],        // type-checked against the schema's fields
+    computed: ["arn"],
     async create(planned) {
       return { ...planned, arn: `arn:aws:s3:::${planned.name}` };
     },
@@ -144,7 +146,9 @@ await new Provider()
   .serve();
 ```
 
-See [`packages/tofu-sdk`](packages/tofu-sdk) (`pnpm build`, `pnpm test`).
+Schemas are Zod objects (validation + inferred types for free); the cty schema
+is derived from them. See [`packages/tofu-sdk`](packages/tofu-sdk)
+(`pnpm build`, `pnpm test`).
 
 ## Developing
 
