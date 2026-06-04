@@ -9,6 +9,7 @@
 //! auto-mTLS. Resource CRUD and planning arrive in later phases.
 
 mod builder;
+mod data_source;
 pub mod handshake;
 mod plan;
 mod resource;
@@ -17,6 +18,7 @@ mod service;
 mod tls;
 
 pub use builder::{BuildError, Provider, ProviderBuilder};
+pub use data_source::{DataSource, DataSourceError};
 pub use resource::{Resource, ResourceError};
 pub use serve::{serve, ServeError};
 pub use service::ProviderService;

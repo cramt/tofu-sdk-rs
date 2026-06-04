@@ -19,3 +19,10 @@ variable "bucket_name" {
 resource "aws_s3_bucket" "test" {
   name = var.bucket_name
 }
+
+# Read-only lookup, exercised by data_source.tftest.hcl. Independent of the
+# managed bucket above (its own type-name address), so it does not affect the
+# resource lifecycle assertions in the other test files.
+data "aws_s3_bucket" "lookup" {
+  name = "looked-up"
+}

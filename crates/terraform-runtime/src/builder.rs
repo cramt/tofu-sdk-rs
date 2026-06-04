@@ -30,6 +30,7 @@ use terraform_reflect::{reflect_block, reflect_data_source, reflect_resource, Re
 use terraform_value::{Type, Value};
 use tokio::sync::OnceCell;
 
+use crate::data_source::{DataSource, DataSourceAdapter, DynDataSource};
 use crate::resource::{Diag, Diagnostics, DynResource, Resource, ResourceAdapter};
 
 /// A `Send` boxed future, the erased form of a handler/closure's async result.
@@ -38,6 +39,16 @@ type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// The set of resource handlers keyed by type name.
 type ResourceMap = HashMap<String, Arc<dyn DynResource>>;
 
+/// The set of data source handlers keyed by type name.
+type DataSourceMap = HashMap<String, Arc<dyn DynDataSource>>;
+
+/// The meta-backed handlers built once `ConfigureProvider` runs.
+#[derive(Default)]
+struct Configured {
+    resources: ResourceMap,
+    data_sources: DataSourceMap,
+}
+
 /// Builds the shared meta `Arc<M>` from the decoded provider config value.
 type MetaFn<M> = Arc<dyn Fn(Value) -> BoxFuture<Result<Arc<M>, Diagnostics>> + Send + Sync>;
 
@@ -45,9 +56,13 @@ type MetaFn<M> = Arc<dyn Fn(Value) -> BoxFuture<Result<Arc<M>, Diagnostics>> + S
 /// `resource_with` until the meta exists at configure time.
 type ResourceFactory<M> = Box<dyn Fn(Arc<M>) -> Arc<dyn DynResource> + Send + Sync>;
 
+/// Builds one data source handler from the shared meta. Stored per registered
+/// `data_source_with` until the meta exists at configure time.
+type DataSourceFactory<M> = Box<dyn Fn(Arc<M>) -> Arc<dyn DynDataSource> + Send + Sync>;
+
 /// The fully-erased configure step: decode-and-build the meta, then construct
-/// every meta-backed resource handler. `M` has been erased away by this point.
-type ConfigureFn = dyn Fn(Value) -> BoxFuture<Result<ResourceMap, Diagnostics>> + Send + Sync;
+/// every meta-backed handler. `M` has been erased away by this point.
+type ConfigureFn = dyn Fn(Value) -> BoxFuture<Result<Configured, Diagnostics>> + Send + Sync;
 
 /// Error returned when a provider definition fails to build.
 #[derive(Debug, thiserror::Error)]
@@ -73,15 +88,17 @@ pub enum BuildError {
 #[derive(Clone)]
 pub struct Provider {
     schema: Arc<ProviderSchema>,
-    /// Handlers that need no provider meta; available immediately.
+    /// Resource handlers that need no provider meta; available immediately.
     eager: Arc<ResourceMap>,
+    /// Data source handlers that need no provider meta; available immediately.
+    eager_data: Arc<DataSourceMap>,
     /// The `cty` type of the provider config block, for decoding `ConfigureProvider`.
     config_ty: Option<Type>,
     /// Builds the meta and the meta-backed handlers from decoded config. `None`
     /// when the provider has no `configure` step.
     configure: Option<Arc<ConfigureFn>>,
     /// The meta-backed handlers, populated once `ConfigureProvider` runs.
-    configured: Arc<OnceCell<ResourceMap>>,
+    configured: Arc<OnceCell<Configured>>,
 }
 
 impl Provider {
@@ -98,12 +115,23 @@ impl Provider {
     /// The handler for resource type `name`, if registered. Configured
     /// (meta-backed) handlers take precedence over eager ones.
     pub(crate) fn resource_handler(&self, name: &str) -> Option<Arc<dyn DynResource>> {
-        if let Some(map) = self.configured.get() {
-            if let Some(handler) = map.get(name) {
+        if let Some(configured) = self.configured.get() {
+            if let Some(handler) = configured.resources.get(name) {
                 return Some(Arc::clone(handler));
             }
         }
         self.eager.get(name).map(Arc::clone)
+    }
+
+    /// The handler for data source type `name`, if registered. Configured
+    /// (meta-backed) handlers take precedence over eager ones.
+    pub(crate) fn data_source_handler(&self, name: &str) -> Option<Arc<dyn DynDataSource>> {
+        if let Some(configured) = self.configured.get() {
+            if let Some(handler) = configured.data_sources.get(name) {
+                return Some(Arc::clone(handler));
+            }
+        }
+        self.eager_data.get(name).map(Arc::clone)
     }
 
     /// The `cty` object type of resource `name`, derived from its schema block.
@@ -118,6 +146,15 @@ impl Provider {
             .iter()
             .find(|r| r.name == name)
             .map(|r| &r.block)
+    }
+
+    /// The `cty` object type of data source `name`, derived from its schema block.
+    pub(crate) fn data_source_cty(&self, name: &str) -> Option<Type> {
+        self.schema
+            .data_sources
+            .iter()
+            .find(|d| d.name == name)
+            .map(|d| d.block.cty_type())
     }
 
     /// The `cty` type Terraform's `ConfigureProvider` config decodes under. An
@@ -148,7 +185,9 @@ pub struct ProviderBuilder<M = ()> {
     provider: Option<Block>,
     schema: ProviderSchema,
     resources: ResourceMap,
+    data_sources: DataSourceMap,
     factories: Vec<(String, ResourceFactory<M>)>,
+    data_factories: Vec<(String, DataSourceFactory<M>)>,
     configure: Option<MetaFn<M>>,
     error: Option<BuildError>,
 }
@@ -159,7 +198,9 @@ impl<M> Default for ProviderBuilder<M> {
             provider: None,
             schema: ProviderSchema::default(),
             resources: HashMap::new(),
+            data_sources: HashMap::new(),
             factories: Vec::new(),
+            data_factories: Vec::new(),
             configure: None,
             error: None,
         }
@@ -216,11 +257,41 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
         self
     }
 
-    /// Register a data source type under `name` (schema only for now).
-    pub fn data_source<T: Facet<'static>>(mut self, name: impl Into<String>) -> Self {
+    /// Register a read-only data source type under `name` with its `handler`.
+    /// Use this for data sources that need no provider configuration; for ones
+    /// that need the configured meta, use [`ProviderBuilder::data_source_with`].
+    pub fn data_source<D: DataSource>(mut self, name: impl Into<String>, handler: D) -> Self {
         let name = name.into();
-        match reflect_data_source::<T>(name.clone()) {
-            Ok(data_source) => self.schema.data_sources.push(data_source),
+        match reflect_data_source::<D::Model>(name.clone()) {
+            Ok(data_source) => {
+                self.schema.data_sources.push(data_source);
+                self.data_sources
+                    .insert(name, DataSourceAdapter::erased(handler));
+            }
+            Err(source) => self.record(name, source),
+        }
+        self
+    }
+
+    /// Register a data source whose handler is built from the configured
+    /// provider meta. `factory` receives the shared `Arc<M>` produced by
+    /// [`ProviderBuilder::configure`] and returns the data source handler.
+    ///
+    /// Requires a [`ProviderBuilder::configure`] step (which fixes `M`); building
+    /// without one is a [`BuildError::MissingConfigure`].
+    pub fn data_source_with<D, F>(mut self, name: impl Into<String>, factory: F) -> Self
+    where
+        D: DataSource,
+        F: Fn(Arc<M>) -> D + Send + Sync + 'static,
+    {
+        let name = name.into();
+        match reflect_data_source::<D::Model>(name.clone()) {
+            Ok(data_source) => {
+                self.schema.data_sources.push(data_source);
+                let make: DataSourceFactory<M> =
+                    Box::new(move |meta: Arc<M>| DataSourceAdapter::erased(factory(meta)));
+                self.data_factories.push((name, make));
+            }
             Err(source) => self.record(name, source),
         }
         self
@@ -237,29 +308,41 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
         let configure: Option<Arc<ConfigureFn>> = match self.configure.take() {
             Some(meta_fn) => {
                 let factories = Arc::new(self.factories);
+                let data_factories = Arc::new(self.data_factories);
                 let configure: Arc<ConfigureFn> = Arc::new(move |config: Value| {
                     let meta_fn = Arc::clone(&meta_fn);
                     let factories = Arc::clone(&factories);
+                    let data_factories = Arc::clone(&data_factories);
                     Box::pin(async move {
                         let meta = meta_fn(config).await?;
-                        let mut map = ResourceMap::with_capacity(factories.len());
+                        let mut resources = ResourceMap::with_capacity(factories.len());
                         for (name, make) in factories.iter() {
-                            map.insert(name.clone(), make(Arc::clone(&meta)));
+                            resources.insert(name.clone(), make(Arc::clone(&meta)));
                         }
-                        Ok(map)
-                    }) as BoxFuture<Result<ResourceMap, Diagnostics>>
+                        let mut data_sources = DataSourceMap::with_capacity(data_factories.len());
+                        for (name, make) in data_factories.iter() {
+                            data_sources.insert(name.clone(), make(Arc::clone(&meta)));
+                        }
+                        Ok(Configured {
+                            resources,
+                            data_sources,
+                        })
+                    }) as BoxFuture<Result<Configured, Diagnostics>>
                 });
                 Some(configure)
             }
-            // Meta-backed resources were registered but there is nothing to build
+            // Meta-backed handlers were registered but there is nothing to build
             // their meta — a programming error worth surfacing at build time.
-            None if !self.factories.is_empty() => return Err(BuildError::MissingConfigure),
+            None if !self.factories.is_empty() || !self.data_factories.is_empty() => {
+                return Err(BuildError::MissingConfigure)
+            }
             None => None,
         };
 
         Ok(Provider {
             schema: Arc::new(self.schema),
             eager: Arc::new(self.resources),
+            eager_data: Arc::new(self.data_sources),
             config_ty,
             configure,
             configured: Arc::new(OnceCell::new()),
@@ -303,14 +386,16 @@ impl ProviderBuilder<()> {
             }) as BoxFuture<Result<Arc<M>, Diagnostics>>
         });
 
-        // Carry the schema and eager resources over to the meta-typed builder.
-        // No `resource_with` factories can exist yet (this is the only call that
-        // fixes `M`), so there is nothing of the old `()` factory type to migrate.
+        // Carry the schema and eager handlers over to the meta-typed builder.
+        // No `*_with` factories can exist yet (this is the only call that fixes
+        // `M`), so there is nothing of the old `()` factory type to migrate.
         ProviderBuilder {
             provider: self.provider,
             schema: self.schema,
             resources: self.resources,
+            data_sources: self.data_sources,
             factories: Vec::new(),
+            data_factories: Vec::new(),
             configure: Some(meta_fn),
             error: self.error,
         }

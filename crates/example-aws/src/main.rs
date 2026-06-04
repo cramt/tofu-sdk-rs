@@ -16,7 +16,9 @@ use std::sync::Arc;
 
 use facet::Facet;
 use terraform_provider::terraform;
-use terraform_runtime::{async_trait, serve, Provider, Resource, ResourceError};
+use terraform_runtime::{
+    async_trait, serve, DataSource, DataSourceError, Provider, Resource, ResourceError,
+};
 
 /// Provider-level configuration.
 #[derive(Facet)]
@@ -90,6 +92,43 @@ impl Resource for BucketResource {
     }
 }
 
+/// A read-only lookup of a bucket's derived attributes by name. It mirrors the
+/// resource's computed attributes but is queried with `data "aws_s3_bucket"`,
+/// demonstrating a meta-backed data source (it reads the configured region from
+/// the same shared `AwsClient`).
+#[derive(Facet)]
+#[facet(terraform::data_source)]
+#[allow(dead_code)]
+struct BucketLookup {
+    /// The name of the bucket to look up.
+    #[facet(terraform::required)]
+    name: String,
+
+    /// The ARN, derived from the name.
+    #[facet(terraform::computed)]
+    arn: String,
+
+    /// The region, taken from provider configuration.
+    #[facet(terraform::computed)]
+    region: String,
+}
+
+/// The handler for the `aws_s3_bucket` data source, holding the configured client.
+struct BucketDataSource {
+    client: Arc<AwsClient>,
+}
+
+#[async_trait]
+impl DataSource for BucketDataSource {
+    type Model = BucketLookup;
+
+    async fn read(&self, mut config: BucketLookup) -> Result<BucketLookup, DataSourceError> {
+        config.arn = format!("arn:aws:s3:::{}", config.name);
+        config.region = self.client.region.clone();
+        Ok(config)
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let provider = Provider::builder()
@@ -100,6 +139,9 @@ async fn main() {
             })
         })
         .resource_with("aws_s3_bucket", |client: Arc<AwsClient>| BucketResource {
+            client,
+        })
+        .data_source_with("aws_s3_bucket", |client: Arc<AwsClient>| BucketDataSource {
             client,
         })
         .build()

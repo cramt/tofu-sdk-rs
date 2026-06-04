@@ -89,13 +89,17 @@ impl is a working provider, exercised end-to-end against **real OpenTofu**
   config block and a `configure` closure turns it into shared state (an
   `Arc<Meta>`, e.g. an API client) handed to every resource handler — verified
   by a real `tofu` test that flows a `provider` block region into a resource
+- **Data sources ✅** — a read-only `DataSource` trait (`read`) reflected from a
+  `Model` and dispatched on `ReadDataSource`; registered eagerly
+  (`data_source`) or meta-backed (`data_source_with`) like resources — verified
+  by a real `tofu test` `data` block read
 
 ### Not yet implemented
 
-Data sources, nested blocks end-to-end, functions, ephemeral resources,
-import/move, and a `TfValue<T>` field wrapper to preserve known/unknown/null
-through decode (today `Unknown` decodes to the type's zero value). Numbers are
-held as `f64`. Not all `cty` corner cases are covered.
+Nested blocks end-to-end, functions, ephemeral resources, import/move, and a
+`TfValue<T>` field wrapper to preserve known/unknown/null through decode (today
+`Unknown` decodes to the type's zero value). Numbers are held as `f64`. Not all
+`cty` corner cases are covered.
 
 ## Workspace layout
 

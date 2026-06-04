@@ -1,11 +1,12 @@
 //! The gRPC [`tfplugin6::provider_server::Provider`] implementation.
 //!
-//! Answers schema discovery (`GetMetadata`, `GetProviderSchema`) and the
-//! resource lifecycle (`ConfigureProvider`, validation, `UpgradeResourceState`,
-//! `PlanResourceChange`, `ReadResource`, `ApplyResourceChange`) by dispatching to
-//! the registered resource handlers through the value codec. RPCs for features
-//! the SDK does not yet support (data sources, functions, ephemeral resources,
-//! identity, state stores, actions, import/move) still return `Unimplemented`.
+//! Answers schema discovery (`GetMetadata`, `GetProviderSchema`), the resource
+//! lifecycle (`ConfigureProvider`, validation, `UpgradeResourceState`,
+//! `PlanResourceChange`, `ReadResource`, `ApplyResourceChange`), and data source
+//! reads (`ReadDataSource`) by dispatching to the registered handlers through the
+//! value codec. RPCs for features the SDK does not yet support (functions,
+//! ephemeral resources, identity, state stores, actions, import/move) still
+//! return `Unimplemented`.
 
 use std::pin::Pin;
 
@@ -352,12 +353,56 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         }
     }
 
+    async fn read_data_source(
+        &self,
+        request: Request<tfplugin6::read_data_source::Request>,
+    ) -> Result<Response<tfplugin6::read_data_source::Response>, Status> {
+        use tfplugin6::read_data_source::Response as Resp;
+        let req = request.into_inner();
+
+        let (Some(ty), Some(handler)) = (
+            self.provider.data_source_cty(&req.type_name),
+            self.provider.data_source_handler(&req.type_name),
+        ) else {
+            return Ok(Response::new(Resp {
+                diagnostics: unknown_data_source(&req.type_name),
+                ..Default::default()
+            }));
+        };
+
+        let config = match decode_dynamic(&req.config, &ty) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to decode data source config", e.to_string()),
+                    ..Default::default()
+                }))
+            }
+        };
+
+        match handler.read(config).await {
+            Ok(state) => match encode_dynamic(&state, &ty) {
+                Ok(dv) => Ok(Response::new(Resp {
+                    state: Some(dv),
+                    ..Default::default()
+                })),
+                Err(e) => Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to encode data source state", e.to_string()),
+                    ..Default::default()
+                })),
+            },
+            Err(diags) => Ok(Response::new(Resp {
+                diagnostics: pb_diagnostics(diags),
+                ..Default::default()
+            })),
+        }
+    }
+
     unimplemented_unary! {
         get_resource_identity_schemas => get_resource_identity_schemas,
         upgrade_resource_identity => upgrade_resource_identity,
         import_resource_state => import_resource_state,
         move_resource_state => move_resource_state,
-        read_data_source => read_data_source,
         generate_resource_config => generate_resource_config,
         validate_ephemeral_resource_config => validate_ephemeral_resource_config,
         open_ephemeral_resource => open_ephemeral_resource,
@@ -486,5 +531,12 @@ fn unknown_resource(name: &str) -> Vec<tfplugin6::Diagnostic> {
     error_diag(
         "unknown resource type",
         format!("the provider has no resource named `{name}`"),
+    )
+}
+
+fn unknown_data_source(name: &str) -> Vec<tfplugin6::Diagnostic> {
+    error_diag(
+        "unknown data source type",
+        format!("the provider has no data source named `{name}`"),
     )
 }

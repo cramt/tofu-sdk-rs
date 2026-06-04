@@ -105,6 +105,14 @@ each handler in an erased `DynResource` (`resource.rs`) that decodes the dynamic
 gRPC service (`service.rs`) dispatches by type name and drives the codec; the
 planning engine lives in `plan.rs`.
 
+Data sources mirror this exactly: the read-only `DataSource` trait (`read`) over
+a `Model`, erased as `DynDataSource` (`data_source.rs`), dispatched on
+`ReadDataSource`. Register eagerly with `ProviderBuilder::data_source` or
+meta-backed with `data_source_with` (same `Arc<Meta>` wiring as
+`resource`/`resource_with`). Resources and data sources share a type-name
+namespace per provider — `resource "aws_s3_bucket"` and `data "aws_s3_bucket"`
+can coexist (separate maps in the IR `ProviderSchema`).
+
 ## Testing approach
 
 Three layers, deliberately:

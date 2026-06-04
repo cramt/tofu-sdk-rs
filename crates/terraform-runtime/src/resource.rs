@@ -158,7 +158,7 @@ impl<R: Resource> ResourceAdapter<R> {
 }
 
 /// Convert a codec/decoding error into diagnostics.
-fn codec_diag(context: &str, e: impl std::fmt::Display) -> Diagnostics {
+pub(crate) fn codec_diag(context: &str, e: impl std::fmt::Display) -> Diagnostics {
     vec![Diag::error(format!("failed to {context}"), e.to_string())]
 }
 

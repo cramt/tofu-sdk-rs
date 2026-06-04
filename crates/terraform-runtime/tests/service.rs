@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use facet::Facet;
 use terraform_attrs as terraform;
-use terraform_runtime::{async_trait, Provider, ProviderService, Resource, ResourceError};
+use terraform_runtime::{
+    async_trait, DataSource, DataSourceError, Provider, ProviderService, Resource, ResourceError,
+};
 use terraform_tfplugin6::tfplugin6::{self, provider_server::Provider as _};
 use tonic::{Code, Request};
 
@@ -48,10 +50,22 @@ struct BucketLookup {
     arn: String,
 }
 
+struct BucketLookupDataSource;
+
+#[async_trait]
+impl DataSource for BucketLookupDataSource {
+    type Model = BucketLookup;
+
+    async fn read(&self, mut config: BucketLookup) -> Result<BucketLookup, DataSourceError> {
+        config.arn = format!("arn:aws:s3:::{}", config.name);
+        Ok(config)
+    }
+}
+
 fn service() -> ProviderService {
     let provider = Provider::builder()
         .resource("aws_s3_bucket", BucketResource)
-        .data_source::<BucketLookup>("aws_s3_bucket")
+        .data_source("aws_s3_bucket", BucketLookupDataSource)
         .build()
         .expect("provider builds");
     ProviderService::new(provider)
@@ -111,12 +125,86 @@ async fn get_metadata_lists_type_names() {
 #[tokio::test]
 async fn unimplemented_rpc_returns_unimplemented() {
     let svc = service();
-    // Data sources are not implemented yet.
+    // Import is not implemented yet.
     let status = svc
-        .read_data_source(Request::new(tfplugin6::read_data_source::Request::default()))
+        .import_resource_state(Request::new(
+            tfplugin6::import_resource_state::Request::default(),
+        ))
         .await
-        .expect_err("read_data_source is not implemented yet");
+        .expect_err("import_resource_state is not implemented yet");
     assert_eq!(status.code(), Code::Unimplemented);
+}
+
+#[tokio::test]
+async fn read_data_source_computes_state() {
+    let svc = service();
+
+    // The data source's cty object type: required `name`, computed `arn`.
+    let cty_ty = terraform_value::Type::Object(vec![
+        terraform_value::ObjectAttr {
+            name: "name".into(),
+            ty: terraform_value::Type::String,
+            optional: false,
+        },
+        terraform_value::ObjectAttr {
+            name: "arn".into(),
+            ty: terraform_value::Type::String,
+            optional: true,
+        },
+    ]);
+
+    // Config: name known, computed arn null (as Terraform sends it).
+    let mut obj = std::collections::BTreeMap::new();
+    obj.insert(
+        "name".to_string(),
+        terraform_value::Value::String("lookup-me".into()),
+    );
+    obj.insert("arn".to_string(), terraform_value::Value::Null);
+    let config = terraform_value::Value::Object(obj);
+    let config_dv = tfplugin6::DynamicValue {
+        msgpack: terraform_codec::encode_msgpack(&config, &cty_ty).unwrap(),
+        json: vec![],
+    };
+
+    let resp = svc
+        .read_data_source(Request::new(tfplugin6::read_data_source::Request {
+            type_name: "aws_s3_bucket".into(),
+            config: Some(config_dv),
+            ..Default::default()
+        }))
+        .await
+        .expect("read_data_source")
+        .into_inner();
+    assert!(resp.diagnostics.is_empty(), "{:?}", resp.diagnostics);
+
+    let state = resp.state.expect("data source state");
+    let value = terraform_codec::decode_msgpack(&state.msgpack, &cty_ty).unwrap();
+    if let terraform_value::Value::Object(fields) = value {
+        assert_eq!(
+            fields["arn"],
+            terraform_value::Value::String("arn:aws:s3:::lookup-me".into()),
+            "the data source computed arn from the queried name"
+        );
+    } else {
+        panic!("data source state should be an object");
+    }
+}
+
+#[tokio::test]
+async fn read_data_source_unknown_type_errors() {
+    let svc = service();
+    let resp = svc
+        .read_data_source(Request::new(tfplugin6::read_data_source::Request {
+            type_name: "nonexistent".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("read_data_source")
+        .into_inner();
+    assert!(
+        !resp.diagnostics.is_empty(),
+        "unknown data source type should produce a diagnostic"
+    );
 }
 
 #[tokio::test]
