@@ -81,8 +81,9 @@ This is an early, in-progress implementation.
   decode, and the full lifecycle (`ConfigureProvider`, validation,
   `UpgradeResourceState`, `PlanResourceChange`, `ReadResource`,
   `ApplyResourceChange`) — verified by a real `tofu apply`/`destroy` test
-- **Phase 5 🚧** — planning engine: `force_new` → replacement, unknown
-  propagation, richer plan/diff semantics
+- **Phase 5 ✅** — planning engine: changing a `force_new` attribute emits
+  `requires_replace` (destroy + create), computed attributes go unknown on
+  replacement — verified by a real `tofu` replacement test
 
 ## Workspace layout
 

@@ -10,13 +10,13 @@
 use std::pin::Pin;
 
 use terraform_codec::{decode_json, decode_msgpack, encode_msgpack, CodecError};
-use terraform_ir::Block;
 use terraform_tfplugin6::{emit_metadata, emit_provider_schema, tfplugin6};
 use terraform_value::{Type, Value};
 use tonic::codegen::tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 use crate::builder::Provider;
+use crate::plan::plan;
 use crate::resource::{Diag, Diagnostics, Severity};
 
 /// A boxed server-streaming response of `T`. Used only to satisfy the trait's
@@ -181,6 +181,15 @@ impl tfplugin6::provider_server::Provider for ProviderService {
             }));
         };
 
+        let prior = match decode_dynamic(&req.prior_state, &ty) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to decode prior state", e.to_string()),
+                    ..Default::default()
+                }))
+            }
+        };
         let proposed = match decode_dynamic(&req.proposed_new_state, &ty) {
             Ok(v) => v,
             Err(e) => {
@@ -191,10 +200,11 @@ impl tfplugin6::provider_server::Provider for ProviderService {
             }
         };
 
-        let planned = plan_value(proposed, block);
-        match encode_dynamic(&planned, &ty) {
+        let plan = plan(&prior, proposed, block);
+        match encode_dynamic(&plan.planned, &ty) {
             Ok(dv) => Ok(Response::new(Resp {
                 planned_state: Some(dv),
+                requires_replace: plan.requires_replace,
                 planned_private: req.planned_private,
                 ..Default::default()
             })),
@@ -411,26 +421,6 @@ fn encode_dynamic(value: &Value, ty: &Type) -> Result<tfplugin6::DynamicValue, C
         msgpack: encode_msgpack(value, ty)?,
         json: Vec::new(),
     })
-}
-
-/// Compute the planned state from Terraform's proposed new state.
-///
-/// A null proposal is a destroy. Otherwise, computed attributes left null
-/// (because the caller cannot set them) become unknown, signalling that the
-/// provider will fill them during apply.
-fn plan_value(proposed: Value, block: &Block) -> Value {
-    if proposed.is_null() {
-        return Value::Null;
-    }
-    let Value::Object(mut fields) = proposed else {
-        return proposed;
-    };
-    for attr in &block.attributes {
-        if attr.computed && !attr.required && matches!(fields.get(&attr.name), Some(Value::Null)) {
-            fields.insert(attr.name.clone(), Value::Unknown);
-        }
-    }
-    Value::Object(fields)
 }
 
 /// Encode `value` and build a state response via `build`, surfacing encode

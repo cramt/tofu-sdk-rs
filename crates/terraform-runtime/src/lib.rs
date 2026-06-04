@@ -10,6 +10,7 @@
 
 mod builder;
 pub mod handshake;
+mod plan;
 mod resource;
 mod serve;
 mod service;

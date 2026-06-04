@@ -24,6 +24,37 @@ resource "aws_s3_bucket" "test" {
 }
 "#;
 
+/// A config whose bucket is named `name`.
+fn config(name: &str) -> String {
+    format!(
+        r#"
+terraform {{
+  required_providers {{
+    aws = {{
+      source = "example/aws"
+    }}
+  }}
+}}
+
+resource "aws_s3_bucket" "test" {{
+  name = "{name}"
+}}
+"#
+    )
+}
+
+/// The single bucket's attribute values from `tofu show -json` output.
+fn bucket_values(state: &Value) -> &Value {
+    let resources = state["values"]["root_module"]["resources"]
+        .as_array()
+        .expect("resources array");
+    let bucket = resources
+        .iter()
+        .find(|r| r["type"] == "aws_s3_bucket")
+        .expect("aws_s3_bucket in state");
+    &bucket["values"]
+}
+
 #[test]
 fn apply_show_destroy_lifecycle() {
     let engine = common::engine();
@@ -84,4 +115,52 @@ fn apply_show_destroy_lifecycle() {
         .map(|r| r.is_empty())
         .unwrap_or(true);
     assert!(empty, "all resources destroyed");
+}
+
+#[test]
+fn changing_force_new_attribute_replaces() {
+    let engine = common::engine();
+    let ws = common::workspace(&config("alpha"));
+
+    // Create with name = alpha.
+    common::assert_ok(
+        "apply (alpha)",
+        &common::run(&engine, &["apply", "-auto-approve"], &ws),
+    );
+    let show = common::run(&engine, &["show", "-json"], &ws);
+    common::assert_ok("show (alpha)", &show);
+    let state: Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(
+        bucket_values(&state)["arn"],
+        Value::from("arn:aws:s3:::alpha")
+    );
+
+    // Change the force_new `name` and plan: it must force replacement.
+    std::fs::write(ws.cfg.join("main.tf"), config("beta")).unwrap();
+    let plan = common::run(&engine, &["plan", "-no-color"], &ws);
+    common::assert_ok("plan (beta)", &plan);
+    let plan_out = String::from_utf8_lossy(&plan.stdout);
+    assert!(
+        plan_out.contains("forces replacement"),
+        "plan should report that changing `name` forces replacement:\n{plan_out}"
+    );
+
+    // Apply the replacement and confirm the computed arn tracks the new name.
+    common::assert_ok(
+        "apply (beta)",
+        &common::run(&engine, &["apply", "-auto-approve"], &ws),
+    );
+    let show = common::run(&engine, &["show", "-json"], &ws);
+    common::assert_ok("show (beta)", &show);
+    let state: Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(bucket_values(&state)["name"], Value::from("beta"));
+    assert_eq!(
+        bucket_values(&state)["arn"],
+        Value::from("arn:aws:s3:::beta")
+    );
+
+    common::assert_ok(
+        "destroy",
+        &common::run(&engine, &["destroy", "-auto-approve"], &ws),
+    );
 }
