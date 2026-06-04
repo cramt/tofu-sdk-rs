@@ -30,6 +30,10 @@ pub struct ProviderSchema {
 pub struct ResourceSchema {
     /// Fully-qualified type name, e.g. `aws_s3_bucket`.
     pub name: String,
+    /// The current state-schema version. Terraform stores this with each
+    /// resource's state and calls `UpgradeResourceState` to migrate older state
+    /// forward when this number is higher than the stored one.
+    pub version: i64,
     /// The resource's attribute/block structure.
     pub block: Block,
 }

@@ -39,12 +39,14 @@ interface RawProvider {
   config(schemaJson: string, configure: RawHandler): void;
   resource(
     typeName: string,
+    version: number,
     schemaJson: string,
     create: RawHandler,
     read: RawHandler,
     update: RawHandler,
     del: RawHandler,
     imp: RawHandler,
+    upgrade: RawHandler,
   ): void;
   dataSource(typeName: string, schemaJson: string, read: RawHandler): void;
   serve(): Promise<void>;
@@ -176,6 +178,11 @@ function validateOut<S extends z.ZodType>(schema: S, value: unknown, ctx: string
 /** A managed resource. `S` is the Zod model; `create` is required. */
 export interface Resource<S extends z.ZodObject<z.ZodRawShape>> extends Dispositions<S> {
   schema: S;
+  /**
+   * The current state-schema version (default 0). Raise it when a schema change
+   * needs migrating stored state, and implement `upgrade`.
+   */
+  version?: number;
   /** Create the resource and return its new state (computed fields filled). */
   create(planned: z.infer<S>): Promise<z.infer<S>>;
   /** Refresh state; return `null` if the resource no longer exists. */
@@ -186,6 +193,11 @@ export interface Resource<S extends z.ZodObject<z.ZodRawShape>> extends Disposit
   delete?(prior: z.infer<S>): Promise<void>;
   /** Import an existing resource by ID, returning its state (then refreshed via `read`). */
   import?(id: string): Promise<z.infer<S>>;
+  /**
+   * Migrate stored state written at `fromVersion` to the current schema.
+   * `prior` is the raw stored state (untyped — it predates the current schema).
+   */
+  upgrade?(fromVersion: number, prior: unknown): Promise<z.infer<S>>;
 }
 
 /** A singular read-only data source: given a config, produce a state. */
@@ -271,7 +283,31 @@ export class Provider {
       const imported = await def.import(id);
       return JSON.stringify(validateOut(def.schema, imported, `resource ${typeName} import`));
     };
-    this.raw.resource(typeName, schemaJson(def.schema, def), create, read, update, del, imp);
+    const upgrade: RawHandler = async (err, input) => {
+      if (err) throw err;
+      const { fromVersion, priorState } = JSON.parse(input) as {
+        fromVersion: number;
+        priorState: unknown;
+      };
+      if (!def.upgrade) {
+        throw new Error(
+          `resource "${typeName}" has no state upgrade (stored version ${fromVersion})`,
+        );
+      }
+      const next = await def.upgrade(fromVersion, priorState);
+      return JSON.stringify(validateOut(def.schema, next, `resource ${typeName} upgrade`));
+    };
+    this.raw.resource(
+      typeName,
+      def.version ?? 0,
+      schemaJson(def.schema, def),
+      create,
+      read,
+      update,
+      del,
+      imp,
+      upgrade,
+    );
     return this;
   }
 

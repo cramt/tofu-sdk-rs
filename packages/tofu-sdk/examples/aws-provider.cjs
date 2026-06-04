@@ -34,6 +34,7 @@ new Provider()
   // A managed resource: `name` forces replacement; `arn`/`region` are computed.
   .resource("aws_s3_bucket", {
     schema: Bucket,
+    version: 1,
     forceNew: ["name"],
     computed: ["arn", "region"],
     async create(planned) {
@@ -45,6 +46,11 @@ new Provider()
     // Import an existing bucket by name (the id), recovering its computed state.
     async import(id) {
       return { name: id, arn: `${ARN_PREFIX}${id}`, region };
+    },
+    // Migrate v0 state, which named the bucket `bucket` instead of `name`.
+    async upgrade(_fromVersion, prior) {
+      const name = prior?.name ?? prior?.bucket ?? "";
+      return { name, arn: `${ARN_PREFIX}${name}`, region };
     },
   })
   // A singular data source: look a bucket up by name and compute its arn.

@@ -97,14 +97,18 @@ impl is a working provider, exercised end-to-end against **real OpenTofu**
   verified by real `tofu test` `data` reads
 - **Import ✅** — `Resource::import(id)` dispatched on `ImportResourceState`
   (then refreshed via `read`) — verified by a real `tofu import`
+- **State upgrades ✅** — a resource declares `SCHEMA_VERSION` and an
+  `upgrade(from_version, prior)` migration; `UpgradeResourceState` runs it when
+  stored state predates the current schema — verified by a real `tofu` refresh
+  over pre-seeded v0 state
 
 ### Not yet implemented
 
 HCL nested *block* syntax (nested object/list/map *attributes* work), config
-validation hooks, custom plan modification, state upgrade, functions, ephemeral
-resources, move, and a `TfValue<T>` field wrapper to preserve known/unknown/null
-through decode (today `Unknown` decodes to the type's zero value). Numbers are
-held as `f64`. Not all `cty` corner cases are covered.
+validation hooks, custom plan modification, functions, ephemeral resources,
+move, and a `TfValue<T>` field wrapper to preserve known/unknown/null through
+decode (today `Unknown` decodes to the type's zero value). Numbers are held as
+`f64`. Not all `cty` corner cases are covered.
 
 ## Workspace layout
 

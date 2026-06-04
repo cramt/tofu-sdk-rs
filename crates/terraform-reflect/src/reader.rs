@@ -73,6 +73,7 @@ pub fn reflect_resource<T: Facet<'static>>(
 ) -> Result<ResourceSchema, ReflectError> {
     Ok(ResourceSchema {
         name: name.into(),
+        version: 0,
         block: reflect_block::<T>()?,
     })
 }

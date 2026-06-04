@@ -620,6 +620,34 @@ impl terraform_runtime::DynResource for DynEchoArn {
         );
         Ok(terraform_value::Value::Object(fields))
     }
+
+    async fn upgrade(
+        &self,
+        _from_version: i64,
+        prior: terraform_value::Value,
+    ) -> Result<terraform_value::Value, terraform_runtime::Diagnostics> {
+        // Migrate by renaming the old `bucket` field to `name`, recomputing arn.
+        let terraform_value::Value::Object(old) = prior else {
+            return Err(vec![terraform_runtime::Diag::error(
+                "bad prior state",
+                "expected an object",
+            )]);
+        };
+        let name = match old.get("bucket") {
+            Some(terraform_value::Value::String(s)) => s.clone(),
+            _ => String::new(),
+        };
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(
+            "name".to_string(),
+            terraform_value::Value::String(name.clone()),
+        );
+        fields.insert(
+            "arn".to_string(),
+            terraform_value::Value::String(format!("arn:aws:s3:::{name}")),
+        );
+        Ok(terraform_value::Value::Object(fields))
+    }
 }
 
 #[tokio::test]
@@ -642,7 +670,7 @@ async fn dyn_resource_serves_from_hand_built_schema() {
         nested_blocks: vec![],
     };
     let provider = Provider::builder()
-        .dyn_resource("aws_s3_bucket", block, std::sync::Arc::new(DynEchoArn))
+        .dyn_resource("aws_s3_bucket", 1, block, std::sync::Arc::new(DynEchoArn))
         .build()
         .expect("dynamic provider builds");
     let svc = ProviderService::new(provider);
@@ -728,4 +756,35 @@ async fn dyn_resource_serves_from_hand_built_schema() {
     };
     assert_eq!(fields["name"], Value::String("b2".into()), "imported by id");
     assert_eq!(fields["arn"], Value::String("arn:aws:s3:::b2".into()));
+
+    // Upgrade from v0 state (old `bucket` field) migrates to the current schema.
+    let old_state = br#"{"bucket":"b3"}"#;
+    let upgraded = svc
+        .upgrade_resource_state(Request::new(tfplugin6::upgrade_resource_state::Request {
+            type_name: "aws_s3_bucket".into(),
+            version: 0,
+            raw_state: Some(tfplugin6::RawState {
+                json: old_state.to_vec(),
+                flatmap: std::collections::HashMap::new(),
+            }),
+        }))
+        .await
+        .expect("upgrade")
+        .into_inner();
+    assert!(
+        upgraded.diagnostics.is_empty(),
+        "{:?}",
+        upgraded.diagnostics
+    );
+    let state = upgraded.upgraded_state.expect("upgraded state");
+    let value = terraform_codec::decode_msgpack(&state.msgpack, &cty).unwrap();
+    let Value::Object(fields) = value else {
+        panic!("upgraded state should be an object");
+    };
+    assert_eq!(
+        fields["name"],
+        Value::String("b3".into()),
+        "v0 `bucket` migrated to `name`"
+    );
+    assert_eq!(fields["arn"], Value::String("arn:aws:s3:::b3".into()));
 }

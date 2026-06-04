@@ -24,8 +24,9 @@ pub fn emit_schema(block: &Block, version: i64) -> tfplugin6::Schema {
 
 /// Lower a whole [`ProviderSchema`] into a `GetProviderSchema` response.
 ///
-/// All schemas are emitted at state-schema version 0; per-resource versioning
-/// (for state upgrades) arrives with the planning/upgrade work in a later phase.
+/// Resource schemas carry their declared state-schema `version` (Terraform uses
+/// it to decide when to call `UpgradeResourceState`); the provider config block
+/// and data sources are stateless and emit at version 0.
 pub fn emit_provider_schema(schema: &ProviderSchema) -> get_provider_schema::Response {
     // Terraform requires the provider schema to always be present, even when the
     // provider takes no configuration — an absent `provider` field is reported as
@@ -41,7 +42,7 @@ pub fn emit_provider_schema(schema: &ProviderSchema) -> get_provider_schema::Res
         resource_schemas: schema
             .resources
             .iter()
-            .map(|r| (r.name.clone(), emit_schema(&r.block, 0)))
+            .map(|r| (r.name.clone(), emit_schema(&r.block, r.version)))
             .collect(),
         data_source_schemas: schema
             .data_sources

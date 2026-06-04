@@ -10,7 +10,7 @@
 
 use std::pin::Pin;
 
-use terraform_codec::{decode_json, decode_msgpack, encode_msgpack, CodecError};
+use terraform_codec::{decode_json, decode_json_value, decode_msgpack, encode_msgpack, CodecError};
 use terraform_tfplugin6::{emit_metadata, emit_provider_schema, tfplugin6};
 use terraform_value::{Type, Value};
 use tonic::codegen::tokio_stream::Stream;
@@ -147,7 +147,10 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         use tfplugin6::upgrade_resource_state::Response as Resp;
         let req = request.into_inner();
 
-        let Some(ty) = self.provider.resource_cty(&req.type_name) else {
+        let (Some(ty), Some(current_version)) = (
+            self.provider.resource_cty(&req.type_name),
+            self.provider.resource_version(&req.type_name),
+        ) else {
             return Ok(Response::new(Resp {
                 diagnostics: unknown_resource(&req.type_name),
                 ..Default::default()
@@ -155,11 +158,39 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         };
 
         // Stored state arrives as cty JSON in `raw_state.json`.
-        let value = match req.raw_state.as_ref() {
-            Some(raw) if !raw.json.is_empty() => match facet_json::from_slice(&raw.json)
-                .map_err(|e| CodecError::Decode(e.to_string()))
-                .and_then(|j: facet_value::Value| decode_json(&j, &ty))
-            {
+        let raw = match req.raw_state.as_ref() {
+            Some(raw) if !raw.json.is_empty() => raw.json.as_slice(),
+            // Empty state (a fresh resource) needs no upgrade.
+            _ => {
+                return Ok(Response::new(Resp {
+                    upgraded_state: encode_dynamic(&Value::Null, &ty).ok(),
+                    ..Default::default()
+                }))
+            }
+        };
+        let json: facet_value::Value = match facet_json::from_slice(raw) {
+            Ok(j) => j,
+            Err(e) => {
+                return Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to parse prior state", e.to_string()),
+                    ..Default::default()
+                }))
+            }
+        };
+
+        // Up to date already: the stored state matches the current schema, so it
+        // decodes directly. Otherwise hand the untyped prior state to the
+        // resource's upgrade migration.
+        let upgraded = if req.version >= current_version {
+            decode_json(&json, &ty).map_err(|e| e.to_string())
+        } else {
+            let Some(handler) = self.provider.resource_handler(&req.type_name) else {
+                return Ok(Response::new(Resp {
+                    diagnostics: unknown_resource(&req.type_name),
+                    ..Default::default()
+                }));
+            };
+            let prior = match decode_json_value(&json) {
                 Ok(v) => v,
                 Err(e) => {
                     return Ok(Response::new(Resp {
@@ -167,17 +198,25 @@ impl tfplugin6::provider_server::Provider for ProviderService {
                         ..Default::default()
                     }))
                 }
-            },
-            _ => Value::Null,
+            };
+            match handler.upgrade(req.version, prior).await {
+                Ok(v) => Ok(v),
+                Err(diags) => {
+                    return Ok(Response::new(Resp {
+                        diagnostics: pb_diagnostics(diags),
+                        ..Default::default()
+                    }))
+                }
+            }
         };
 
-        match encode_dynamic(&value, &ty) {
+        match upgraded.and_then(|v| encode_dynamic(&v, &ty).map_err(|e| e.to_string())) {
             Ok(dv) => Ok(Response::new(Resp {
                 upgraded_state: Some(dv),
                 ..Default::default()
             })),
             Err(e) => Ok(Response::new(Resp {
-                diagnostics: error_diag("failed to encode upgraded state", e.to_string()),
+                diagnostics: error_diag("failed to upgrade state", e),
                 ..Default::default()
             })),
         }

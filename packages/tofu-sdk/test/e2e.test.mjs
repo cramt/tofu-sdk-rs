@@ -156,6 +156,70 @@ output "list_names" {
   }
 });
 
+test("upgrades v0 state to the current schema", () => {
+  const bin = engine();
+  const { dir, cfg, env } = workspace();
+  try {
+    writeFileSync(
+      join(cfg, "main.tf"),
+      `
+terraform {
+  required_providers {
+    aws = {
+      source = "example/aws"
+    }
+  }
+}
+
+provider "aws" {
+  region = "eu-west-1"
+}
+
+resource "aws_s3_bucket" "test" {
+  name = "legacy"
+}
+`,
+    );
+    // Pre-seed state at schema_version 0, where the bucket was named by a
+    // `bucket` attribute (the current schema uses `name`).
+    const priorState = {
+      version: 4,
+      terraform_version: "1.12.0",
+      serial: 1,
+      lineage: "00000000-0000-0000-0000-000000000000",
+      outputs: {},
+      resources: [
+        {
+          mode: "managed",
+          type: "aws_s3_bucket",
+          name: "test",
+          provider: 'provider["registry.terraform.io/example/aws"]',
+          instances: [{ schema_version: 0, attributes: { bucket: "legacy" } }],
+        },
+      ],
+    };
+    writeFileSync(join(cfg, "terraform.tfstate"), JSON.stringify(priorState));
+
+    // A refresh reads prior state; the stored version (0) < current (1) triggers
+    // UpgradeResourceState, which runs the resource's `upgrade` migration.
+    const refresh = run(bin, ["apply", "-refresh-only", "-auto-approve"], cfg, env);
+    assert.equal(refresh.status, 0, `refresh failed:\n${refresh.stdout}\n${refresh.stderr}`);
+
+    const show = run(bin, ["show", "-json"], cfg, env);
+    assert.equal(show.status, 0, show.stderr);
+    const state = JSON.parse(show.stdout);
+    const bucket = state.values.root_module.resources.find(
+      (r) => r.type === "aws_s3_bucket",
+    ).values;
+    assert.equal(bucket.name, "legacy", "v0 `bucket` migrated to `name`");
+    assert.equal(bucket.arn, "arn:aws:s3:::legacy", "arn recomputed after upgrade");
+
+    run(bin, ["destroy", "-auto-approve"], cfg, env);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("imports an existing resource by id", () => {
   const bin = engine();
   const { dir, cfg, env } = workspace();

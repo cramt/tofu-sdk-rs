@@ -103,6 +103,14 @@ fn decode_json_each(items: &[Json], elem: &Type) -> Result<Vec<Value>, CodecErro
     items.iter().map(|v| decode_json(v, elem)).collect()
 }
 
+/// Structurally decode a `cty` JSON value into a [`Value`] **without** a schema:
+/// objects become [`Value::Object`], arrays [`Value::Tuple`], and scalars map by
+/// JSON kind. Used by `UpgradeResourceState`, where the stored state predates
+/// the current schema and so cannot be typed by it.
+pub fn decode_json_value(json: &Json) -> Result<Value, CodecError> {
+    decode_json_dynamic(json)
+}
+
 fn decode_json_dynamic(json: &Json) -> Result<Value, CodecError> {
     if json.is_null() {
         return Ok(Value::Null);

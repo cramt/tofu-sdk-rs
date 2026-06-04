@@ -132,6 +132,7 @@ struct JsResource {
     update: Handler,
     delete: Handler,
     import: Handler,
+    upgrade: Handler,
 }
 
 #[async_trait]
@@ -186,6 +187,28 @@ impl DynResource for JsResource {
         let out = promise.await.map_err(|e| handler_err("import", e))?;
         json_to_value(&out, &self.ty).map_err(|e| handler_err("import", e))
     }
+
+    async fn upgrade(
+        &self,
+        from_version: i64,
+        prior: Value,
+    ) -> std::result::Result<Value, Diagnostics> {
+        // The upgrade handler sees `{ fromVersion, priorState }`; the prior state
+        // is the untyped stored state.
+        let input = Value::Object(
+            [
+                (
+                    "fromVersion".to_string(),
+                    Value::Number(from_version as f64),
+                ),
+                ("priorState".to_string(), prior),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let out = call_handler(&self.upgrade, &input, "upgrade").await?;
+        json_to_value(&out, &self.ty).map_err(|e| handler_err("upgrade", e))
+    }
 }
 
 /// A data source whose read is one async JS callback. Singular vs plural is
@@ -223,6 +246,7 @@ impl DynConfigure for JsConfigure {
 /// A registered resource, ready to hand to the builder at serve time.
 struct ResourceReg {
     name: String,
+    version: i64,
     block: Block,
     handler: Arc<dyn DynResource>,
 }
@@ -286,20 +310,24 @@ impl Provider {
     /// Register a managed resource: its `type_name`, a schema description
     /// (`schema_json`), and the four async lifecycle handlers.
     #[napi]
+    #[allow(clippy::too_many_arguments)]
     pub fn resource(
         &mut self,
         type_name: String,
+        version: i32,
         schema_json: String,
         create: ThreadsafeFunction<String, Promise<String>>,
         read: ThreadsafeFunction<String, Promise<String>>,
         update: ThreadsafeFunction<String, Promise<String>>,
         delete: ThreadsafeFunction<String, Promise<String>>,
         import: ThreadsafeFunction<String, Promise<String>>,
+        upgrade: ThreadsafeFunction<String, Promise<String>>,
     ) -> Result<()> {
         let block = block_from_schema_json(&schema_json).map_err(napi_err)?;
         let ty = block.cty_type();
         self.resources.push(ResourceReg {
             name: type_name,
+            version: version as i64,
             block,
             handler: Arc::new(JsResource {
                 ty,
@@ -308,6 +336,7 @@ impl Provider {
                 update,
                 delete,
                 import,
+                upgrade,
             }),
         });
         Ok(())
@@ -345,7 +374,12 @@ impl Provider {
                 .dyn_configure(Arc::clone(&cfg.handler));
         }
         for r in &self.resources {
-            builder = builder.dyn_resource(r.name.clone(), r.block.clone(), Arc::clone(&r.handler));
+            builder = builder.dyn_resource(
+                r.name.clone(),
+                r.version,
+                r.block.clone(),
+                Arc::clone(&r.handler),
+            );
         }
         for d in &self.data_sources {
             builder =

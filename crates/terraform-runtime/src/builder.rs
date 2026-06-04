@@ -168,6 +168,15 @@ impl Provider {
             .map(|r| &r.block)
     }
 
+    /// The current state-schema version of resource `name`.
+    pub(crate) fn resource_version(&self, name: &str) -> Option<i64> {
+        self.schema
+            .resources
+            .iter()
+            .find(|r| r.name == name)
+            .map(|r| r.version)
+    }
+
     /// The `cty` object type of data source `name`, derived from its schema block.
     pub(crate) fn data_source_cty(&self, name: &str) -> Option<Type> {
         self.schema
@@ -249,7 +258,8 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
     pub fn resource<R: Resource>(mut self, name: impl Into<String>, handler: R) -> Self {
         let name = name.into();
         match reflect_resource::<R::Model>(name.clone()) {
-            Ok(resource) => {
+            Ok(mut resource) => {
+                resource.version = R::SCHEMA_VERSION;
                 self.schema.resources.push(resource);
                 self.resources
                     .insert(name, ResourceAdapter::erased(handler));
@@ -272,7 +282,8 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
     {
         let name = name.into();
         match reflect_resource::<R::Model>(name.clone()) {
-            Ok(resource) => {
+            Ok(mut resource) => {
+                resource.version = R::SCHEMA_VERSION;
                 self.schema.resources.push(resource);
                 let make: ResourceFactory<M> =
                     Box::new(move |meta: Arc<M>| ResourceAdapter::erased(factory(meta)));
@@ -406,12 +417,14 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
     pub fn dyn_resource(
         mut self,
         name: impl Into<String>,
+        version: i64,
         block: Block,
         handler: Arc<dyn DynResource>,
     ) -> Self {
         let name = name.into();
         self.schema.resources.push(ResourceSchema {
             name: name.clone(),
+            version,
             block,
         });
         self.resources.insert(name, handler);

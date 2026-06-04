@@ -106,6 +106,10 @@ pub trait Resource: Send + Sync + 'static {
     /// The Rust type modeling this resource's schema (config + computed state).
     type Model: Facet<'static> + Send + Sync;
 
+    /// The current state-schema version. Bump it when a schema change requires
+    /// migrating stored state, and implement [`upgrade`](Resource::upgrade).
+    const SCHEMA_VERSION: i64 = 0;
+
     /// Create the resource from its planned state and return the new state with
     /// computed attributes filled in.
     async fn create(&self, planned: Self::Model) -> Result<Self::Model, ResourceError>;
@@ -140,6 +144,21 @@ pub trait Resource: Send + Sync + 'static {
     async fn import(&self, _id: String) -> Result<Self::Model, ResourceError> {
         Err(ResourceError::new("this resource does not support import"))
     }
+
+    /// Migrate stored state written at `from_version` (an older
+    /// [`SCHEMA_VERSION`](Resource::SCHEMA_VERSION)) to the current schema.
+    /// `prior` is the raw stored state as a dynamic [`Value`] — it predates the
+    /// current `Model`, so it is untyped (objects/lists/scalars). Defaults to an
+    /// error; implement it whenever you raise `SCHEMA_VERSION`.
+    async fn upgrade(
+        &self,
+        _from_version: i64,
+        _prior: Value,
+    ) -> Result<Self::Model, ResourceError> {
+        Err(ResourceError::new(
+            "this resource does not support state upgrades",
+        ))
+    }
 }
 
 /// Object-safe, value-oriented form of [`Resource`] that the service dispatches
@@ -152,6 +171,7 @@ pub trait DynResource: Send + Sync {
     async fn update(&self, planned: Value, prior: Value) -> Result<Value, Diagnostics>;
     async fn delete(&self, prior: Value) -> Result<(), Diagnostics>;
     async fn import(&self, id: String) -> Result<Value, Diagnostics>;
+    async fn upgrade(&self, from_version: i64, prior: Value) -> Result<Value, Diagnostics>;
 }
 
 /// Wraps a typed [`Resource`] as an erased [`DynResource`].
@@ -234,5 +254,15 @@ impl<R: Resource> DynResource for ResourceAdapter<R> {
             .map_err(Diag::from)
             .map_err(|d| vec![d])?;
         to_value(&result).map_err(|e| codec_diag("encode imported state", e))
+    }
+
+    async fn upgrade(&self, from_version: i64, prior: Value) -> Result<Value, Diagnostics> {
+        let result = self
+            .inner
+            .upgrade(from_version, prior)
+            .await
+            .map_err(Diag::from)
+            .map_err(|d| vec![d])?;
+        to_value(&result).map_err(|e| codec_diag("encode upgraded state", e))
     }
 }

@@ -20,7 +20,7 @@ mod decode;
 mod encode;
 mod typed;
 
-pub use decode::{decode_json, decode_msgpack};
+pub use decode::{decode_json, decode_json_value, decode_msgpack};
 pub use encode::{encode_json, encode_msgpack};
 pub use typed::{from_value, to_value, TypedError};
 
