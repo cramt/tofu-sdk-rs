@@ -63,9 +63,9 @@ pub struct Workspace {
     pub cfg: PathBuf,
 }
 
-/// Build a workspace whose `main.tf` is `config_tf`, wired to the example
-/// provider binary via `dev_overrides` (so no `init` is needed).
-pub fn workspace(config_tf: &str) -> Workspace {
+/// Build an empty workspace (provider symlinked, CLI config written, empty
+/// config dir) ready to be populated with config files.
+fn empty_workspace() -> Workspace {
     let provider_bin = env!("CARGO_BIN_EXE_example-aws");
     let dir = TempDir::new();
 
@@ -84,13 +84,34 @@ pub fn workspace(config_tf: &str) -> Workspace {
 
     let cfg = dir.path().join("cfg");
     fs::create_dir_all(&cfg).unwrap();
-    fs::write(cfg.join("main.tf"), config_tf).unwrap();
 
     Workspace {
         _dir: dir,
         tofurc,
         cfg,
     }
+}
+
+/// Build a workspace whose `main.tf` is `config_tf`, wired to the example
+/// provider binary via `dev_overrides` (so no `init` is needed).
+pub fn workspace(config_tf: &str) -> Workspace {
+    let ws = empty_workspace();
+    fs::write(ws.cfg.join("main.tf"), config_tf).unwrap();
+    ws
+}
+
+/// Build a workspace by copying every file from `fixtures_dir` (a directory of
+/// `.tf` / `.tftest.hcl` files) into the config dir. Used to run a `tofu test`
+/// suite that lives in the repo under `tests/tofu/`.
+pub fn workspace_from_fixtures(fixtures_dir: &Path) -> Workspace {
+    let ws = empty_workspace();
+    for entry in fs::read_dir(fixtures_dir).expect("read fixtures dir") {
+        let entry = entry.expect("fixtures dir entry");
+        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            fs::copy(entry.path(), ws.cfg.join(entry.file_name())).expect("copy fixture file");
+        }
+    }
+    ws
 }
 
 /// Run an engine command in the workspace.

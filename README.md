@@ -110,7 +110,7 @@ held as `f64`. Not all `cty` corner cases are covered.
 | `terraform-provider` | The public, author-facing facade |
 | `terraform-codec` | `DynamicValue` codec (cty msgpack/JSON) + typed encode/decode |
 | `terraform-macros` | Reserved for convenience derives |
-| `example-aws` | A minimal example provider + the OpenTofu contract test |
+| `example-aws` | A minimal example provider + the OpenTofu `tofu test` e2e suite |
 
 ## Developing
 
@@ -121,8 +121,10 @@ nix develop
 cargo test --workspace
 ```
 
-The contract test in `example-aws` drives a real `tofu`/`terraform` binary, so
-it requires one on `PATH` (provided by the dev shell).
+The e2e suite in `example-aws` runs the engine's native `tofu test` framework
+(`tests/tofu/*.tftest.hcl`) plus a schema contract test, driving a real
+`tofu`/`terraform` binary — so it requires one on `PATH` (provided by the dev
+shell).
 
 ## License
 

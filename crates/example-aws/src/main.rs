@@ -51,6 +51,12 @@ struct Bucket {
     #[facet(terraform::computed)]
     region: String,
 
+    /// Which handler last wrote this resource: `"created"` or `"updated"`. It
+    /// lets the `tofu test` suite observe whether a change replaced the bucket
+    /// (the create path runs again) or updated it in place.
+    #[facet(terraform::computed)]
+    last_action: String,
+
     /// Free-form tags.
     tags: Option<HashMap<String, String>>,
 }
@@ -61,10 +67,12 @@ struct BucketResource {
 }
 
 impl BucketResource {
-    /// Fill the computed attributes from the (known) name and configured region.
-    fn computed(&self, mut bucket: Bucket) -> Bucket {
+    /// Fill the computed attributes from the (known) name and configured region,
+    /// recording which lifecycle handler ran in `last_action`.
+    fn computed(&self, mut bucket: Bucket, action: &str) -> Bucket {
         bucket.arn = format!("arn:aws:s3:::{}", bucket.name);
         bucket.region = self.client.region.clone();
+        bucket.last_action = action.to_string();
         bucket
     }
 }
@@ -74,11 +82,11 @@ impl Resource for BucketResource {
     type Model = Bucket;
 
     async fn create(&self, planned: Bucket) -> Result<Bucket, ResourceError> {
-        Ok(self.computed(planned))
+        Ok(self.computed(planned, "created"))
     }
 
     async fn update(&self, planned: Bucket, _prior: Bucket) -> Result<Bucket, ResourceError> {
-        Ok(self.computed(planned))
+        Ok(self.computed(planned, "updated"))
     }
 }
 

@@ -107,20 +107,39 @@ planning engine lives in `plan.rs`.
 
 ## Testing approach
 
-Two layers, deliberately:
+Three layers, deliberately:
 
 1. **Logic via direct trait calls** — the generated gRPC service is an ordinary
    async trait, so tests construct `ProviderService` and call methods directly
    (no socket/client). See `terraform-runtime/tests/service.rs`.
-2. **Real-engine contract tests** — `example-aws/tests/` drives an actual
-   `tofu`/`terraform` binary via a `dev_overrides` workspace
-   (`tests/common/mod.rs`), covering schema, full apply/destroy lifecycle, and
-   `force_new` replacement. These **require `tofu` or `terraform` on `PATH`**
-   (the dev shell provides it) and are the source of truth for protocol
-   compatibility.
+2. **Native `tofu test` e2e suite** — the lifecycle is driven by the engine's
+   own test framework. The `.tftest.hcl` files in `example-aws/tests/tofu/`
+   hold the real `run`/`assert` blocks (apply/plan, computed values, provider
+   config, `force_new` replacement); `tofu test` performs real apply/destroy
+   cycles through the plugin protocol. `example-aws/tests/tofu_test.rs` is a
+   thin runner that lays out the `dev_overrides` workspace and shells out to
+   `tofu test` so the suite runs under `cargo test --workspace`.
+3. **Schema contract test** — `example-aws/tests/tofu_schema.rs` parses
+   `providers schema -json` (the native test framework only asserts plan/apply
+   state, not schema, so this stays a Rust test).
+
+Both engine-backed layers **require `tofu` or `terraform` on `PATH`** (the dev
+shell provides it) and are the source of truth for protocol compatibility. The
+shared `dev_overrides` workspace plumbing lives in `tests/common/mod.rs`.
+
+Notes / gotchas for the `tofu test` suite:
+- **`force_new` is asserted indirectly via `last_action`.** The framework can
+  assert attribute *values* but not the planned *action* (replace vs in-place
+  update). The example `Bucket` has a computed `last_action` set to `"created"`
+  by `create` and `"updated"` by `update`; a replacement re-runs `create`, so
+  asserting `last_action == "created"` after a rename proves replacement.
+- **Don't add an in-place run that expects `last_action == "updated"`.** The
+  planning engine only marks computed attrs unknown when null or replacing
+  (`plan.rs`), so an in-place update that changed `last_action` would trip
+  Terraform's "inconsistent result after apply" check.
 
 Do not reintroduce hand-rolled gRPC clients / subprocess+UDS plumbing for tests
-— the real-engine path is both simpler and higher-fidelity.
+— the engine-backed path is both simpler and higher-fidelity.
 
 ### Run the example against tofu by hand
 
