@@ -11,16 +11,12 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # External
-# Using the git source: the crates.io release of facet 0.46.5 requires
-# facet-reflect 0.46.5, which was never published, so the `reflect` feature
-# (Peek/Partial) is unresolvable from crates.io. The git repo is internally
-# consistent. (Reported upstream.)
-facet = { git = "https://github.com/facet-rs/facet" }
-# facet-json / facet-value live in the facet-format repo (split out of the
-# monorepo). The published 0.46 releases pin `facet-core = "0.46"` (matching the
-# facet git pin); their transitive `facet-reflect = "0.46"` is unpublished, so we
-# patch facet-core/facet-reflect to the git source below to unify on one
-# facet-core. JSON handling goes through these instead of serde.
+# facet 0.46.5 (and facet-core/facet-reflect/facet-path/facet-solver 0.46.5) are
+# all published on crates.io now, so the `reflect` feature (Peek/Partial)
+# resolves without a git source or a [patch.crates-io] override. JSON handling
+# goes through facet-json / facet-value (from the facet-format repo) instead of
+# serde; their transitive facet-* deps are ^0.46 and unify on facet-core 0.46.5.
+facet = "0.46"
 facet-json = "0.46"
 facet-value = "0.46"
 thiserror = "2"
@@ -35,16 +31,6 @@ terraform-runtime = { path = "crates/terraform-runtime" }
 terraform-tfplugin6 = { path = "crates/terraform-tfplugin6" }
 terraform-macros = { path = "crates/terraform-macros" }
 terraform-provider = { path = "crates/terraform-provider" }
-
-# facet-json/facet-value (and their facet-format/facet-reflect deps) request
-# crates.io facet-core/facet-reflect ^0.46; point those at the git facet repo so
-# the entire tree shares one facet-core 0.46.5 (and so the unpublished
-# facet-reflect 0.46 resolves at all).
-[patch.crates-io]
-facet-core = { git = "https://github.com/facet-rs/facet" }
-facet-reflect = { git = "https://github.com/facet-rs/facet" }
-facet-path = { git = "https://github.com/facet-rs/facet" }
-facet-solver = { git = "https://github.com/facet-rs/facet" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"
