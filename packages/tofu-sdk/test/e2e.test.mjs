@@ -85,6 +85,10 @@ data "aws_s3_bucket" "looked_up" {
   name = "queried"
 }
 
+data "aws_s3_buckets" "many" {
+  name = "team"
+}
+
 output "arn" {
   value = aws_s3_bucket.test.arn
 }
@@ -95,6 +99,10 @@ output "region" {
 
 output "data_arn" {
   value = data.aws_s3_bucket.looked_up.arn
+}
+
+output "list_names" {
+  value = data.aws_s3_buckets.many.results[*].name
 }
 `,
     );
@@ -110,6 +118,11 @@ output "data_arn" {
     assert.equal(outputs.arn.value, "arn:aws:s3:::e2e-bucket", "resource computed arn");
     assert.equal(outputs.region.value, "eu-west-1", "configured provider region reached the resource");
     assert.equal(outputs.data_arn.value, "arn:aws:s3:::queried", "data source computed arn");
+    assert.deepEqual(
+      outputs.list_names.value,
+      ["team", "team-staging"],
+      "plural data source returned the results list",
+    );
 
     // Renaming the force_new `name` must plan a replacement.
     const plan = run(

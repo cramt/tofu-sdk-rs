@@ -64,6 +64,9 @@ are available for the Rust build.
 
 ## Status
 
-Early. Resources and singular data sources work end-to-end against real
-OpenTofu. Provider configuration, plural (list) data sources, and prebuilt
-multi-platform binaries are not wired up yet.
+Early but functional. Resources (CRUD + `force_new` replacement), provider
+configuration (`config`), and both singular (`dataSource`) and plural
+(`dataSourceList`) data sources work end-to-end against real OpenTofu — see
+`test/e2e.test.mjs`. Not yet wired up: prebuilt multi-platform binaries, nested
+blocks, and a generated `terraform-provider-*` launcher (you write the shebang
+entry yourself for now).

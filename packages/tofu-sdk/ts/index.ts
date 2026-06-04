@@ -113,6 +113,17 @@ export interface DataSource<TConfig, TState = TConfig> {
 }
 
 /**
+ * A plural data source: a lookup by one or more `searchKeys` that resolves to a
+ * `results` list. `schema` describes one result element; `searchKeys` names the
+ * element fields that double as query inputs.
+ */
+export interface DataSourceList<TQuery, TElement> {
+  schema: Schema;
+  searchKeys: string[];
+  list(query: TQuery): Promise<TElement[]>;
+}
+
+/**
  * Provider-level configuration. `configure` runs once when the host configures
  * the provider; use it to set up state (clients, credentials, defaults) that
  * your resource and data-source handlers close over.
@@ -184,7 +195,7 @@ export class Provider {
     return this;
   }
 
-  /** Register a read-only data source under `typeName`. */
+  /** Register a singular read-only data source under `typeName`. */
   dataSource<TConfig extends Record<string, unknown>, TState>(
     typeName: string,
     def: DataSource<TConfig, TState>,
@@ -194,6 +205,41 @@ export class Provider {
       schemaToJson(def.schema),
       adapt((config: TConfig) => def.read(config)),
     );
+    return this;
+  }
+
+  /**
+   * Register a plural read-only data source under `typeName`: the `searchKeys`
+   * are query inputs and the result is a computed `results` list of objects
+   * matching `schema`.
+   */
+  dataSourceList<TQuery extends Record<string, unknown>, TElement>(
+    typeName: string,
+    def: DataSourceList<TQuery, TElement>,
+  ): this {
+    // Each result element is an object of the full element schema.
+    const elementType: CtyType = [
+      "object",
+      Object.fromEntries(
+        Object.entries(def.schema).map(([name, attr]) => [name, attr.type]),
+      ),
+    ];
+    // The wrapper block: the search keys as optional inputs, plus `results`.
+    const wrapper: Schema = {};
+    for (const key of def.searchKeys) {
+      wrapper[key] = { type: def.schema[key].type, optional: true };
+    }
+    wrapper.results = { type: ["list", elementType], computed: true };
+
+    const read: RawHandler = async (err, input) => {
+      if (err) throw err;
+      const config = JSON.parse(input) as TQuery;
+      const items = await def.list(config);
+      const inputs: Record<string, unknown> = {};
+      for (const key of def.searchKeys) inputs[key] = config[key];
+      return JSON.stringify({ ...inputs, results: items });
+    };
+    this.raw.dataSource(typeName, schemaToJson(wrapper), read);
     return this;
   }
 

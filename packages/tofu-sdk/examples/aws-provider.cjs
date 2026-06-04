@@ -36,7 +36,7 @@ new Provider()
       return { ...planned, arn: `${ARN_PREFIX}${planned.name}`, region };
     },
   })
-  // A read-only data source: look a bucket up by name and compute its arn.
+  // A singular data source: look a bucket up by name and compute its arn.
   .dataSource("aws_s3_bucket", {
     schema: {
       name: { type: "string", required: true },
@@ -44,6 +44,21 @@ new Provider()
     },
     async read(config) {
       return { ...config, arn: `${ARN_PREFIX}${config.name}` };
+    },
+  })
+  // A plural data source: look buckets up by `name` -> a `results` list. The
+  // example has no backing store, so it synthesizes a couple of matches.
+  .dataSourceList("aws_s3_buckets", {
+    schema: {
+      name: { type: "string" },
+      arn: { type: "string" },
+    },
+    searchKeys: ["name"],
+    async list(query) {
+      return ["", "-staging"].map((suffix) => {
+        const name = `${query.name}${suffix}`;
+        return { name, arn: `${ARN_PREFIX}${name}` };
+      });
     },
   })
   .serve()
