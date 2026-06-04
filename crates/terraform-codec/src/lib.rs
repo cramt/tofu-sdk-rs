@@ -18,9 +18,11 @@
 
 mod decode;
 mod encode;
+mod typed;
 
 pub use decode::decode_msgpack;
 pub use encode::encode_msgpack;
+pub use typed::{to_value, TypedError};
 
 /// An error from encoding or decoding a `DynamicValue`.
 #[derive(Debug, thiserror::Error)]
