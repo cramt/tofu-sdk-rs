@@ -13,8 +13,10 @@
 //! backend-agnostic core.
 
 mod ty;
+mod value;
 
 pub use ty::{ObjectAttr, Type};
+pub use value::Value;
 
 /// A Terraform value that may be known, unknown, or null.
 ///

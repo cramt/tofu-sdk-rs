@@ -96,6 +96,74 @@ impl Type {
             }
         }
     }
+
+    /// Parse a `cty` JSON type constraint (the inverse of [`Type::to_cty_json`]).
+    ///
+    /// Used when decoding a `DynamicPseudoType` value, whose wire form carries
+    /// the concrete type as embedded JSON.
+    pub fn from_cty_json(json: &Json) -> Result<Type, String> {
+        match json {
+            Json::String(s) => match s.as_str() {
+                "bool" => Ok(Type::Bool),
+                "number" => Ok(Type::Number),
+                "string" => Ok(Type::String),
+                "dynamic" => Ok(Type::Dynamic),
+                other => Err(format!("unknown primitive cty type {other:?}")),
+            },
+            Json::Array(items) => {
+                let kind = items
+                    .first()
+                    .and_then(Json::as_str)
+                    .ok_or_else(|| "cty type array must start with a kind string".to_string())?;
+                match kind {
+                    "list" => Ok(Type::list(Self::nth_type(items, 1)?)),
+                    "set" => Ok(Type::set(Self::nth_type(items, 1)?)),
+                    "map" => Ok(Type::map(Self::nth_type(items, 1)?)),
+                    "tuple" => {
+                        let elems = items
+                            .get(1)
+                            .and_then(Json::as_array)
+                            .ok_or_else(|| "tuple type needs an element-type array".to_string())?;
+                        let tys = elems
+                            .iter()
+                            .map(Type::from_cty_json)
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(Type::Tuple(tys))
+                    }
+                    "object" => {
+                        let fields = items
+                            .get(1)
+                            .and_then(Json::as_object)
+                            .ok_or_else(|| "object type needs an attribute map".to_string())?;
+                        let optionals: Vec<&str> = items
+                            .get(2)
+                            .and_then(Json::as_array)
+                            .map(|a| a.iter().filter_map(Json::as_str).collect())
+                            .unwrap_or_default();
+                        let mut attrs = Vec::with_capacity(fields.len());
+                        for (name, ty) in fields {
+                            attrs.push(ObjectAttr {
+                                name: name.clone(),
+                                ty: Type::from_cty_json(ty)?,
+                                optional: optionals.contains(&name.as_str()),
+                            });
+                        }
+                        Ok(Type::Object(attrs))
+                    }
+                    other => Err(format!("unknown cty collection kind {other:?}")),
+                }
+            }
+            other => Err(format!("invalid cty type constraint: {other}")),
+        }
+    }
+
+    /// Helper: parse the element type at `index` of a collection type array.
+    fn nth_type(items: &[Json], index: usize) -> Result<Type, String> {
+        let elem = items
+            .get(index)
+            .ok_or_else(|| "collection type missing element type".to_string())?;
+        Type::from_cty_json(elem)
+    }
 }
 
 #[cfg(test)]
@@ -154,5 +222,36 @@ mod tests {
             optional: false,
         }]);
         assert_eq!(ty.to_cty_json(), json!(["object", {"a": "string"}]));
+    }
+
+    #[test]
+    fn cty_json_round_trips() {
+        let types = [
+            Type::String,
+            Type::Number,
+            Type::Bool,
+            Type::Dynamic,
+            Type::list(Type::String),
+            Type::set(Type::Bool),
+            Type::map(Type::Number),
+            Type::Tuple(vec![Type::String, Type::Number]),
+            Type::Object(vec![
+                ObjectAttr {
+                    name: "a".into(),
+                    ty: Type::String,
+                    optional: false,
+                },
+                ObjectAttr {
+                    name: "b".into(),
+                    ty: Type::Number,
+                    optional: true,
+                },
+            ]),
+        ];
+        for ty in types {
+            let json = ty.to_cty_json();
+            let back = Type::from_cty_json(&json).expect("parses back");
+            assert_eq!(back, ty, "round trip for {json}");
+        }
     }
 }

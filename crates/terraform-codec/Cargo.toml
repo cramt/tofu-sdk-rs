@@ -8,6 +8,9 @@ rust-version.workspace = true
 
 [dependencies]
 terraform-value = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+rmpv = "1"
 
 [lints]
 workspace = true
