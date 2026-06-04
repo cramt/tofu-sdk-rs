@@ -44,6 +44,7 @@ interface RawProvider {
     read: RawHandler,
     update: RawHandler,
     del: RawHandler,
+    imp: RawHandler,
   ): void;
   dataSource(typeName: string, schemaJson: string, read: RawHandler): void;
   serve(): Promise<void>;
@@ -183,6 +184,8 @@ export interface Resource<S extends z.ZodObject<z.ZodRawShape>> extends Disposit
   update?(planned: z.infer<S>, prior: z.infer<S>): Promise<z.infer<S>>;
   /** Delete the resource. */
   delete?(prior: z.infer<S>): Promise<void>;
+  /** Import an existing resource by ID, returning its state (then refreshed via `read`). */
+  import?(id: string): Promise<z.infer<S>>;
 }
 
 /** A singular read-only data source: given a config, produce a state. */
@@ -259,7 +262,16 @@ export class Provider {
       if (def.delete) await def.delete(prior);
       return null;
     });
-    this.raw.resource(typeName, schemaJson(def.schema, def), create, read, update, del);
+    // The import handler's input is the raw ID string, not marshalled JSON.
+    const imp: RawHandler = async (err, id) => {
+      if (err) throw err;
+      if (!def.import) {
+        throw new Error(`resource "${typeName}" does not support import`);
+      }
+      const imported = await def.import(id);
+      return JSON.stringify(validateOut(def.schema, imported, `resource ${typeName} import`));
+    };
+    this.raw.resource(typeName, schemaJson(def.schema, def), create, read, update, del, imp);
     return this;
   }
 

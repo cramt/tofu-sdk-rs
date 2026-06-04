@@ -155,13 +155,13 @@ async fn get_metadata_lists_type_names() {
 #[tokio::test]
 async fn unimplemented_rpc_returns_unimplemented() {
     let svc = service();
-    // Import is not implemented yet.
+    // Move is not implemented yet.
     let status = svc
-        .import_resource_state(Request::new(
-            tfplugin6::import_resource_state::Request::default(),
+        .move_resource_state(Request::new(
+            tfplugin6::move_resource_state::Request::default(),
         ))
         .await
-        .expect_err("import_resource_state is not implemented yet");
+        .expect_err("move_resource_state is not implemented yet");
     assert_eq!(status.code(), Code::Unimplemented);
 }
 
@@ -603,6 +603,23 @@ impl terraform_runtime::DynResource for DynEchoArn {
     ) -> Result<(), terraform_runtime::Diagnostics> {
         Ok(())
     }
+
+    async fn import(
+        &self,
+        id: String,
+    ) -> Result<terraform_value::Value, terraform_runtime::Diagnostics> {
+        // Import by name: produce a state with `name` set, `arn` computed.
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(
+            "name".to_string(),
+            terraform_value::Value::String(id.clone()),
+        );
+        fields.insert(
+            "arn".to_string(),
+            terraform_value::Value::String(format!("arn:aws:s3:::{id}")),
+        );
+        Ok(terraform_value::Value::Object(fields))
+    }
 }
 
 #[tokio::test]
@@ -680,4 +697,35 @@ async fn dyn_resource_serves_from_hand_built_schema() {
         Value::String("arn:aws:s3:::b1".into()),
         "the dynamic handler computed the arn"
     );
+
+    // Import by id produces an imported resource with the computed arn.
+    let imported = svc
+        .import_resource_state(Request::new(tfplugin6::import_resource_state::Request {
+            type_name: "aws_s3_bucket".into(),
+            id: "b2".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("import")
+        .into_inner();
+    assert!(
+        imported.diagnostics.is_empty(),
+        "{:?}",
+        imported.diagnostics
+    );
+    assert_eq!(
+        imported.imported_resources.len(),
+        1,
+        "one imported resource"
+    );
+    let state = imported.imported_resources[0]
+        .state
+        .as_ref()
+        .expect("state");
+    let value = terraform_codec::decode_msgpack(&state.msgpack, &cty).unwrap();
+    let Value::Object(fields) = value else {
+        panic!("imported state should be an object");
+    };
+    assert_eq!(fields["name"], Value::String("b2".into()), "imported by id");
+    assert_eq!(fields["arn"], Value::String("arn:aws:s3:::b2".into()));
 }

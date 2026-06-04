@@ -3,10 +3,10 @@
 //! Answers schema discovery (`GetMetadata`, `GetProviderSchema`), the resource
 //! lifecycle (`ConfigureProvider`, validation, `UpgradeResourceState`,
 //! `PlanResourceChange`, `ReadResource`, `ApplyResourceChange`), and data source
-//! reads (`ReadDataSource`) by dispatching to the registered handlers through the
-//! value codec. RPCs for features the SDK does not yet support (functions,
-//! ephemeral resources, identity, state stores, actions, import/move) still
-//! return `Unimplemented`.
+//! reads (`ReadDataSource`), and import (`ImportResourceState`) by dispatching to
+//! the registered handlers through the value codec. RPCs for features the SDK
+//! does not yet support (functions, ephemeral resources, identity, state stores,
+//! actions, move) still return `Unimplemented`.
 
 use std::pin::Pin;
 
@@ -398,10 +398,50 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         }
     }
 
+    async fn import_resource_state(
+        &self,
+        request: Request<tfplugin6::import_resource_state::Request>,
+    ) -> Result<Response<tfplugin6::import_resource_state::Response>, Status> {
+        use tfplugin6::import_resource_state::{ImportedResource, Response as Resp};
+        let req = request.into_inner();
+
+        let (Some(ty), Some(handler)) = (
+            self.provider.resource_cty(&req.type_name),
+            self.provider.resource_handler(&req.type_name),
+        ) else {
+            return Ok(Response::new(Resp {
+                diagnostics: unknown_resource(&req.type_name),
+                ..Default::default()
+            }));
+        };
+
+        // The provider produces the imported state from the ID; Terraform then
+        // refreshes it with ReadResource.
+        match handler.import(req.id).await {
+            Ok(state) => match encode_dynamic(&state, &ty) {
+                Ok(dv) => Ok(Response::new(Resp {
+                    imported_resources: vec![ImportedResource {
+                        type_name: req.type_name,
+                        state: Some(dv),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })),
+                Err(e) => Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to encode imported state", e.to_string()),
+                    ..Default::default()
+                })),
+            },
+            Err(diags) => Ok(Response::new(Resp {
+                diagnostics: pb_diagnostics(diags),
+                ..Default::default()
+            })),
+        }
+    }
+
     unimplemented_unary! {
         get_resource_identity_schemas => get_resource_identity_schemas,
         upgrade_resource_identity => upgrade_resource_identity,
-        import_resource_state => import_resource_state,
         move_resource_state => move_resource_state,
         generate_resource_config => generate_resource_config,
         validate_ephemeral_resource_config => validate_ephemeral_resource_config,

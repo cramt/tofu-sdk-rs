@@ -132,6 +132,14 @@ pub trait Resource: Send + Sync + 'static {
     async fn delete(&self, _prior: Self::Model) -> Result<(), ResourceError> {
         Ok(())
     }
+
+    /// Import an existing resource by its ID, returning the imported state.
+    /// Terraform refreshes it with [`read`](Resource::read) immediately after, so
+    /// returning just enough to identify it (e.g. the ID-bearing fields) is fine.
+    /// Defaults to an error (import unsupported).
+    async fn import(&self, _id: String) -> Result<Self::Model, ResourceError> {
+        Err(ResourceError::new("this resource does not support import"))
+    }
 }
 
 /// Object-safe, value-oriented form of [`Resource`] that the service dispatches
@@ -143,6 +151,7 @@ pub trait DynResource: Send + Sync {
     async fn read(&self, current: Value) -> Result<Option<Value>, Diagnostics>;
     async fn update(&self, planned: Value, prior: Value) -> Result<Value, Diagnostics>;
     async fn delete(&self, prior: Value) -> Result<(), Diagnostics>;
+    async fn import(&self, id: String) -> Result<Value, Diagnostics>;
 }
 
 /// Wraps a typed [`Resource`] as an erased [`DynResource`].
@@ -215,5 +224,15 @@ impl<R: Resource> DynResource for ResourceAdapter<R> {
             .await
             .map_err(Diag::from)
             .map_err(|d| vec![d])
+    }
+
+    async fn import(&self, id: String) -> Result<Value, Diagnostics> {
+        let result = self
+            .inner
+            .import(id)
+            .await
+            .map_err(Diag::from)
+            .map_err(|d| vec![d])?;
+        to_value(&result).map_err(|e| codec_diag("encode imported state", e))
     }
 }

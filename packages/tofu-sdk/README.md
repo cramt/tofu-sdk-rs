@@ -69,9 +69,9 @@ are available for the Rust build.
 
 ## Status
 
-Early but functional. Resources (CRUD + `force_new` replacement), provider
-configuration (`config`), and both singular (`dataSource`) and plural
+Early but functional. Resources (CRUD + `force_new` replacement + `import`),
+provider configuration (`config`), and both singular (`dataSource`) and plural
 (`dataSourceList`) data sources work end-to-end against real OpenTofu — see
-`test/e2e.test.mjs`. Not yet wired up: prebuilt multi-platform binaries, nested
-blocks, and a generated `terraform-provider-*` launcher (you write the shebang
-entry yourself for now).
+`test/e2e.test.mjs`. Not yet wired up: config validation hooks, prebuilt
+multi-platform binaries, HCL block syntax, and a generated
+`terraform-provider-*` launcher (you write the shebang entry yourself for now).

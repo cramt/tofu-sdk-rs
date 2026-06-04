@@ -123,7 +123,7 @@ async fn call_handler(
 
 // --- erased handlers backed by JS ------------------------------------------
 
-/// A resource whose CRUD is four async JS callbacks.
+/// A resource whose lifecycle is a set of async JS callbacks.
 struct JsResource {
     /// The resource's cty object type, used to type handler results.
     ty: Type,
@@ -131,6 +131,7 @@ struct JsResource {
     read: Handler,
     update: Handler,
     delete: Handler,
+    import: Handler,
 }
 
 #[async_trait]
@@ -172,6 +173,18 @@ impl DynResource for JsResource {
     async fn delete(&self, prior: Value) -> std::result::Result<(), Diagnostics> {
         call_handler(&self.delete, &prior, "delete").await?;
         Ok(())
+    }
+
+    async fn import(&self, id: String) -> std::result::Result<Value, Diagnostics> {
+        // The import handler's input is the raw ID string (not a marshalled
+        // Value), so it is passed through directly.
+        let promise = self
+            .import
+            .call_async(Ok(id))
+            .await
+            .map_err(|e| handler_err("import", e))?;
+        let out = promise.await.map_err(|e| handler_err("import", e))?;
+        json_to_value(&out, &self.ty).map_err(|e| handler_err("import", e))
     }
 }
 
@@ -281,6 +294,7 @@ impl Provider {
         read: ThreadsafeFunction<String, Promise<String>>,
         update: ThreadsafeFunction<String, Promise<String>>,
         delete: ThreadsafeFunction<String, Promise<String>>,
+        import: ThreadsafeFunction<String, Promise<String>>,
     ) -> Result<()> {
         let block = block_from_schema_json(&schema_json).map_err(napi_err)?;
         let ty = block.cty_type();
@@ -293,6 +307,7 @@ impl Provider {
                 read,
                 update,
                 delete,
+                import,
             }),
         });
         Ok(())

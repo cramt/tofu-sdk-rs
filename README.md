@@ -95,13 +95,16 @@ impl is a working provider, exercised end-to-end against **real OpenTofu**
   singular `DataSource` (`read -> Model`, one object), a `shared` key gives a
   plural `DataSourceList` (`list -> Vec<Model>`, a `results` list) — both
   verified by real `tofu test` `data` reads
+- **Import ✅** — `Resource::import(id)` dispatched on `ImportResourceState`
+  (then refreshed via `read`) — verified by a real `tofu import`
 
 ### Not yet implemented
 
-Nested blocks end-to-end, functions, ephemeral resources, import/move, and a
-`TfValue<T>` field wrapper to preserve known/unknown/null through decode (today
-`Unknown` decodes to the type's zero value). Numbers are held as `f64`. Not all
-`cty` corner cases are covered.
+HCL nested *block* syntax (nested object/list/map *attributes* work), config
+validation hooks, custom plan modification, state upgrade, functions, ephemeral
+resources, move, and a `TfValue<T>` field wrapper to preserve known/unknown/null
+through decode (today `Unknown` decodes to the type's zero value). Numbers are
+held as `f64`. Not all `cty` corner cases are covered.
 
 ## Workspace layout
 

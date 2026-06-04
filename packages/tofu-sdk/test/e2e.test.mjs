@@ -155,3 +155,50 @@ output "list_names" {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("imports an existing resource by id", () => {
+  const bin = engine();
+  const { dir, cfg, env } = workspace();
+  try {
+    writeFileSync(
+      join(cfg, "main.tf"),
+      `
+terraform {
+  required_providers {
+    aws = {
+      source = "example/aws"
+    }
+  }
+}
+
+provider "aws" {
+  region = "eu-west-1"
+}
+
+resource "aws_s3_bucket" "test" {
+  name = "imported"
+}
+`,
+    );
+
+    const imp = run(bin, ["import", "aws_s3_bucket.test", "imported"], cfg, env);
+    assert.equal(imp.status, 0, `import failed:\n${imp.stdout}\n${imp.stderr}`);
+
+    const show = run(bin, ["state", "show", "aws_s3_bucket.test"], cfg, env);
+    assert.equal(show.status, 0, show.stderr);
+    assert.match(
+      show.stdout,
+      /arn\s+= "arn:aws:s3:::imported"/,
+      `imported state should carry the computed arn:\n${show.stdout}`,
+    );
+    assert.match(
+      show.stdout,
+      /region\s+= "eu-west-1"/,
+      "the configured provider region should apply during import",
+    );
+
+    run(bin, ["destroy", "-auto-approve"], cfg, env);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

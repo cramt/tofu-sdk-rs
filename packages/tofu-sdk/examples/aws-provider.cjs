@@ -42,6 +42,10 @@ new Provider()
     async update(planned, _prior) {
       return { ...planned, arn: `${ARN_PREFIX}${planned.name}`, region };
     },
+    // Import an existing bucket by name (the id), recovering its computed state.
+    async import(id) {
+      return { name: id, arn: `${ARN_PREFIX}${id}`, region };
+    },
   })
   // A singular data source: look a bucket up by name and compute its arn.
   .dataSource("aws_s3_bucket", {
