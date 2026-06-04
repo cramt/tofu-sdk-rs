@@ -552,3 +552,132 @@ async fn configure_then_apply_uses_provider_meta() {
 fn cty(bytes: &[u8]) -> String {
     String::from_utf8(bytes.to_vec()).expect("attribute type is valid UTF-8 JSON")
 }
+
+// --- Dynamic seam (the FFI boundary for non-Rust frontends) -----------------
+
+/// A resource handler written *without* facet or a `Model` — it operates on the
+/// dynamic `Value` directly, exactly as the Node binding's bridge will.
+struct DynEchoArn;
+
+#[async_trait]
+impl terraform_runtime::DynResource for DynEchoArn {
+    async fn create(
+        &self,
+        planned: terraform_value::Value,
+    ) -> Result<terraform_value::Value, terraform_runtime::Diagnostics> {
+        let terraform_value::Value::Object(mut fields) = planned else {
+            return Err(vec![terraform_runtime::Diag::error(
+                "bad input",
+                "expected an object",
+            )]);
+        };
+        let name = match fields.get("name") {
+            Some(terraform_value::Value::String(s)) => s.clone(),
+            _ => String::new(),
+        };
+        fields.insert(
+            "arn".to_string(),
+            terraform_value::Value::String(format!("arn:aws:s3:::{name}")),
+        );
+        Ok(terraform_value::Value::Object(fields))
+    }
+
+    async fn read(
+        &self,
+        current: terraform_value::Value,
+    ) -> Result<Option<terraform_value::Value>, terraform_runtime::Diagnostics> {
+        Ok(Some(current))
+    }
+
+    async fn update(
+        &self,
+        planned: terraform_value::Value,
+        _prior: terraform_value::Value,
+    ) -> Result<terraform_value::Value, terraform_runtime::Diagnostics> {
+        Ok(planned)
+    }
+
+    async fn delete(
+        &self,
+        _prior: terraform_value::Value,
+    ) -> Result<(), terraform_runtime::Diagnostics> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn dyn_resource_serves_from_hand_built_schema() {
+    use terraform_ir::{AttributeSchema, Block};
+    use terraform_value::{ObjectAttr, Type, Value};
+
+    // The IR a non-Rust frontend would construct from its own schema description.
+    let block = Block {
+        attributes: vec![
+            AttributeSchema {
+                required: true,
+                ..AttributeSchema::new("name", Type::String)
+            },
+            AttributeSchema {
+                computed: true,
+                ..AttributeSchema::new("arn", Type::String)
+            },
+        ],
+        nested_blocks: vec![],
+    };
+    let provider = Provider::builder()
+        .dyn_resource("aws_s3_bucket", block, std::sync::Arc::new(DynEchoArn))
+        .build()
+        .expect("dynamic provider builds");
+    let svc = ProviderService::new(provider);
+
+    // The hand-built schema is served like any other.
+    let schema = svc
+        .get_provider_schema(Request::new(tfplugin6::get_provider_schema::Request {}))
+        .await
+        .expect("GetProviderSchema")
+        .into_inner();
+    assert!(schema.resource_schemas.contains_key("aws_s3_bucket"));
+
+    // A create round-trips through the dynamic handler.
+    let cty = Type::Object(vec![
+        ObjectAttr {
+            name: "name".into(),
+            ty: Type::String,
+            optional: false,
+        },
+        ObjectAttr {
+            name: "arn".into(),
+            ty: Type::String,
+            optional: true,
+        },
+    ]);
+    let mut obj = std::collections::BTreeMap::new();
+    obj.insert("name".to_string(), Value::String("b1".into()));
+    obj.insert("arn".to_string(), Value::Unknown);
+    let planned = tfplugin6::DynamicValue {
+        msgpack: terraform_codec::encode_msgpack(&Value::Object(obj), &cty).unwrap(),
+        json: vec![],
+    };
+
+    let apply = svc
+        .apply_resource_change(Request::new(tfplugin6::apply_resource_change::Request {
+            type_name: "aws_s3_bucket".into(),
+            prior_state: None,
+            planned_state: Some(planned),
+            ..Default::default()
+        }))
+        .await
+        .expect("apply")
+        .into_inner();
+    assert!(apply.diagnostics.is_empty(), "{:?}", apply.diagnostics);
+
+    let new = terraform_codec::decode_msgpack(&apply.new_state.unwrap().msgpack, &cty).unwrap();
+    let Value::Object(fields) = new else {
+        panic!("new state should be an object");
+    };
+    assert_eq!(
+        fields["arn"],
+        Value::String("arn:aws:s3:::b1".into()),
+        "the dynamic handler computed the arn"
+    );
+}

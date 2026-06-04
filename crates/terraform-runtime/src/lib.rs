@@ -21,6 +21,13 @@ pub use builder::{BuildError, Provider, ProviderBuilder};
 pub use data_source::{DataSource, DataSourceError, DataSourceList};
 pub use resource::{Resource, ResourceError};
 pub use serve::{serve, ServeError};
+
+/// The erased, `Value`-oriented handler traits and diagnostic types. These are
+/// the dynamic seam used by non-Rust frontends (paired with
+/// [`ProviderBuilder::dyn_resource`] / [`ProviderBuilder::dyn_data_source`]);
+/// Rust authors use the typed [`Resource`] / [`DataSource`] traits instead.
+pub use data_source::DynDataSource;
+pub use resource::{Diag, Diagnostics, DynResource, Severity};
 pub use service::ProviderService;
 
 /// Re-export of `async_trait` so authors can `#[terraform_runtime::async_trait]`

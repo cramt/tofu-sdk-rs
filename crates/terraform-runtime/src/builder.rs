@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use facet::Facet;
 use terraform_codec::from_value;
-use terraform_ir::{Block, ProviderSchema};
+use terraform_ir::{Block, DataSourceSchema, ProviderSchema, ResourceSchema};
 use terraform_reflect::{
     reflect_block, reflect_data_source, reflect_data_source_list, reflect_resource,
     PluralDataSource, ReflectError,
@@ -351,6 +351,51 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
             }
             Err(source) => self.record(name, source),
         }
+        self
+    }
+
+    // --- Dynamic seam ------------------------------------------------------
+    //
+    // The methods above are the facet *frontend*: a Rust `Model` is reflected
+    // into the IR and bridged to the dynamic `Value` by an adapter. The two
+    // below skip reflection entirely — the caller supplies a hand-built schema
+    // [`Block`] and an already-erased handler that operates on `Value`. This is
+    // the seam non-Rust frontends use (e.g. the Node binding builds the IR from
+    // a JS schema description and implements [`DynResource`] by calling into JS).
+
+    /// Register a managed resource from a hand-built schema `block` and an
+    /// erased [`DynResource`] handler, bypassing facet reflection.
+    pub fn dyn_resource(
+        mut self,
+        name: impl Into<String>,
+        block: Block,
+        handler: Arc<dyn DynResource>,
+    ) -> Self {
+        let name = name.into();
+        self.schema.resources.push(ResourceSchema {
+            name: name.clone(),
+            block,
+        });
+        self.resources.insert(name, handler);
+        self
+    }
+
+    /// Register a data source from a hand-built schema `block` and an erased
+    /// [`DynDataSource`] handler, bypassing facet reflection. The `block` and
+    /// handler together decide the shape (a singular object, or a plural
+    /// `results` list); the runtime does not distinguish them here.
+    pub fn dyn_data_source(
+        mut self,
+        name: impl Into<String>,
+        block: Block,
+        handler: Arc<dyn DynDataSource>,
+    ) -> Self {
+        let name = name.into();
+        self.schema.data_sources.push(DataSourceSchema {
+            name: name.clone(),
+            block,
+        });
+        self.data_sources.insert(name, handler);
         self
     }
 
