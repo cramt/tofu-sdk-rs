@@ -11,10 +11,11 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # External
-# Pinned to 0.46.4: facet 0.46.5 requires facet-reflect 0.46.5, which is not
-# published on crates.io, so the `reflect` feature (Peek/Partial) is
-# unresolvable at 0.46.5.
-facet = "=0.46.4"
+# Using the git source: the crates.io release of facet 0.46.5 requires
+# facet-reflect 0.46.5, which was never published, so the `reflect` feature
+# (Peek/Partial) is unresolvable from crates.io. The git repo is internally
+# consistent. (Reported upstream.)
+facet = { git = "https://github.com/facet-rs/facet" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
