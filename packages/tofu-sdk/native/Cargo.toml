@@ -1,0 +1,28 @@
+[package]
+name = "tofu-sdk-napi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+# The Node native addon (.node): a thin napi-rs bridge over the dynamic provider
+# seam in `terraform-runtime`. JS supplies the schema (IR) and async handlers;
+# this crate marshals `Value` <-> JS and runs the tfplugin6 server in-process.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3", default-features = false, features = ["napi4", "tokio_rt"] }
+napi-derive = "3"
+terraform-runtime = { workspace = true }
+terraform-ir = { workspace = true }
+terraform-value = { workspace = true }
+terraform-codec = { workspace = true }
+facet-json = { workspace = true }
+facet-value = { workspace = true }
+
+[build-dependencies]
+napi-build = "2"

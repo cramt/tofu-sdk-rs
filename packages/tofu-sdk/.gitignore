@@ -1,0 +1,4 @@
+node_modules/
+dist/
+# Built native addon(s) — produced by `napi build`, not checked in.
+*.node

@@ -1,0 +1,336 @@
+//! Node native addon: a thin napi-rs bridge over the dynamic provider seam in
+//! `terraform-runtime`.
+//!
+//! JavaScript supplies, per resource/data source, a schema description (cty-typed
+//! attributes as JSON) and async lifecycle handlers. This crate:
+//!
+//! - parses the schema JSON into a `terraform-ir` [`Block`];
+//! - implements the erased [`DynResource`]/[`DynDataSource`] traits by calling
+//!   the JS handlers (marshalling the dynamic `Value` to/from JSON across the
+//!   boundary, typed by the schema); and
+//! - runs the real tfplugin6 server in-process via `terraform_runtime::serve`.
+//!
+//! All Terraform/protocol concerns stay in Rust; JS only sees decoded values.
+
+#![allow(unsafe_code)]
+
+use std::fmt::Write as _;
+use std::sync::Arc;
+
+use napi::bindgen_prelude::*;
+use napi::threadsafe_function::ThreadsafeFunction;
+use napi_derive::napi;
+
+use terraform_codec::decode_json;
+use terraform_ir::{AttributeSchema, Block};
+use terraform_runtime::{
+    async_trait, serve as serve_provider, Diag, Diagnostics, DynDataSource, DynResource,
+    Provider as RtProvider,
+};
+use terraform_value::{Type, Value};
+
+/// An async JS handler: takes a JSON string, returns a `Promise<string>`.
+type Handler = ThreadsafeFunction<String, Promise<String>>;
+
+// --- marshalling ------------------------------------------------------------
+
+/// Serialize a dynamic [`Value`] to a JSON string for the JS boundary.
+/// `Unknown` (only present on computed attributes the handler must fill) maps to
+/// `null`; `Set`/`Tuple` collapse to arrays and `Map`/`Object` to objects, which
+/// the schema-typed decode on the way back reconstructs.
+fn value_to_json(value: &Value) -> String {
+    let mut out = String::new();
+    write_json(value, &mut out);
+    out
+}
+
+fn write_json(value: &Value, out: &mut String) {
+    match value {
+        Value::Null | Value::Unknown => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => {
+            let _ = write!(out, "{n}");
+        }
+        Value::String(s) => write_json_string(s, out),
+        Value::List(items) | Value::Set(items) | Value::Tuple(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json(item, out);
+            }
+            out.push(']');
+        }
+        Value::Map(m) | Value::Object(m) => {
+            out.push('{');
+            for (i, (k, v)) in m.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_string(k, out);
+                out.push(':');
+                write_json(v, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+fn write_json_string(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Parse a handler's JSON result back into a typed [`Value`] under `ty`.
+fn json_to_value(json: &str, ty: &Type) -> std::result::Result<Value, String> {
+    let parsed: facet_value::Value =
+        facet_json::from_slice(json.as_bytes()).map_err(|e| e.to_string())?;
+    decode_json(&parsed, ty).map_err(|e| e.to_string())
+}
+
+/// Build a [`Block`] from the JS schema description:
+/// `{ "attributes": [ { "name", "type": <cty-json>, "required"?, "optional"?,
+/// "computed"?, "forceNew"?, "sensitive"?, "description"? }, ... ] }`.
+fn block_from_schema_json(json: &str) -> std::result::Result<Block, String> {
+    let parsed: facet_value::Value =
+        facet_json::from_slice(json.as_bytes()).map_err(|e| e.to_string())?;
+    let obj = parsed.as_object().ok_or("schema must be a JSON object")?;
+    let attrs = obj
+        .get("attributes")
+        .and_then(|v| v.as_array())
+        .ok_or("schema must have an `attributes` array")?;
+
+    let mut attributes = Vec::with_capacity(attrs.len());
+    for attr in attrs.iter() {
+        let ao = attr.as_object().ok_or("each attribute must be an object")?;
+        let name = ao
+            .get("name")
+            .and_then(|v| v.as_string())
+            .ok_or("attribute is missing a string `name`")?
+            .as_str()
+            .to_string();
+        let type_val = ao
+            .get("type")
+            .ok_or_else(|| format!("attribute `{name}` is missing a `type`"))?;
+        // The `type` field is a cty type constraint (itself JSON); re-serialize
+        // it and reuse the canonical cty decoder.
+        let type_bytes = facet_json::to_string(type_val).map_err(|e| e.to_string())?;
+        let ty = Type::from_cty_json_bytes(type_bytes.as_bytes())?;
+        let flag = |key: &str| ao.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+        attributes.push(AttributeSchema {
+            name,
+            ty,
+            description: ao
+                .get("description")
+                .and_then(|v| v.as_string())
+                .map(|s| s.as_str().to_string()),
+            required: flag("required"),
+            optional: flag("optional"),
+            computed: flag("computed"),
+            sensitive: flag("sensitive"),
+            force_new: flag("forceNew"),
+        });
+    }
+    Ok(Block {
+        attributes,
+        nested_blocks: Vec::new(),
+    })
+}
+
+fn handler_err(ctx: &str, e: impl std::fmt::Display) -> Diagnostics {
+    vec![Diag::error(format!("{ctx} handler failed"), e.to_string())]
+}
+
+/// Invoke an async JS handler with `input` and await its JSON result.
+async fn call_handler(
+    handler: &Handler,
+    input: &Value,
+    ctx: &str,
+) -> std::result::Result<String, Diagnostics> {
+    let promise = handler
+        .call_async(Ok(value_to_json(input)))
+        .await
+        .map_err(|e| handler_err(ctx, e))?;
+    promise.await.map_err(|e| handler_err(ctx, e))
+}
+
+// --- erased handlers backed by JS ------------------------------------------
+
+/// A resource whose CRUD is four async JS callbacks.
+struct JsResource {
+    /// The resource's cty object type, used to type handler results.
+    ty: Type,
+    create: Handler,
+    read: Handler,
+    update: Handler,
+    delete: Handler,
+}
+
+#[async_trait]
+impl DynResource for JsResource {
+    async fn create(&self, planned: Value) -> std::result::Result<Value, Diagnostics> {
+        let out = call_handler(&self.create, &planned, "create").await?;
+        json_to_value(&out, &self.ty).map_err(|e| handler_err("create", e))
+    }
+
+    async fn read(&self, current: Value) -> std::result::Result<Option<Value>, Diagnostics> {
+        let out = call_handler(&self.read, &current, "read").await?;
+        // A JSON `null` result means the resource no longer exists.
+        if out.trim() == "null" {
+            return Ok(None);
+        }
+        json_to_value(&out, &self.ty)
+            .map(Some)
+            .map_err(|e| handler_err("read", e))
+    }
+
+    async fn update(
+        &self,
+        planned: Value,
+        _prior: Value,
+    ) -> std::result::Result<Value, Diagnostics> {
+        let out = call_handler(&self.update, &planned, "update").await?;
+        json_to_value(&out, &self.ty).map_err(|e| handler_err("update", e))
+    }
+
+    async fn delete(&self, prior: Value) -> std::result::Result<(), Diagnostics> {
+        call_handler(&self.delete, &prior, "delete").await?;
+        Ok(())
+    }
+}
+
+/// A data source whose read is one async JS callback. Singular vs plural is
+/// decided entirely by the JS-supplied schema and what the handler returns; the
+/// Rust side treats both uniformly.
+struct JsDataSource {
+    ty: Type,
+    read: Handler,
+}
+
+#[async_trait]
+impl DynDataSource for JsDataSource {
+    async fn read(&self, config: Value) -> std::result::Result<Value, Diagnostics> {
+        let out = call_handler(&self.read, &config, "data source read").await?;
+        json_to_value(&out, &self.ty).map_err(|e| handler_err("data source read", e))
+    }
+}
+
+// --- the JS-facing provider -------------------------------------------------
+
+/// A registered resource, ready to hand to the builder at serve time.
+struct ResourceReg {
+    name: String,
+    block: Block,
+    handler: Arc<dyn DynResource>,
+}
+
+/// A registered data source.
+struct DataSourceReg {
+    name: String,
+    block: Block,
+    handler: Arc<dyn DynDataSource>,
+}
+
+/// The provider definition assembled from JS, then served over tfplugin6.
+#[napi]
+pub struct Provider {
+    resources: Vec<ResourceReg>,
+    data_sources: Vec<DataSourceReg>,
+}
+
+fn napi_err(e: impl std::fmt::Display) -> Error {
+    Error::from_reason(e.to_string())
+}
+
+#[napi]
+impl Provider {
+    /// Create an empty provider. (Constructed from JS as `new Provider()`; a
+    /// Rust `Default` impl would be meaningless here.)
+    #[napi(constructor)]
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Provider {
+            resources: Vec::new(),
+            data_sources: Vec::new(),
+        }
+    }
+
+    /// Register a managed resource: its `type_name`, a schema description
+    /// (`schema_json`), and the four async lifecycle handlers.
+    #[napi]
+    pub fn resource(
+        &mut self,
+        type_name: String,
+        schema_json: String,
+        create: Handler,
+        read: Handler,
+        update: Handler,
+        delete: Handler,
+    ) -> Result<()> {
+        let block = block_from_schema_json(&schema_json).map_err(napi_err)?;
+        let ty = block.cty_type();
+        self.resources.push(ResourceReg {
+            name: type_name,
+            block,
+            handler: Arc::new(JsResource {
+                ty,
+                create,
+                read,
+                update,
+                delete,
+            }),
+        });
+        Ok(())
+    }
+
+    /// Register a data source: its `type_name`, a schema description, and a
+    /// single async `read` handler. The schema and handler together decide the
+    /// shape (a singular object, or a plural `results` list).
+    #[napi]
+    pub fn data_source(
+        &mut self,
+        type_name: String,
+        schema_json: String,
+        read: Handler,
+    ) -> Result<()> {
+        let block = block_from_schema_json(&schema_json).map_err(napi_err)?;
+        let ty = block.cty_type();
+        self.data_sources.push(DataSourceReg {
+            name: type_name,
+            block,
+            handler: Arc::new(JsDataSource { ty, read }),
+        });
+        Ok(())
+    }
+
+    /// Serve the provider over the Terraform plugin protocol. Performs the
+    /// go-plugin handshake on stdout and runs until SIGTERM, so the returned
+    /// promise stays pending for the provider's lifetime.
+    #[napi]
+    pub async fn serve(&self) -> Result<()> {
+        let mut builder = RtProvider::builder();
+        for r in &self.resources {
+            builder = builder.dyn_resource(r.name.clone(), r.block.clone(), Arc::clone(&r.handler));
+        }
+        for d in &self.data_sources {
+            builder =
+                builder.dyn_data_source(d.name.clone(), d.block.clone(), Arc::clone(&d.handler));
+        }
+        let provider = builder.build().map_err(napi_err)?;
+        serve_provider(provider).await.map_err(napi_err)
+    }
+}
