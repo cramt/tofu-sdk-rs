@@ -63,8 +63,11 @@ This is an early, in-progress implementation.
 - **Phase 1 ✅** — reflection → provider IR → `tfplugin6` schema emission
 - **Phase 2 ✅** — `tfplugin6` gRPC server, go-plugin handshake, auto-mTLS,
   `GetProviderSchema` (verified end-to-end against real OpenTofu)
-- **Phase 3 🚧** — `DynamicValue` codecs (msgpack/json ↔ Rust), known/unknown/null
-- **Phase 4** — `ConfigureProvider`, `ReadResource`, `ApplyResourceChange`
+- **Phase 3 ✅** — `cty` `DynamicValue` msgpack codec (known/unknown/null) and
+  typed encode (Rust value → dynamic value via reflection); typed decode folds
+  into Phase 4
+- **Phase 4 🚧** — the `Resource` trait, typed decode, `ConfigureProvider`,
+  `ReadResource`, `ApplyResourceChange`
 - **Phase 5** — planning engine (replacement semantics, unknown propagation)
 
 ## Workspace layout
