@@ -14,14 +14,13 @@
 
 #![allow(unsafe_code)]
 
-use std::fmt::Write as _;
 use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
 
-use terraform_codec::decode_json;
+use terraform_codec::{decode_json, encode_json};
 use terraform_ir::{AttributeSchema, Block};
 use terraform_runtime::{
     async_trait, serve as serve_provider, Diag, Diagnostics, DynDataSource, DynResource,
@@ -37,66 +36,15 @@ use terraform_value::{Type, Value};
 type Handler = ThreadsafeFunction<String, Promise<String>>;
 
 // --- marshalling ------------------------------------------------------------
+//
+// Both directions go through facet (no hand-rolled JSON): `encode_json` lowers a
+// `Value` to a dynamic `facet_value::Value` which `facet_json` serializes, and
+// the reverse parses with `facet_json` then types it with `decode_json` under
+// the attribute's cty `Type`.
 
 /// Serialize a dynamic [`Value`] to a JSON string for the JS boundary.
-/// `Unknown` (only present on computed attributes the handler must fill) maps to
-/// `null`; `Set`/`Tuple` collapse to arrays and `Map`/`Object` to objects, which
-/// the schema-typed decode on the way back reconstructs.
-fn value_to_json(value: &Value) -> String {
-    let mut out = String::new();
-    write_json(value, &mut out);
-    out
-}
-
-fn write_json(value: &Value, out: &mut String) {
-    match value {
-        Value::Null | Value::Unknown => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Number(n) => {
-            let _ = write!(out, "{n}");
-        }
-        Value::String(s) => write_json_string(s, out),
-        Value::List(items) | Value::Set(items) | Value::Tuple(items) => {
-            out.push('[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_json(item, out);
-            }
-            out.push(']');
-        }
-        Value::Map(m) | Value::Object(m) => {
-            out.push('{');
-            for (i, (k, v)) in m.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_json_string(k, out);
-                out.push(':');
-                write_json(v, out);
-            }
-            out.push('}');
-        }
-    }
-}
-
-fn write_json_string(s: &str, out: &mut String) {
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
+fn value_to_json(value: &Value) -> std::result::Result<String, String> {
+    facet_json::to_string(&encode_json(value)).map_err(|e| e.to_string())
 }
 
 /// Parse a handler's JSON result back into a typed [`Value`] under `ty`.
@@ -165,8 +113,9 @@ async fn call_handler(
     input: &Value,
     ctx: &str,
 ) -> std::result::Result<String, Diagnostics> {
+    let json = value_to_json(input).map_err(|e| handler_err(ctx, e))?;
     let promise = handler
-        .call_async(Ok(value_to_json(input)))
+        .call_async(Ok(json))
         .await
         .map_err(|e| handler_err(ctx, e))?;
     promise.await.map_err(|e| handler_err(ctx, e))
@@ -209,9 +158,12 @@ impl DynResource for JsResource {
     ) -> std::result::Result<Value, Diagnostics> {
         // The update handler sees both states as `{ planned, prior }`.
         let input = Value::Object(
-            [("planned".to_string(), planned), ("prior".to_string(), prior)]
-                .into_iter()
-                .collect(),
+            [
+                ("planned".to_string(), planned),
+                ("prior".to_string(), prior),
+            ]
+            .into_iter()
+            .collect(),
         );
         let out = call_handler(&self.update, &input, "update").await?;
         json_to_value(&out, &self.ty).map_err(|e| handler_err("update", e))

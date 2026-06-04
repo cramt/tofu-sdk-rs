@@ -2,10 +2,40 @@
 
 use std::collections::BTreeMap;
 
+use facet_value::{VArray, VObject, Value as Json};
 use rmpv::{Integer, Utf8String, Value as Mp};
 use terraform_value::{Type, Value};
 
 use crate::CodecError;
+
+/// Encode a [`Value`] into a dynamic `cty` **JSON** value (the inverse of
+/// [`decode_json`](crate::decode_json), and unlike msgpack it needs no schema).
+///
+/// `Unknown` maps to JSON `null` (JSON cannot represent unknown); `Set`/`Tuple`
+/// collapse to arrays and `Map`/`Object` to objects. Round-tripping back through
+/// `decode_json` with the attribute's [`Type`] reconstructs the precise variant.
+pub fn encode_json(value: &Value) -> Json {
+    match value {
+        Value::Null | Value::Unknown => Json::NULL,
+        Value::Bool(b) => (*b).into(),
+        Value::Number(n) => (*n).into(),
+        Value::String(s) => s.clone().into(),
+        Value::List(items) | Value::Set(items) | Value::Tuple(items) => {
+            let mut arr = VArray::with_capacity(items.len());
+            for item in items {
+                arr.push(encode_json(item));
+            }
+            arr.into()
+        }
+        Value::Map(entries) | Value::Object(entries) => {
+            let mut obj = VObject::with_capacity(entries.len());
+            for (key, val) in entries {
+                obj.insert(key.clone(), encode_json(val));
+            }
+            obj.into()
+        }
+    }
+}
 
 /// Encode `value` (interpreted as `ty`) to `cty` msgpack bytes.
 pub fn encode_msgpack(value: &Value, ty: &Type) -> Result<Vec<u8>, CodecError> {

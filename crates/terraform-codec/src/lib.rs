@@ -21,7 +21,7 @@ mod encode;
 mod typed;
 
 pub use decode::{decode_json, decode_msgpack};
-pub use encode::encode_msgpack;
+pub use encode::{encode_json, encode_msgpack};
 pub use typed::{from_value, to_value, TypedError};
 
 /// An error from encoding or decoding a `DynamicValue`.
@@ -127,6 +127,65 @@ mod tests {
             Value::Tuple(vec![Value::String("x".into()), Value::Number(1.0)]),
             &Type::Tuple(vec![Type::String, Type::Number]),
         );
+    }
+
+    #[test]
+    fn json_round_trips_an_object() {
+        // `encode_json` -> `facet_json` -> `facet_json` -> `decode_json` (the
+        // path the Node binding uses) survives a round trip when typed.
+        let ty = Type::Object(vec![
+            ObjectAttr {
+                name: "name".into(),
+                ty: Type::String,
+                optional: false,
+            },
+            ObjectAttr {
+                name: "count".into(),
+                ty: Type::Number,
+                optional: false,
+            },
+            ObjectAttr {
+                name: "enabled".into(),
+                ty: Type::Bool,
+                optional: false,
+            },
+            ObjectAttr {
+                name: "tags".into(),
+                ty: Type::map(Type::String),
+                optional: true,
+            },
+            ObjectAttr {
+                name: "items".into(),
+                ty: Type::list(Type::String),
+                optional: true,
+            },
+        ]);
+        let mut tags = BTreeMap::new();
+        tags.insert("env".to_string(), Value::String("prod".into()));
+        let mut obj = BTreeMap::new();
+        obj.insert("name".to_string(), Value::String("bucket".into()));
+        obj.insert("count".to_string(), Value::Number(3.0));
+        obj.insert("enabled".to_string(), Value::Bool(true));
+        obj.insert("tags".to_string(), Value::Map(tags));
+        obj.insert(
+            "items".to_string(),
+            Value::List(vec![Value::String("a".into())]),
+        );
+        let value = Value::Object(obj);
+
+        let json = facet_json::to_string(&encode_json(&value)).expect("serialize");
+        let parsed: facet_value::Value = facet_json::from_slice(json.as_bytes()).expect("parse");
+        let back = decode_json(&parsed, &ty).expect("decode");
+        assert_eq!(back, value, "JSON round trip");
+    }
+
+    #[test]
+    fn json_encodes_unknown_as_null() {
+        // JSON cannot carry "unknown"; it degrades to null (decoded as the zero
+        // value by the typed layer — the handler is expected to fill computed
+        // fields anyway).
+        let json = facet_json::to_string(&encode_json(&Value::Unknown)).expect("serialize");
+        assert_eq!(json, "null");
     }
 
     #[test]
