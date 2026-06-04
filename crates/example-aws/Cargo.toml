@@ -1,0 +1,29 @@
+[package]
+name = "example-aws"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+# A minimal end-to-end example provider. Doubles as documentation of the
+# author-facing API and as the subject of the plugin-launch integration test.
+
+[[bin]]
+name = "example-aws"
+path = "src/main.rs"
+
+[dependencies]
+facet = { workspace = true }
+terraform-provider = { workspace = true }
+terraform-runtime = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+# The contract test drives the real `tofu`/`terraform` binary and parses its
+# JSON schema output — no in-process gRPC needed.
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

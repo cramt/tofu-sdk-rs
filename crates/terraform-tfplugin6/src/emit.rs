@@ -6,15 +6,96 @@
 //! planning behavior (`RequiresReplace`), not a schema property, and is consumed
 //! by the planning engine in a later phase.
 
-use terraform_ir::{AttributeSchema, Block, NestedBlock, NestingMode};
+use std::collections::HashMap;
 
-use crate::tfplugin6::{self, schema, StringKind};
+use terraform_ir::{AttributeSchema, Block, NestedBlock, NestingMode, ProviderSchema};
+
+use crate::tfplugin6::{
+    self, get_metadata, get_provider_schema, schema, ServerCapabilities, StringKind,
+};
 
 /// Lower an IR [`Block`] into a complete [`tfplugin6::Schema`] at `version`.
 pub fn emit_schema(block: &Block, version: i64) -> tfplugin6::Schema {
     tfplugin6::Schema {
         version,
         block: Some(emit_block(block)),
+    }
+}
+
+/// Lower a whole [`ProviderSchema`] into a `GetProviderSchema` response.
+///
+/// All schemas are emitted at state-schema version 0; per-resource versioning
+/// (for state upgrades) arrives with the planning/upgrade work in a later phase.
+pub fn emit_provider_schema(schema: &ProviderSchema) -> get_provider_schema::Response {
+    // Terraform requires the provider schema to always be present, even when the
+    // provider takes no configuration — an absent `provider` field is reported as
+    // "missing provider schema". Default to an empty block in that case.
+    let provider = schema
+        .provider
+        .as_ref()
+        .map(|b| emit_schema(b, 0))
+        .unwrap_or_else(|| emit_schema(&Block::default(), 0));
+
+    get_provider_schema::Response {
+        provider: Some(provider),
+        resource_schemas: schema
+            .resources
+            .iter()
+            .map(|r| (r.name.clone(), emit_schema(&r.block, 0)))
+            .collect(),
+        data_source_schemas: schema
+            .data_sources
+            .iter()
+            .map(|d| (d.name.clone(), emit_schema(&d.block, 0)))
+            .collect(),
+        functions: HashMap::new(),
+        ephemeral_resource_schemas: HashMap::new(),
+        list_resource_schemas: HashMap::new(),
+        state_store_schemas: HashMap::new(),
+        action_schemas: HashMap::new(),
+        diagnostics: Vec::new(),
+        provider_meta: None,
+        server_capabilities: Some(server_capabilities()),
+    }
+}
+
+/// Lower a [`ProviderSchema`] into a `GetMetadata` response (type-name listing).
+pub fn emit_metadata(schema: &ProviderSchema) -> get_metadata::Response {
+    get_metadata::Response {
+        server_capabilities: Some(server_capabilities()),
+        diagnostics: Vec::new(),
+        data_sources: schema
+            .data_sources
+            .iter()
+            .map(|d| get_metadata::DataSourceMetadata {
+                type_name: d.name.clone(),
+            })
+            .collect(),
+        resources: schema
+            .resources
+            .iter()
+            .map(|r| get_metadata::ResourceMetadata {
+                type_name: r.name.clone(),
+            })
+            .collect(),
+        functions: Vec::new(),
+        ephemeral_resources: Vec::new(),
+        list_resources: Vec::new(),
+        state_stores: Vec::new(),
+        actions: Vec::new(),
+    }
+}
+
+/// The capabilities this SDK currently advertises.
+///
+/// Everything is `false` for now: the planning, move, and config-generation RPCs
+/// are not yet implemented, so we must not claim them.
+pub fn server_capabilities() -> ServerCapabilities {
+    ServerCapabilities {
+        plan_destroy: false,
+        get_provider_schema_optional: false,
+        move_resource_state: false,
+        generate_resource_config: false,
     }
 }
 

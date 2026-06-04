@@ -7,8 +7,50 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+facet = { workspace = true }
 terraform-value = { workspace = true }
 terraform-ir = { workspace = true }
+terraform-reflect = { workspace = true }
+terraform-tfplugin6 = { workspace = true }
+thiserror = { workspace = true }
+
+tonic = { version = "0.14", default-features = false, features = [
+    "server",
+    "router",
+    "transport",
+    "codegen",
+    "tls-ring",
+] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+    "io-std",
+    "io-util",
+    "sync",
+] }
+tokio-stream = { version = "0.1", features = ["net"] }
+rcgen = "0.14"
+base64 = "0.22"
+# Terminate auto-mTLS ourselves: tonic's ServerTlsConfig hardcodes a WebPKI
+# client verifier (advertises CA-name hints + path validation), which is
+# incompatible with go-plugin's RequireAnyClientCert + cert pinning. We build a
+# rustls ServerConfig with a custom verifier instead. Versions are pinned to
+# match what tonic's `tls-ring` pulls so the `TlsStream` types unify.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls-pemfile = "2"
+
+[dev-dependencies]
+facet = { workspace = true }
+terraform-attrs = { workspace = true }
+terraform-tfplugin6 = { workspace = true }
+serde_json = { workspace = true }
+# Only needed to name `tonic::Request`/`Response`/`Status` and the generated
+# service trait in tests — no transport: the tests call the service methods
+# directly.
+tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 
 [lints]
 workspace = true

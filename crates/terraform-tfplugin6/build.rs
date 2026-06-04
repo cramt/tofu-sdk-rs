@@ -1,9 +1,8 @@
-//! Generate Rust types for the Terraform plugin protocol v6 from the vendored
-//! `tfplugin6.proto`.
+//! Generate Rust types and the gRPC `Provider` service for the Terraform plugin
+//! protocol v6 from the vendored `tfplugin6.proto`.
 //!
-//! Phase 1 only needs the message types (for schema emission), so we generate
-//! prost messages and skip the gRPC service. Phase 2 will switch to
-//! `tonic-prost-build` to additionally generate the `Provider` service.
+//! Both the server (the provider runtime implements it) and the client (handy
+//! for in-process integration tests) are generated.
 //!
 //! `protoc` is provided by the Nix dev shell (the `PROTOC` env var points at
 //! it); the well-known `google/protobuf/timestamp.proto` import is resolved from
@@ -15,8 +14,6 @@ fn main() {
     println!("cargo:rerun-if-changed=proto/tfplugin6.proto");
     println!("cargo:rerun-if-env-changed=PROTOC");
 
-    let mut config = prost_build::Config::new();
-
     // Make sure protoc's bundled well-known types are on the include path so
     // `import "google/protobuf/timestamp.proto"` resolves regardless of how
     // protoc was packaged.
@@ -25,7 +22,9 @@ fn main() {
         includes.push(dir);
     }
 
-    config
+    tonic_prost_build::configure()
+        .build_server(true)
+        .build_client(true)
         .compile_protos(&[PathBuf::from("proto/tfplugin6.proto")], &includes)
         .expect("failed to compile tfplugin6.proto");
 }
