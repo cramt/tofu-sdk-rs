@@ -94,8 +94,7 @@ fn encode_object(
 /// (as cty JSON bytes) and the value encoded with that type.
 fn encode_dynamic(value: &Value) -> Result<Mp, CodecError> {
     let concrete = value.infer_type();
-    let type_json = serde_json::to_vec(&concrete.to_cty_json())
-        .map_err(|e| CodecError::Encode(format!("dynamic type: {e}")))?;
+    let type_json = concrete.to_cty_json_bytes();
     let inner = to_mp(value, &concrete)?;
     Ok(Mp::Array(vec![Mp::Binary(type_json), inner]))
 }

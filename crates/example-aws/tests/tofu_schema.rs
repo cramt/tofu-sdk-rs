@@ -7,7 +7,7 @@
 
 mod common;
 
-use serde_json::Value;
+use common::Json;
 
 const CONFIG: &str = r#"
 terraform {
@@ -27,32 +27,49 @@ fn real_engine_loads_reflected_schema() {
     let output = common::run(&engine, &["providers", "schema", "-json"], &ws);
     common::assert_ok(&format!("{engine} providers schema -json"), &output);
 
-    let schema: Value = serde_json::from_slice(&output.stdout).expect("schema is valid JSON");
+    let schema = common::json(&output.stdout);
 
     // The provider key is host-qualified (registry.opentofu.org or
     // registry.terraform.io); match by suffix instead of hardcoding the host.
-    let providers = schema["provider_schemas"]
+    let providers = common::get(&schema, &["provider_schemas"])
         .as_object()
         .expect("provider_schemas object");
     let (_, provider) = providers
         .iter()
-        .find(|(k, _)| k.ends_with("example/aws"))
+        .find(|(k, _)| k.as_str().ends_with("example/aws"))
         .expect("our provider is present");
 
-    let attrs = &provider["resource_schemas"]["aws_s3_bucket"]["block"]["attributes"];
+    let attrs = common::get(
+        provider,
+        &["resource_schemas", "aws_s3_bucket", "block", "attributes"],
+    );
 
-    assert_eq!(attrs["name"]["type"], Value::from("string"));
-    assert_eq!(attrs["name"]["required"], Value::from(true));
-    assert_eq!(attrs["arn"]["type"], Value::from("string"));
-    assert_eq!(attrs["arn"]["computed"], Value::from(true));
     assert_eq!(
-        attrs["tags"]["type"],
-        serde_json::json!(["map", "string"]),
+        common::to_json_string(common::get(attrs, &["name", "type"])),
+        r#""string""#
+    );
+    assert_eq!(
+        common::get(attrs, &["name", "required"]).as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        common::to_json_string(common::get(attrs, &["arn", "type"])),
+        r#""string""#
+    );
+    assert_eq!(
+        common::get(attrs, &["arn", "computed"]).as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        common::to_json_string(common::get(attrs, &["tags", "type"])),
+        r#"["map","string"]"#,
         "tags should be map(string)"
     );
 
     assert!(
-        provider["provider"]["block"].is_object(),
+        common::path(provider, &["provider", "block"])
+            .and_then(Json::as_object)
+            .is_some(),
         "provider schema block must be present"
     );
 }

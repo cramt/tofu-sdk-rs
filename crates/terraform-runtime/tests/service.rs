@@ -6,9 +6,9 @@
 //! real by the `tofu providers schema` contract test in `example-aws`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use facet::Facet;
-use serde_json::{json, Value};
 use terraform_attrs as terraform;
 use terraform_runtime::{async_trait, Provider, ProviderService, Resource, ResourceError};
 use terraform_tfplugin6::tfplugin6::{self, provider_server::Provider as _};
@@ -76,10 +76,10 @@ async fn get_provider_schema_returns_reflected_schema() {
 
     let name = block.attributes.iter().find(|a| a.name == "name").unwrap();
     assert!(name.required);
-    assert_eq!(cty(&name.r#type), json!("string"));
+    assert_eq!(cty(&name.r#type), r#""string""#);
 
     let tags = block.attributes.iter().find(|a| a.name == "tags").unwrap();
-    assert_eq!(cty(&tags.r#type), json!(["map", "string"]));
+    assert_eq!(cty(&tags.r#type), r#"["map","string"]"#);
 
     assert!(resp.data_source_schemas.contains_key("aws_s3_bucket"));
     assert!(resp.server_capabilities.is_some());
@@ -216,7 +216,152 @@ async fn plan_then_apply_create_round_trips() {
     }
 }
 
-/// Decode the `cty` JSON type-constraint bytes from an attribute's `type` field.
-fn cty(bytes: &[u8]) -> Value {
-    serde_json::from_slice(bytes).expect("attribute type is valid JSON")
+// --- Provider configuration (meta) -----------------------------------------
+
+/// Provider config: an optional region.
+#[derive(Facet)]
+#[allow(dead_code)]
+struct AwsConfig {
+    #[facet(terraform::optional)]
+    region: Option<String>,
+}
+
+/// The configured shared state handed to resource handlers.
+struct AwsClient {
+    region: String,
+}
+
+/// A resource that stamps the configured region onto itself.
+#[derive(Facet)]
+#[facet(terraform::resource)]
+#[allow(dead_code)]
+struct RegionBucket {
+    #[facet(terraform::required)]
+    name: String,
+    #[facet(terraform::computed)]
+    region: String,
+}
+
+struct RegionResource {
+    client: Arc<AwsClient>,
+}
+
+#[async_trait]
+impl Resource for RegionResource {
+    type Model = RegionBucket;
+
+    async fn create(&self, mut planned: RegionBucket) -> Result<RegionBucket, ResourceError> {
+        planned.region = self.client.region.clone();
+        Ok(planned)
+    }
+}
+
+/// A provider whose `region_bucket` handler is built from the configured client.
+fn configured_service() -> ProviderService {
+    let provider = Provider::builder()
+        .provider_config::<AwsConfig>()
+        .configure(|cfg: AwsConfig| async move {
+            Arc::new(AwsClient {
+                region: cfg.region.unwrap_or_else(|| "us-east-1".to_string()),
+            })
+        })
+        .resource_with("region_bucket", |client: Arc<AwsClient>| RegionResource {
+            client,
+        })
+        .build()
+        .expect("configured provider builds");
+    ProviderService::new(provider)
+}
+
+/// The `cty` object type of `RegionBucket`.
+fn region_bucket_ty() -> terraform_value::Type {
+    terraform_value::Type::Object(vec![
+        terraform_value::ObjectAttr {
+            name: "name".into(),
+            ty: terraform_value::Type::String,
+            optional: false,
+        },
+        terraform_value::ObjectAttr {
+            name: "region".into(),
+            ty: terraform_value::Type::String,
+            optional: true,
+        },
+    ])
+}
+
+#[tokio::test]
+async fn configure_then_apply_uses_provider_meta() {
+    let svc = configured_service();
+
+    // ConfigureProvider with region = eu-west-1.
+    let cfg_ty = terraform_value::Type::Object(vec![terraform_value::ObjectAttr {
+        name: "region".into(),
+        ty: terraform_value::Type::String,
+        optional: true,
+    }]);
+    let mut cfg = std::collections::BTreeMap::new();
+    cfg.insert(
+        "region".to_string(),
+        terraform_value::Value::String("eu-west-1".into()),
+    );
+    let cfg_dv = tfplugin6::DynamicValue {
+        msgpack: terraform_codec::encode_msgpack(&terraform_value::Value::Object(cfg), &cfg_ty)
+            .unwrap(),
+        json: vec![],
+    };
+    let configured = svc
+        .configure_provider(Request::new(tfplugin6::configure_provider::Request {
+            config: Some(cfg_dv),
+            ..Default::default()
+        }))
+        .await
+        .expect("configure")
+        .into_inner();
+    assert!(
+        configured.diagnostics.is_empty(),
+        "{:?}",
+        configured.diagnostics
+    );
+
+    // Apply (create): the handler should stamp the configured region.
+    let ty = region_bucket_ty();
+    let mut planned = std::collections::BTreeMap::new();
+    planned.insert(
+        "name".to_string(),
+        terraform_value::Value::String("b".into()),
+    );
+    planned.insert("region".to_string(), terraform_value::Value::Unknown);
+    let planned_dv = tfplugin6::DynamicValue {
+        msgpack: terraform_codec::encode_msgpack(&terraform_value::Value::Object(planned), &ty)
+            .unwrap(),
+        json: vec![],
+    };
+    let apply = svc
+        .apply_resource_change(Request::new(tfplugin6::apply_resource_change::Request {
+            type_name: "region_bucket".into(),
+            prior_state: None,
+            planned_state: Some(planned_dv),
+            ..Default::default()
+        }))
+        .await
+        .expect("apply")
+        .into_inner();
+    assert!(apply.diagnostics.is_empty(), "{:?}", apply.diagnostics);
+
+    let new_value =
+        terraform_codec::decode_msgpack(&apply.new_state.expect("new state").msgpack, &ty).unwrap();
+    let terraform_value::Value::Object(fields) = new_value else {
+        panic!("new state should be an object");
+    };
+    assert_eq!(
+        fields["region"],
+        terraform_value::Value::String("eu-west-1".into()),
+        "handler stamped the region from the configured meta"
+    );
+}
+
+/// The `cty` JSON type-constraint bytes from an attribute's `type` field, as a
+/// JSON string.
+fn cty(bytes: &[u8]) -> String {
+    String::from_utf8(bytes.to_vec()).expect("attribute type is valid UTF-8 JSON")
 }

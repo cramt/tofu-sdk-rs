@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use facet_value::Value as Json;
 use rmpv::Value as Mp;
 use terraform_value::{Type, Value};
 
@@ -25,9 +26,7 @@ pub fn decode_msgpack(bytes: &[u8], ty: &Type) -> Result<Value, CodecError> {
 /// e.g. in `UpgradeResourceState`) into a [`Value`], directed by `ty`.
 ///
 /// JSON state is always wholly known, so there is no unknown handling here.
-pub fn decode_json(json: &serde_json::Value, ty: &Type) -> Result<Value, CodecError> {
-    use serde_json::Value as J;
-
+pub fn decode_json(json: &Json, ty: &Type) -> Result<Value, CodecError> {
     if json.is_null() {
         return Ok(Value::Null);
     }
@@ -36,20 +35,21 @@ pub fn decode_json(json: &serde_json::Value, ty: &Type) -> Result<Value, CodecEr
             .as_bool()
             .map(Value::Bool)
             .ok_or_else(|| json_mismatch("bool", json)),
-        Type::Number => match json {
-            J::Number(n) => n
-                .as_f64()
-                .map(Value::Number)
-                .ok_or_else(|| json_mismatch("number", json)),
-            J::String(s) => s
-                .parse::<f64>()
-                .map(Value::Number)
-                .map_err(|_| json_mismatch("number", json)),
-            _ => Err(json_mismatch("number", json)),
-        },
+        Type::Number => {
+            if let Some(n) = json.as_number() {
+                Ok(Value::Number(n.to_f64_lossy()))
+            } else if let Some(s) = json.as_string() {
+                s.as_str()
+                    .parse::<f64>()
+                    .map(Value::Number)
+                    .map_err(|_| json_mismatch("number", json))
+            } else {
+                Err(json_mismatch("number", json))
+            }
+        }
         Type::String => json
-            .as_str()
-            .map(|s| Value::String(s.to_string()))
+            .as_string()
+            .map(|s| Value::String(s.as_str().to_string()))
             .ok_or_else(|| json_mismatch("string", json)),
         Type::List(elem) => Ok(Value::List(decode_json_each(
             json_array(json, "list")?,
@@ -77,8 +77,8 @@ pub fn decode_json(json: &serde_json::Value, ty: &Type) -> Result<Value, CodecEr
         Type::Map(elem) => {
             let obj = json_object(json, "map")?;
             let mut entries = BTreeMap::new();
-            for (k, v) in obj {
-                entries.insert(k.clone(), decode_json(v, elem)?);
+            for (k, v) in obj.iter() {
+                entries.insert(k.as_str().to_string(), decode_json(v, elem)?);
             }
             Ok(Value::Map(entries))
         }
@@ -99,58 +99,70 @@ pub fn decode_json(json: &serde_json::Value, ty: &Type) -> Result<Value, CodecEr
     }
 }
 
-fn decode_json_each(items: &[serde_json::Value], elem: &Type) -> Result<Vec<Value>, CodecError> {
+fn decode_json_each(items: &[Json], elem: &Type) -> Result<Vec<Value>, CodecError> {
     items.iter().map(|v| decode_json(v, elem)).collect()
 }
 
-fn decode_json_dynamic(json: &serde_json::Value) -> Result<Value, CodecError> {
-    use serde_json::Value as J;
-    Ok(match json {
-        J::Null => Value::Null,
-        J::Bool(b) => Value::Bool(*b),
-        J::Number(n) => Value::Number(n.as_f64().unwrap_or(0.0)),
-        J::String(s) => Value::String(s.clone()),
-        J::Array(items) => Value::Tuple(
+fn decode_json_dynamic(json: &Json) -> Result<Value, CodecError> {
+    if json.is_null() {
+        return Ok(Value::Null);
+    }
+    if let Some(b) = json.as_bool() {
+        return Ok(Value::Bool(b));
+    }
+    if let Some(n) = json.as_number() {
+        return Ok(Value::Number(n.to_f64_lossy()));
+    }
+    if let Some(s) = json.as_string() {
+        return Ok(Value::String(s.as_str().to_string()));
+    }
+    if let Some(items) = json.as_array() {
+        return Ok(Value::Tuple(
             items
+                .as_slice()
                 .iter()
                 .map(decode_json_dynamic)
                 .collect::<Result<_, _>>()?,
-        ),
-        J::Object(map) => {
-            let mut fields = BTreeMap::new();
-            for (k, v) in map {
-                fields.insert(k.clone(), decode_json_dynamic(v)?);
-            }
-            Value::Object(fields)
+        ));
+    }
+    if let Some(obj) = json.as_object() {
+        let mut fields = BTreeMap::new();
+        for (k, v) in obj.iter() {
+            fields.insert(k.as_str().to_string(), decode_json_dynamic(v)?);
         }
-    })
+        return Ok(Value::Object(fields));
+    }
+    Err(CodecError::Decode(
+        "unsupported dynamic JSON value".to_string(),
+    ))
 }
 
-fn json_array<'a>(
-    json: &'a serde_json::Value,
-    expected: &str,
-) -> Result<&'a [serde_json::Value], CodecError> {
+fn json_array<'a>(json: &'a Json, expected: &str) -> Result<&'a [Json], CodecError> {
     json.as_array()
-        .map(Vec::as_slice)
+        .map(|a| a.as_slice())
         .ok_or_else(|| json_mismatch(expected, json))
 }
 
-fn json_object<'a>(
-    json: &'a serde_json::Value,
-    expected: &str,
-) -> Result<&'a serde_json::Map<String, serde_json::Value>, CodecError> {
+fn json_object<'a>(json: &'a Json, expected: &str) -> Result<&'a facet_value::VObject, CodecError> {
     json.as_object()
         .ok_or_else(|| json_mismatch(expected, json))
 }
 
-fn json_mismatch(expected: &str, json: &serde_json::Value) -> CodecError {
-    let found = match json {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "bool",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
+fn json_mismatch(expected: &str, json: &Json) -> CodecError {
+    let found = if json.is_null() {
+        "null"
+    } else if json.as_bool().is_some() {
+        "bool"
+    } else if json.as_number().is_some() {
+        "number"
+    } else if json.as_string().is_some() {
+        "string"
+    } else if json.as_array().is_some() {
+        "array"
+    } else if json.as_object().is_some() {
+        "object"
+    } else {
+        "value"
     };
     CodecError::TypeMismatch {
         expected: expected.to_string(),
@@ -261,9 +273,7 @@ fn decode_dynamic(mp: &Mp) -> Result<Value, CodecError> {
             )))
         }
     };
-    let type_json: serde_json::Value = serde_json::from_slice(&type_bytes)
-        .map_err(|e| CodecError::Dynamic(format!("dynamic type JSON: {e}")))?;
-    let ty = Type::from_cty_json(&type_json).map_err(CodecError::Dynamic)?;
+    let ty = Type::from_cty_json_bytes(&type_bytes).map_err(CodecError::Dynamic)?;
     from_mp(&items[1], &ty)
 }
 

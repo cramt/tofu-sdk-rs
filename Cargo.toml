@@ -16,8 +16,13 @@ rust-version = "1.85"
 # (Peek/Partial) is unresolvable from crates.io. The git repo is internally
 # consistent. (Reported upstream.)
 facet = { git = "https://github.com/facet-rs/facet" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# facet-json / facet-value live in the facet-format repo (split out of the
+# monorepo). The published 0.46 releases pin `facet-core = "0.46"` (matching the
+# facet git pin); their transitive `facet-reflect = "0.46"` is unpublished, so we
+# patch facet-core/facet-reflect to the git source below to unify on one
+# facet-core. JSON handling goes through these instead of serde.
+facet-json = "0.46"
+facet-value = "0.46"
 thiserror = "2"
 
 # Internal crates (path deps)
@@ -30,6 +35,16 @@ terraform-runtime = { path = "crates/terraform-runtime" }
 terraform-tfplugin6 = { path = "crates/terraform-tfplugin6" }
 terraform-macros = { path = "crates/terraform-macros" }
 terraform-provider = { path = "crates/terraform-provider" }
+
+# facet-json/facet-value (and their facet-format/facet-reflect deps) request
+# crates.io facet-core/facet-reflect ^0.46; point those at the git facet repo so
+# the entire tree shares one facet-core 0.46.5 (and so the unpublished
+# facet-reflect 0.46 resolves at all).
+[patch.crates-io]
+facet-core = { git = "https://github.com/facet-rs/facet" }
+facet-reflect = { git = "https://github.com/facet-rs/facet" }
+facet-path = { git = "https://github.com/facet-rs/facet" }
+facet-solver = { git = "https://github.com/facet-rs/facet" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

@@ -112,3 +112,44 @@ pub fn assert_ok(label: &str, output: &Output) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// --- JSON navigation over the engine's `-json` output -----------------------
+//
+// The engine emits dynamic JSON; we parse it into a `facet_value::Value` and
+// walk it with these helpers (no serde).
+
+pub use facet_value::Value as Json;
+
+/// Parse engine JSON output into a dynamic value.
+pub fn json(bytes: &[u8]) -> Json {
+    facet_json::from_slice(bytes).expect("engine emitted valid JSON")
+}
+
+/// Follow a path of object keys, returning `None` if any segment is missing or
+/// not an object.
+pub fn path<'a>(value: &'a Json, keys: &[&str]) -> Option<&'a Json> {
+    let mut current = value;
+    for key in keys {
+        current = current.as_object()?.get(key)?;
+    }
+    Some(current)
+}
+
+/// Follow a path of object keys, panicking with the path on any miss.
+pub fn get<'a>(value: &'a Json, keys: &[&str]) -> &'a Json {
+    path(value, keys).unwrap_or_else(|| panic!("missing JSON path {keys:?}"))
+}
+
+/// The string at `keys` (panics if absent or not a string).
+pub fn string<'a>(value: &'a Json, keys: &[&str]) -> &'a str {
+    get(value, keys)
+        .as_string()
+        .unwrap_or_else(|| panic!("JSON path {keys:?} is not a string"))
+        .as_str()
+}
+
+/// Render a JSON node back to its compact string form (for comparing the cty
+/// type constraints the engine reports).
+pub fn to_json_string(value: &Json) -> String {
+    facet_json::to_string(value).expect("value re-serializes")
+}

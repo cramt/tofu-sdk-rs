@@ -85,11 +85,14 @@ impl is a working provider, exercised end-to-end against **real OpenTofu**
 - **Phase 5 ✅** — planning engine: changing a `force_new` attribute emits
   `requires_replace` (destroy + create), computed attributes go unknown on
   replacement — verified by a real `tofu` replacement test
+- **Provider configuration ✅** — `ConfigureProvider` decodes the provider
+  config block and a `configure` closure turns it into shared state (an
+  `Arc<Meta>`, e.g. an API client) handed to every resource handler — verified
+  by a real `tofu` test that flows a `provider` block region into a resource
 
 ### Not yet implemented
 
-Data sources, provider configuration plumbed into handlers (`ConfigureProvider`
-is currently a no-op), nested blocks end-to-end, functions, ephemeral resources,
+Data sources, nested blocks end-to-end, functions, ephemeral resources,
 import/move, and a `TfValue<T>` field wrapper to preserve known/unknown/null
 through decode (today `Unknown` decodes to the type's zero value). Numbers are
 held as `f64`. Not all `cty` corner cases are covered.

@@ -1,4 +1,4 @@
-use serde_json::{json, Value as Json};
+use facet_value::{VArray, VObject, Value as Json};
 
 /// The Terraform `cty` type system.
 ///
@@ -58,7 +58,7 @@ impl Type {
         Type::Map(Box::new(elem))
     }
 
-    /// Serialize to the `cty` JSON type-constraint encoding.
+    /// Serialize to the `cty` JSON type-constraint encoding (as a dynamic value).
     ///
     /// This is the encoding Terraform expects in `Schema.Attribute.type`
     /// (transmitted as the JSON bytes of a type constraint). Examples:
@@ -68,33 +68,43 @@ impl Type {
     /// - `Object({a: string, b?: number})` → `["object", {"a":"string","b":"number"}, ["b"]]`
     pub fn to_cty_json(&self) -> Json {
         match self {
-            Type::Bool => json!("bool"),
-            Type::Number => json!("number"),
-            Type::String => json!("string"),
-            Type::Dynamic => json!("dynamic"),
-            Type::List(elem) => json!(["list", elem.to_cty_json()]),
-            Type::Set(elem) => json!(["set", elem.to_cty_json()]),
-            Type::Map(elem) => json!(["map", elem.to_cty_json()]),
+            Type::Bool => Json::from("bool"),
+            Type::Number => Json::from("number"),
+            Type::String => Json::from("string"),
+            Type::Dynamic => Json::from("dynamic"),
+            Type::List(elem) => json_array([Json::from("list"), elem.to_cty_json()]),
+            Type::Set(elem) => json_array([Json::from("set"), elem.to_cty_json()]),
+            Type::Map(elem) => json_array([Json::from("map"), elem.to_cty_json()]),
             Type::Tuple(elems) => {
-                let elems: Vec<Json> = elems.iter().map(Type::to_cty_json).collect();
-                json!(["tuple", elems])
+                let inner = json_array(elems.iter().map(Type::to_cty_json));
+                json_array([Json::from("tuple"), inner])
             }
             Type::Object(attrs) => {
-                let mut fields = serde_json::Map::new();
+                let mut fields = VObject::new();
                 let mut optionals: Vec<Json> = Vec::new();
                 for attr in attrs {
-                    fields.insert(attr.name.clone(), attr.ty.to_cty_json());
+                    fields.insert(attr.name.as_str(), attr.ty.to_cty_json());
                     if attr.optional {
-                        optionals.push(json!(attr.name));
+                        optionals.push(Json::from(attr.name.as_str()));
                     }
                 }
                 if optionals.is_empty() {
-                    json!(["object", fields])
+                    json_array([Json::from("object"), Json::from(fields)])
                 } else {
-                    json!(["object", fields, optionals])
+                    json_array([
+                        Json::from("object"),
+                        Json::from(fields),
+                        json_array(optionals),
+                    ])
                 }
             }
         }
+    }
+
+    /// Serialize to the `cty` JSON type-constraint encoding as bytes (the form
+    /// Terraform carries in `Schema.Attribute.type`).
+    pub fn to_cty_json_bytes(&self) -> Vec<u8> {
+        facet_json::to_vec(&self.to_cty_json()).expect("a cty type constraint always serializes")
     }
 
     /// Parse a `cty` JSON type constraint (the inverse of [`Type::to_cty_json`]).
@@ -102,59 +112,75 @@ impl Type {
     /// Used when decoding a `DynamicPseudoType` value, whose wire form carries
     /// the concrete type as embedded JSON.
     pub fn from_cty_json(json: &Json) -> Result<Type, String> {
-        match json {
-            Json::String(s) => match s.as_str() {
+        if let Some(s) = json.as_string() {
+            return match s.as_str() {
                 "bool" => Ok(Type::Bool),
                 "number" => Ok(Type::Number),
                 "string" => Ok(Type::String),
                 "dynamic" => Ok(Type::Dynamic),
                 other => Err(format!("unknown primitive cty type {other:?}")),
-            },
-            Json::Array(items) => {
-                let kind = items
-                    .first()
-                    .and_then(Json::as_str)
-                    .ok_or_else(|| "cty type array must start with a kind string".to_string())?;
-                match kind {
-                    "list" => Ok(Type::list(Self::nth_type(items, 1)?)),
-                    "set" => Ok(Type::set(Self::nth_type(items, 1)?)),
-                    "map" => Ok(Type::map(Self::nth_type(items, 1)?)),
-                    "tuple" => {
-                        let elems = items
-                            .get(1)
-                            .and_then(Json::as_array)
-                            .ok_or_else(|| "tuple type needs an element-type array".to_string())?;
-                        let tys = elems
-                            .iter()
-                            .map(Type::from_cty_json)
-                            .collect::<Result<Vec<_>, _>>()?;
-                        Ok(Type::Tuple(tys))
-                    }
-                    "object" => {
-                        let fields = items
-                            .get(1)
-                            .and_then(Json::as_object)
-                            .ok_or_else(|| "object type needs an attribute map".to_string())?;
-                        let optionals: Vec<&str> = items
-                            .get(2)
-                            .and_then(Json::as_array)
-                            .map(|a| a.iter().filter_map(Json::as_str).collect())
-                            .unwrap_or_default();
-                        let mut attrs = Vec::with_capacity(fields.len());
-                        for (name, ty) in fields {
-                            attrs.push(ObjectAttr {
-                                name: name.clone(),
-                                ty: Type::from_cty_json(ty)?,
-                                optional: optionals.contains(&name.as_str()),
-                            });
-                        }
-                        Ok(Type::Object(attrs))
-                    }
-                    other => Err(format!("unknown cty collection kind {other:?}")),
-                }
-            }
-            other => Err(format!("invalid cty type constraint: {other}")),
+            };
         }
+        if let Some(items) = json.as_array() {
+            let items = items.as_slice();
+            let kind = items
+                .first()
+                .and_then(Json::as_string)
+                .map(|s| s.as_str())
+                .ok_or_else(|| "cty type array must start with a kind string".to_string())?;
+            return match kind {
+                "list" => Ok(Type::list(Self::nth_type(items, 1)?)),
+                "set" => Ok(Type::set(Self::nth_type(items, 1)?)),
+                "map" => Ok(Type::map(Self::nth_type(items, 1)?)),
+                "tuple" => {
+                    let elems = items
+                        .get(1)
+                        .and_then(Json::as_array)
+                        .ok_or_else(|| "tuple type needs an element-type array".to_string())?;
+                    let tys = elems
+                        .as_slice()
+                        .iter()
+                        .map(Type::from_cty_json)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(Type::Tuple(tys))
+                }
+                "object" => {
+                    let fields = items
+                        .get(1)
+                        .and_then(Json::as_object)
+                        .ok_or_else(|| "object type needs an attribute map".to_string())?;
+                    let optionals: Vec<&str> = items
+                        .get(2)
+                        .and_then(Json::as_array)
+                        .map(|a| {
+                            a.as_slice()
+                                .iter()
+                                .filter_map(|j| j.as_string().map(|s| s.as_str()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let mut attrs = Vec::with_capacity(fields.len());
+                    for (name, ty) in fields.iter() {
+                        let name = name.as_str();
+                        attrs.push(ObjectAttr {
+                            name: name.to_string(),
+                            ty: Type::from_cty_json(ty)?,
+                            optional: optionals.contains(&name),
+                        });
+                    }
+                    Ok(Type::Object(attrs))
+                }
+                other => Err(format!("unknown cty collection kind {other:?}")),
+            };
+        }
+        Err(format!("invalid cty type constraint: {json:?}"))
+    }
+
+    /// Parse a `cty` JSON type constraint from its byte encoding.
+    pub fn from_cty_json_bytes(bytes: &[u8]) -> Result<Type, String> {
+        let json: Json =
+            facet_json::from_slice(bytes).map_err(|e| format!("invalid cty type JSON: {e}"))?;
+        Type::from_cty_json(&json)
     }
 
     /// Helper: parse the element type at `index` of a collection type array.
@@ -166,31 +192,35 @@ impl Type {
     }
 }
 
+/// Build a `cty` JSON array value from an iterator of element values.
+fn json_array(items: impl IntoIterator<Item = Json>) -> Json {
+    Json::from(items.into_iter().collect::<VArray>())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The cty type constraint of `ty` as a JSON string.
+    fn cty(ty: &Type) -> String {
+        String::from_utf8(ty.to_cty_json_bytes()).expect("utf8")
+    }
+
     #[test]
     fn primitive_encoding() {
-        assert_eq!(Type::String.to_cty_json(), json!("string"));
-        assert_eq!(Type::Number.to_cty_json(), json!("number"));
-        assert_eq!(Type::Bool.to_cty_json(), json!("bool"));
-        assert_eq!(Type::Dynamic.to_cty_json(), json!("dynamic"));
+        assert_eq!(cty(&Type::String), r#""string""#);
+        assert_eq!(cty(&Type::Number), r#""number""#);
+        assert_eq!(cty(&Type::Bool), r#""bool""#);
+        assert_eq!(cty(&Type::Dynamic), r#""dynamic""#);
     }
 
     #[test]
     fn collection_encoding() {
+        assert_eq!(cty(&Type::list(Type::String)), r#"["list","string"]"#);
+        assert_eq!(cty(&Type::map(Type::Number)), r#"["map","number"]"#);
         assert_eq!(
-            Type::list(Type::String).to_cty_json(),
-            json!(["list", "string"])
-        );
-        assert_eq!(
-            Type::map(Type::Number).to_cty_json(),
-            json!(["map", "number"])
-        );
-        assert_eq!(
-            Type::set(Type::list(Type::Bool)).to_cty_json(),
-            json!(["set", ["list", "bool"]])
+            cty(&Type::set(Type::list(Type::Bool))),
+            r#"["set",["list","bool"]]"#
         );
     }
 
@@ -208,10 +238,7 @@ mod tests {
                 optional: true,
             },
         ]);
-        assert_eq!(
-            ty.to_cty_json(),
-            json!(["object", {"a": "string", "b": "number"}, ["b"]])
-        );
+        assert_eq!(cty(&ty), r#"["object",{"a":"string","b":"number"},["b"]]"#);
     }
 
     #[test]
@@ -221,7 +248,7 @@ mod tests {
             ty: Type::String,
             optional: false,
         }]);
-        assert_eq!(ty.to_cty_json(), json!(["object", {"a": "string"}]));
+        assert_eq!(cty(&ty), r#"["object",{"a":"string"}]"#);
     }
 
     #[test]
@@ -251,7 +278,7 @@ mod tests {
         for ty in types {
             let json = ty.to_cty_json();
             let back = Type::from_cty_json(&json).expect("parses back");
-            assert_eq!(back, ty, "round trip for {json}");
+            assert_eq!(back, ty, "round trip for {json:?}");
         }
     }
 }

@@ -22,8 +22,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [dev-dependencies]
 # The contract test drives the real `tofu`/`terraform` binary and parses its
-# JSON schema output — no in-process gRPC needed.
-serde_json = { workspace = true }
+# JSON output with facet-json/facet-value — no in-process gRPC needed.
+facet-json = { workspace = true }
+facet-value = { workspace = true }
 
 [lints]
 workspace = true

@@ -118,12 +118,9 @@ pub fn emit_block(block: &Block) -> schema::Block {
 /// The attribute's `cty` type is serialized to the JSON type-constraint encoding
 /// Terraform expects in the `type` field.
 fn emit_attribute(attr: &AttributeSchema) -> schema::Attribute {
-    let type_json = serde_json::to_vec(&attr.ty.to_cty_json())
-        .expect("cty type constraint always serializes to JSON");
-
     schema::Attribute {
         name: attr.name.clone(),
-        r#type: type_json,
+        r#type: attr.ty.to_cty_json_bytes(),
         nested_type: None,
         description: attr.description.clone().unwrap_or_default(),
         required: attr.required,

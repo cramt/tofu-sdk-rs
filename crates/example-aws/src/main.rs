@@ -2,15 +2,36 @@
 //!
 //! It declares a single resource by reflecting a plain Rust struct and serves
 //! its full create/read/update/delete lifecycle over the plugin protocol. The
-//! resource has no external backing — it derives its one computed attribute
-//! (`arn`) from configuration — which keeps the example self-contained and
-//! deterministic.
+//! resource has no external backing — it derives its computed attributes
+//! (`arn`, `region`) from configuration and the configured provider state —
+//! which keeps the example self-contained and deterministic.
+//!
+//! It also demonstrates **provider configuration**: the provider takes an
+//! optional `region`, and `configure` turns that into a shared `AwsClient`
+//! (the *meta*) handed to the resource handler, which stamps the region onto
+//! every bucket it creates.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use facet::Facet;
 use terraform_provider::terraform;
 use terraform_runtime::{async_trait, serve, Provider, Resource, ResourceError};
+
+/// Provider-level configuration.
+#[derive(Facet)]
+#[allow(dead_code)]
+struct AwsConfig {
+    /// The region buckets are created in. Defaults to `us-east-1` when unset.
+    #[facet(terraform::optional)]
+    region: Option<String>,
+}
+
+/// The configured provider state shared by every resource handler. In a real
+/// provider this would hold an API client, credentials, an HTTP pool, etc.
+struct AwsClient {
+    region: String,
+}
 
 /// An S3-bucket-like resource.
 #[derive(Facet)]
@@ -26,38 +47,53 @@ struct Bucket {
     #[facet(terraform::computed)]
     arn: String,
 
+    /// The region the bucket lives in, taken from provider configuration.
+    #[facet(terraform::computed)]
+    region: String,
+
     /// Free-form tags.
     tags: Option<HashMap<String, String>>,
 }
 
-impl Bucket {
-    /// Derive the computed ARN from the (known) name.
-    fn computed(mut self) -> Self {
-        self.arn = format!("arn:aws:s3:::{}", self.name);
-        self
-    }
+/// The handler for `aws_s3_bucket`, holding the configured client.
+struct BucketResource {
+    client: Arc<AwsClient>,
 }
 
-/// The handler for `aws_s3_bucket`.
-struct BucketResource;
+impl BucketResource {
+    /// Fill the computed attributes from the (known) name and configured region.
+    fn computed(&self, mut bucket: Bucket) -> Bucket {
+        bucket.arn = format!("arn:aws:s3:::{}", bucket.name);
+        bucket.region = self.client.region.clone();
+        bucket
+    }
+}
 
 #[async_trait]
 impl Resource for BucketResource {
     type Model = Bucket;
 
     async fn create(&self, planned: Bucket) -> Result<Bucket, ResourceError> {
-        Ok(planned.computed())
+        Ok(self.computed(planned))
     }
 
     async fn update(&self, planned: Bucket, _prior: Bucket) -> Result<Bucket, ResourceError> {
-        Ok(planned.computed())
+        Ok(self.computed(planned))
     }
 }
 
 #[tokio::main]
 async fn main() {
     let provider = Provider::builder()
-        .resource("aws_s3_bucket", BucketResource)
+        .provider_config::<AwsConfig>()
+        .configure(|cfg: AwsConfig| async move {
+            Arc::new(AwsClient {
+                region: cfg.region.unwrap_or_else(|| "us-east-1".to_string()),
+            })
+        })
+        .resource_with("aws_s3_bucket", |client: Arc<AwsClient>| BucketResource {
+            client,
+        })
         .build()
         .expect("provider definition is valid");
 

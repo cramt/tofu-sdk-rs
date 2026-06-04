@@ -14,7 +14,8 @@ terraform-reflect = { workspace = true }
 terraform-codec = { workspace = true }
 terraform-tfplugin6 = { workspace = true }
 thiserror = { workspace = true }
-serde_json = { workspace = true }
+facet-json = { workspace = true }
+facet-value = { workspace = true }
 async-trait = "0.1"
 
 tonic = { version = "0.14", default-features = false, features = [
@@ -49,7 +50,6 @@ rustls-pemfile = "2"
 facet = { workspace = true }
 terraform-attrs = { workspace = true }
 terraform-tfplugin6 = { workspace = true }
-serde_json = { workspace = true }
 # Only needed to name `tonic::Request`/`Response`/`Status` and the generated
 # service trait in tests — no transport: the tests call the service methods
 # directly.

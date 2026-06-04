@@ -178,11 +178,9 @@ mod tests {
                 optional: false,
             },
         ]);
-        let json = serde_json::json!({
-            "name": "bucket",
-            "count": 3,
-            "tags": { "env": "prod" }
-        });
+        let json: facet_value::Value =
+            facet_json::from_str(r#"{ "name": "bucket", "count": 3, "tags": { "env": "prod" } }"#)
+                .expect("parse json state");
         let value = decode_json(&json, &ty).expect("decode json state");
         let Value::Object(fields) = value else {
             panic!("expected object")

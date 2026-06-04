@@ -62,6 +62,16 @@ mapping lives in `terraform-tfplugin6` (the "backend").
   `Cargo.toml`). The crates.io `facet` 0.46.5 needs `facet-reflect` 0.46.5,
   which was never published, so the `reflect` feature (Peek/Partial) won't
   resolve from crates.io. Switch back to a crates.io release once that is fixed.
+- **No serde — JSON is `facet-json` + `facet-value`.** All JSON (the cty
+  type-constraint encoding and cty JSON state) goes through `facet-json`
+  (typed (de)serialize) and `facet-value` (its dynamic `Value`). These were
+  split out of the facet monorepo into the `facet-format` repo and are NOT in
+  the pinned `facet` git rev; we take them from crates.io (`= "0.46"`). Their
+  deps want crates.io `facet-core`/`facet-reflect`/`facet-path`/`facet-solver`
+  `^0.46`, and `facet-reflect 0.46` is unpublished — so a `[patch.crates-io]`
+  in the root `Cargo.toml` points those four at the git facet repo, unifying
+  the whole tree on one facet-core 0.46.5. cty<->JSON lives on
+  `terraform_value::Type` (`to_cty_json_bytes` / `from_cty_json_bytes`).
 - **`terraform-attrs` is a separate crate on purpose.** A facet
   `define_attr_grammar!` emits a `#[macro_export]` dispatcher that cannot be
   used by path within its own crate (rust-lang/rust#52234). Authors alias it as

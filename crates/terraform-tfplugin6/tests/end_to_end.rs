@@ -11,7 +11,6 @@
 use std::collections::HashMap;
 
 use facet::Facet;
-use serde_json::{json, Value};
 use terraform_attrs as terraform;
 use terraform_reflect::reflect_resource;
 use terraform_tfplugin6::{emit_schema, tfplugin6};
@@ -42,9 +41,10 @@ struct Bucket {
     encrypted: bool,
 }
 
-/// Decode the `cty` JSON type constraint stored in an attribute's `type` bytes.
-fn cty(attr: &tfplugin6::schema::Attribute) -> Value {
-    serde_json::from_slice(&attr.r#type).expect("attribute type is valid JSON")
+/// The `cty` JSON type constraint stored in an attribute's `type` bytes, as a
+/// JSON string.
+fn cty(attr: &tfplugin6::schema::Attribute) -> String {
+    String::from_utf8(attr.r#type.clone()).expect("attribute type is valid UTF-8 JSON")
 }
 
 fn attr<'a>(block: &'a tfplugin6::schema::Block, name: &str) -> &'a tfplugin6::schema::Attribute {
@@ -71,7 +71,7 @@ fn bucket_reflects_to_terraform_schema() {
     assert!(name.required);
     assert!(!name.optional);
     assert!(!name.computed);
-    assert_eq!(cty(name), json!("string"));
+    assert_eq!(cty(name), r#""string""#);
     assert_eq!(name.description, "The name of the bucket.");
 
     // arn: computed-only.
@@ -79,24 +79,24 @@ fn bucket_reflects_to_terraform_schema() {
     assert!(arn.computed);
     assert!(!arn.required);
     assert!(!arn.optional);
-    assert_eq!(cty(arn), json!("string"));
+    assert_eq!(cty(arn), r#""string""#);
 
     // tags: required map(string) (no explicit disposition, non-Option -> required).
     let tags = attr(&block, "tags");
-    assert_eq!(cty(tags), json!(["map", "string"]));
+    assert_eq!(cty(tags), r#"["map","string"]"#);
     assert!(tags.required);
 
     // versions: list(string).
-    assert_eq!(cty(attr(&block, "versions")), json!(["list", "string"]));
+    assert_eq!(cty(attr(&block, "versions")), r#"["list","string"]"#);
 
     // retention_days: Option<i64> -> optional number.
     let retention = attr(&block, "retention_days");
-    assert_eq!(cty(retention), json!("number"));
+    assert_eq!(cty(retention), r#""number""#);
     assert!(retention.optional);
     assert!(!retention.required);
 
     // encrypted: bool.
-    assert_eq!(cty(attr(&block, "encrypted")), json!("bool"));
+    assert_eq!(cty(attr(&block, "encrypted")), r#""bool""#);
 
     // Every attribute must satisfy Terraform's rule: at least one of
     // required/optional/computed must be set.

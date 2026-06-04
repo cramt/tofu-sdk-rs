@@ -14,7 +14,6 @@ doctest = false
 [dependencies]
 terraform-value = { workspace = true }
 terraform-ir = { workspace = true }
-serde_json = { workspace = true }
 prost = "0.14"
 prost-types = "0.14"
 tonic = { version = "0.14", default-features = false, features = [

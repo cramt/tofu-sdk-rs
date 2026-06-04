@@ -3,16 +3,51 @@
 //! Authors describe their provider declaratively — registering a config type,
 //! resources (each with a handler), and data sources — and the builder reflects
 //! the schema up front while keeping the resource handlers for dispatch.
+//!
+//! ## Provider configuration
+//!
+//! A provider can carry configuration (credentials, region, …). The author
+//! registers the config type with [`ProviderBuilder::provider_config`] and a
+//! [`ProviderBuilder::configure`] closure that turns the decoded config into
+//! shared state — typically an API client. That shared state (the *meta*) is an
+//! `Arc<M>` handed to every resource registered with
+//! [`ProviderBuilder::resource_with`], so handlers keep their plain typed CRUD
+//! signatures and reach the configured client through `self`.
+//!
+//! The meta is built lazily, once, when Terraform calls `ConfigureProvider`.
+//! Resources that need no configuration are still registered eagerly with
+//! [`ProviderBuilder::resource`].
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use facet::Facet;
+use terraform_codec::from_value;
 use terraform_ir::{Block, ProviderSchema};
 use terraform_reflect::{reflect_block, reflect_data_source, reflect_resource, ReflectError};
-use terraform_value::Type;
+use terraform_value::{Type, Value};
+use tokio::sync::OnceCell;
 
-use crate::resource::{DynResource, Resource, ResourceAdapter};
+use crate::resource::{Diag, Diagnostics, DynResource, Resource, ResourceAdapter};
+
+/// A `Send` boxed future, the erased form of a handler/closure's async result.
+type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+/// The set of resource handlers keyed by type name.
+type ResourceMap = HashMap<String, Arc<dyn DynResource>>;
+
+/// Builds the shared meta `Arc<M>` from the decoded provider config value.
+type MetaFn<M> = Arc<dyn Fn(Value) -> BoxFuture<Result<Arc<M>, Diagnostics>> + Send + Sync>;
+
+/// Builds one resource handler from the shared meta. Stored per registered
+/// `resource_with` until the meta exists at configure time.
+type ResourceFactory<M> = Box<dyn Fn(Arc<M>) -> Arc<dyn DynResource> + Send + Sync>;
+
+/// The fully-erased configure step: decode-and-build the meta, then construct
+/// every meta-backed resource handler. `M` has been erased away by this point.
+type ConfigureFn = dyn Fn(Value) -> BoxFuture<Result<ResourceMap, Diagnostics>> + Send + Sync;
 
 /// Error returned when a provider definition fails to build.
 #[derive(Debug, thiserror::Error)]
@@ -26,13 +61,27 @@ pub enum BuildError {
         #[source]
         source: ReflectError,
     },
+
+    /// A resource was registered with [`ProviderBuilder::resource_with`] but the
+    /// builder has no [`ProviderBuilder::configure`] step to produce the meta it
+    /// depends on.
+    #[error("a resource needs provider meta but no `configure` step was registered")]
+    MissingConfigure,
 }
 
 /// A fully-described provider, ready to be served.
 #[derive(Clone)]
 pub struct Provider {
     schema: Arc<ProviderSchema>,
-    resources: Arc<HashMap<String, Arc<dyn DynResource>>>,
+    /// Handlers that need no provider meta; available immediately.
+    eager: Arc<ResourceMap>,
+    /// The `cty` type of the provider config block, for decoding `ConfigureProvider`.
+    config_ty: Option<Type>,
+    /// Builds the meta and the meta-backed handlers from decoded config. `None`
+    /// when the provider has no `configure` step.
+    configure: Option<Arc<ConfigureFn>>,
+    /// The meta-backed handlers, populated once `ConfigureProvider` runs.
+    configured: Arc<OnceCell<ResourceMap>>,
 }
 
 impl Provider {
@@ -46,9 +95,15 @@ impl Provider {
         &self.schema
     }
 
-    /// The handler for resource type `name`, if registered.
-    pub(crate) fn resource_handler(&self, name: &str) -> Option<&Arc<dyn DynResource>> {
-        self.resources.get(name)
+    /// The handler for resource type `name`, if registered. Configured
+    /// (meta-backed) handlers take precedence over eager ones.
+    pub(crate) fn resource_handler(&self, name: &str) -> Option<Arc<dyn DynResource>> {
+        if let Some(map) = self.configured.get() {
+            if let Some(handler) = map.get(name) {
+                return Some(Arc::clone(handler));
+            }
+        }
+        self.eager.get(name).map(Arc::clone)
     }
 
     /// The `cty` object type of resource `name`, derived from its schema block.
@@ -64,18 +119,54 @@ impl Provider {
             .find(|r| r.name == name)
             .map(|r| &r.block)
     }
+
+    /// The `cty` type Terraform's `ConfigureProvider` config decodes under. An
+    /// empty object when the provider declares no configuration.
+    pub(crate) fn provider_config_ty(&self) -> Type {
+        self.config_ty
+            .clone()
+            .unwrap_or_else(|| Type::Object(Vec::new()))
+    }
+
+    /// Run the provider's configure step with the decoded `config`, building the
+    /// shared meta and meta-backed handlers exactly once. A no-op (and `Ok`) for
+    /// providers without a `configure` step.
+    pub(crate) async fn configure(&self, config: Value) -> Result<(), Diagnostics> {
+        let Some(configure) = self.configure.clone() else {
+            return Ok(());
+        };
+        self.configured
+            .get_or_try_init(|| configure(config))
+            .await?;
+        Ok(())
+    }
 }
 
-/// Incremental builder for a [`Provider`].
-#[derive(Default)]
-pub struct ProviderBuilder {
+/// Incremental builder for a [`Provider`], parameterized by the provider's
+/// shared meta type `M` (`()` until [`ProviderBuilder::configure`] is called).
+pub struct ProviderBuilder<M = ()> {
     provider: Option<Block>,
     schema: ProviderSchema,
-    resources: HashMap<String, Arc<dyn DynResource>>,
+    resources: ResourceMap,
+    factories: Vec<(String, ResourceFactory<M>)>,
+    configure: Option<MetaFn<M>>,
     error: Option<BuildError>,
 }
 
-impl ProviderBuilder {
+impl<M> Default for ProviderBuilder<M> {
+    fn default() -> Self {
+        ProviderBuilder {
+            provider: None,
+            schema: ProviderSchema::default(),
+            resources: HashMap::new(),
+            factories: Vec::new(),
+            configure: None,
+            error: None,
+        }
+    }
+}
+
+impl<M: Send + Sync + 'static> ProviderBuilder<M> {
     /// Set the provider-level configuration block type.
     pub fn provider_config<T: Facet<'static>>(mut self) -> Self {
         match reflect_block::<T>() {
@@ -85,7 +176,9 @@ impl ProviderBuilder {
         self
     }
 
-    /// Register a managed resource type under `name` with its `handler`.
+    /// Register a managed resource type under `name` with its `handler`. Use this
+    /// for resources that need no provider configuration; for resources that need
+    /// the configured meta, use [`ProviderBuilder::resource_with`].
     pub fn resource<R: Resource>(mut self, name: impl Into<String>, handler: R) -> Self {
         let name = name.into();
         match reflect_resource::<R::Model>(name.clone()) {
@@ -93,6 +186,30 @@ impl ProviderBuilder {
                 self.schema.resources.push(resource);
                 self.resources
                     .insert(name, ResourceAdapter::erased(handler));
+            }
+            Err(source) => self.record(name, source),
+        }
+        self
+    }
+
+    /// Register a managed resource whose handler is built from the configured
+    /// provider meta. `factory` receives the shared `Arc<M>` produced by
+    /// [`ProviderBuilder::configure`] and returns the resource handler.
+    ///
+    /// Requires a [`ProviderBuilder::configure`] step (which fixes `M`); building
+    /// without one is a [`BuildError::MissingConfigure`].
+    pub fn resource_with<R, F>(mut self, name: impl Into<String>, factory: F) -> Self
+    where
+        R: Resource,
+        F: Fn(Arc<M>) -> R + Send + Sync + 'static,
+    {
+        let name = name.into();
+        match reflect_resource::<R::Model>(name.clone()) {
+            Ok(resource) => {
+                self.schema.resources.push(resource);
+                let make: ResourceFactory<M> =
+                    Box::new(move |meta: Arc<M>| ResourceAdapter::erased(factory(meta)));
+                self.factories.push((name, make));
             }
             Err(source) => self.record(name, source),
         }
@@ -114,10 +231,38 @@ impl ProviderBuilder {
         if let Some(err) = self.error.take() {
             return Err(err);
         }
-        self.schema.provider = self.provider;
+        self.schema.provider = self.provider.take();
+        let config_ty = self.schema.provider.as_ref().map(Block::cty_type);
+
+        let configure: Option<Arc<ConfigureFn>> = match self.configure.take() {
+            Some(meta_fn) => {
+                let factories = Arc::new(self.factories);
+                let configure: Arc<ConfigureFn> = Arc::new(move |config: Value| {
+                    let meta_fn = Arc::clone(&meta_fn);
+                    let factories = Arc::clone(&factories);
+                    Box::pin(async move {
+                        let meta = meta_fn(config).await?;
+                        let mut map = ResourceMap::with_capacity(factories.len());
+                        for (name, make) in factories.iter() {
+                            map.insert(name.clone(), make(Arc::clone(&meta)));
+                        }
+                        Ok(map)
+                    }) as BoxFuture<Result<ResourceMap, Diagnostics>>
+                });
+                Some(configure)
+            }
+            // Meta-backed resources were registered but there is nothing to build
+            // their meta — a programming error worth surfacing at build time.
+            None if !self.factories.is_empty() => return Err(BuildError::MissingConfigure),
+            None => None,
+        };
+
         Ok(Provider {
             schema: Arc::new(self.schema),
-            resources: Arc::new(self.resources),
+            eager: Arc::new(self.resources),
+            config_ty,
+            configure,
+            configured: Arc::new(OnceCell::new()),
         })
     }
 
@@ -129,6 +274,45 @@ impl ProviderBuilder {
                 name: name.into(),
                 source,
             });
+        }
+    }
+}
+
+impl ProviderBuilder<()> {
+    /// Register the provider's configure step: a closure that turns the decoded
+    /// provider config `C` into shared meta `Arc<M>` (typically an API client).
+    /// This fixes the meta type for subsequent [`ProviderBuilder::resource_with`]
+    /// calls and runs once, when Terraform calls `ConfigureProvider`.
+    ///
+    /// Call [`ProviderBuilder::provider_config`] as well to publish `C`'s schema;
+    /// `configure` only wires the runtime behavior.
+    pub fn configure<C, M, F, Fut>(self, f: F) -> ProviderBuilder<M>
+    where
+        C: Facet<'static>,
+        M: Send + Sync + 'static,
+        F: Fn(C) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Arc<M>> + Send + 'static,
+    {
+        let f = Arc::new(f);
+        let meta_fn: MetaFn<M> = Arc::new(move |config: Value| {
+            let f = Arc::clone(&f);
+            Box::pin(async move {
+                let cfg: C = from_value(&config)
+                    .map_err(|e| vec![Diag::error("decode provider config", e.to_string())])?;
+                Ok(f(cfg).await)
+            }) as BoxFuture<Result<Arc<M>, Diagnostics>>
+        });
+
+        // Carry the schema and eager resources over to the meta-typed builder.
+        // No `resource_with` factories can exist yet (this is the only call that
+        // fixes `M`), so there is nothing of the old `()` factory type to migrate.
+        ProviderBuilder {
+            provider: self.provider,
+            schema: self.schema,
+            resources: self.resources,
+            factories: Vec::new(),
+            configure: Some(meta_fn),
+            error: self.error,
         }
     }
 }

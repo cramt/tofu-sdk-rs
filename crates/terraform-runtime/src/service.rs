@@ -89,13 +89,31 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         Ok(Response::new(emit_provider_schema(self.provider.schema())))
     }
 
-    // --- Provider configuration & validation (accepted as no-ops) ----------
+    // --- Provider configuration & validation -------------------------------
 
     async fn configure_provider(
         &self,
-        _request: Request<tfplugin6::configure_provider::Request>,
+        request: Request<tfplugin6::configure_provider::Request>,
     ) -> Result<Response<tfplugin6::configure_provider::Response>, Status> {
-        Ok(Response::new(Default::default()))
+        use tfplugin6::configure_provider::Response as Resp;
+        let req = request.into_inner();
+
+        let ty = self.provider.provider_config_ty();
+        let config = match decode_dynamic(&req.config, &ty) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to decode provider config", e.to_string()),
+                }))
+            }
+        };
+
+        match self.provider.configure(config).await {
+            Ok(()) => Ok(Response::new(Default::default())),
+            Err(diags) => Ok(Response::new(Resp {
+                diagnostics: pb_diagnostics(diags),
+            })),
+        }
     }
 
     async fn validate_provider_config(
@@ -137,9 +155,9 @@ impl tfplugin6::provider_server::Provider for ProviderService {
 
         // Stored state arrives as cty JSON in `raw_state.json`.
         let value = match req.raw_state.as_ref() {
-            Some(raw) if !raw.json.is_empty() => match serde_json::from_slice(&raw.json)
+            Some(raw) if !raw.json.is_empty() => match facet_json::from_slice(&raw.json)
                 .map_err(|e| CodecError::Decode(e.to_string()))
-                .and_then(|j: serde_json::Value| decode_json(&j, &ty))
+                .and_then(|j: facet_value::Value| decode_json(&j, &ty))
             {
                 Ok(v) => v,
                 Err(e) => {
@@ -407,8 +425,8 @@ fn decode_dynamic(dv: &Option<tfplugin6::DynamicValue>, ty: &Type) -> Result<Val
     match dv {
         Some(d) if !d.msgpack.is_empty() => decode_msgpack(&d.msgpack, ty),
         Some(d) if !d.json.is_empty() => {
-            let json =
-                serde_json::from_slice(&d.json).map_err(|e| CodecError::Decode(e.to_string()))?;
+            let json: facet_value::Value =
+                facet_json::from_slice(&d.json).map_err(|e| CodecError::Decode(e.to_string()))?;
             decode_json(&json, ty)
         }
         _ => Ok(Value::Null),

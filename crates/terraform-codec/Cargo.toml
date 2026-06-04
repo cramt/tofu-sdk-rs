@@ -10,12 +10,13 @@ rust-version.workspace = true
 # `reflect` enables the Peek/Partial reflection API used by the typed layer.
 facet = { workspace = true, features = ["reflect"] }
 terraform-value = { workspace = true }
-serde_json = { workspace = true }
+facet-value = { workspace = true }
 thiserror = { workspace = true }
 rmpv = "1"
 
 [dev-dependencies]
 terraform-attrs = { workspace = true }
+facet-json = { workspace = true }
 
 [lints]
 workspace = true
