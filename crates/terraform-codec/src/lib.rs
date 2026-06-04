@@ -20,9 +20,9 @@ mod decode;
 mod encode;
 mod typed;
 
-pub use decode::decode_msgpack;
+pub use decode::{decode_json, decode_msgpack};
 pub use encode::encode_msgpack;
-pub use typed::{to_value, TypedError};
+pub use typed::{from_value, to_value, TypedError};
 
 /// An error from encoding or decoding a `DynamicValue`.
 #[derive(Debug, thiserror::Error)]
@@ -157,5 +157,41 @@ mod tests {
     fn type_mismatch_is_reported() {
         let err = encode_msgpack(&Value::String("x".into()), &Type::Bool).unwrap_err();
         assert!(matches!(err, CodecError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn json_state_decodes() {
+        let ty = Type::Object(vec![
+            ObjectAttr {
+                name: "name".into(),
+                ty: Type::String,
+                optional: false,
+            },
+            ObjectAttr {
+                name: "count".into(),
+                ty: Type::Number,
+                optional: false,
+            },
+            ObjectAttr {
+                name: "tags".into(),
+                ty: Type::map(Type::String),
+                optional: false,
+            },
+        ]);
+        let json = serde_json::json!({
+            "name": "bucket",
+            "count": 3,
+            "tags": { "env": "prod" }
+        });
+        let value = decode_json(&json, &ty).expect("decode json state");
+        let Value::Object(fields) = value else {
+            panic!("expected object")
+        };
+        assert_eq!(fields["name"], Value::String("bucket".into()));
+        assert_eq!(fields["count"], Value::Number(3.0));
+        let Value::Map(ref tags) = fields["tags"] else {
+            panic!("tags map")
+        };
+        assert_eq!(tags["env"], Value::String("prod".into()));
     }
 }

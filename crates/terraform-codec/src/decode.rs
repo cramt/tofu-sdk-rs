@@ -21,6 +21,143 @@ pub fn decode_msgpack(bytes: &[u8], ty: &Type) -> Result<Value, CodecError> {
     from_mp(&mp, ty)
 }
 
+/// Decode a `cty` **JSON** value (the encoding Terraform uses for stored state,
+/// e.g. in `UpgradeResourceState`) into a [`Value`], directed by `ty`.
+///
+/// JSON state is always wholly known, so there is no unknown handling here.
+pub fn decode_json(json: &serde_json::Value, ty: &Type) -> Result<Value, CodecError> {
+    use serde_json::Value as J;
+
+    if json.is_null() {
+        return Ok(Value::Null);
+    }
+    match ty {
+        Type::Bool => json
+            .as_bool()
+            .map(Value::Bool)
+            .ok_or_else(|| json_mismatch("bool", json)),
+        Type::Number => match json {
+            J::Number(n) => n
+                .as_f64()
+                .map(Value::Number)
+                .ok_or_else(|| json_mismatch("number", json)),
+            J::String(s) => s
+                .parse::<f64>()
+                .map(Value::Number)
+                .map_err(|_| json_mismatch("number", json)),
+            _ => Err(json_mismatch("number", json)),
+        },
+        Type::String => json
+            .as_str()
+            .map(|s| Value::String(s.to_string()))
+            .ok_or_else(|| json_mismatch("string", json)),
+        Type::List(elem) => Ok(Value::List(decode_json_each(
+            json_array(json, "list")?,
+            elem,
+        )?)),
+        Type::Set(elem) => Ok(Value::Set(decode_json_each(
+            json_array(json, "set")?,
+            elem,
+        )?)),
+        Type::Tuple(elems) => {
+            let items = json_array(json, "tuple")?;
+            if items.len() != elems.len() {
+                return Err(CodecError::TypeMismatch {
+                    expected: format!("tuple of {} elements", elems.len()),
+                    found: "array of different length",
+                });
+            }
+            let values = items
+                .iter()
+                .zip(elems)
+                .map(|(v, t)| decode_json(v, t))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Tuple(values))
+        }
+        Type::Map(elem) => {
+            let obj = json_object(json, "map")?;
+            let mut entries = BTreeMap::new();
+            for (k, v) in obj {
+                entries.insert(k.clone(), decode_json(v, elem)?);
+            }
+            Ok(Value::Map(entries))
+        }
+        Type::Object(attrs) => {
+            let obj = json_object(json, "object")?;
+            let mut fields = BTreeMap::new();
+            for attr in attrs {
+                let value = match obj.get(&attr.name) {
+                    Some(v) => decode_json(v, &attr.ty)?,
+                    None => Value::Null,
+                };
+                fields.insert(attr.name.clone(), value);
+            }
+            Ok(Value::Object(fields))
+        }
+        // Best-effort: infer a concrete type from the JSON shape.
+        Type::Dynamic => decode_json_dynamic(json),
+    }
+}
+
+fn decode_json_each(items: &[serde_json::Value], elem: &Type) -> Result<Vec<Value>, CodecError> {
+    items.iter().map(|v| decode_json(v, elem)).collect()
+}
+
+fn decode_json_dynamic(json: &serde_json::Value) -> Result<Value, CodecError> {
+    use serde_json::Value as J;
+    Ok(match json {
+        J::Null => Value::Null,
+        J::Bool(b) => Value::Bool(*b),
+        J::Number(n) => Value::Number(n.as_f64().unwrap_or(0.0)),
+        J::String(s) => Value::String(s.clone()),
+        J::Array(items) => Value::Tuple(
+            items
+                .iter()
+                .map(decode_json_dynamic)
+                .collect::<Result<_, _>>()?,
+        ),
+        J::Object(map) => {
+            let mut fields = BTreeMap::new();
+            for (k, v) in map {
+                fields.insert(k.clone(), decode_json_dynamic(v)?);
+            }
+            Value::Object(fields)
+        }
+    })
+}
+
+fn json_array<'a>(
+    json: &'a serde_json::Value,
+    expected: &str,
+) -> Result<&'a [serde_json::Value], CodecError> {
+    json.as_array()
+        .map(Vec::as_slice)
+        .ok_or_else(|| json_mismatch(expected, json))
+}
+
+fn json_object<'a>(
+    json: &'a serde_json::Value,
+    expected: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, CodecError> {
+    json.as_object()
+        .ok_or_else(|| json_mismatch(expected, json))
+}
+
+fn json_mismatch(expected: &str, json: &serde_json::Value) -> CodecError {
+    let found = match json {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    };
+    CodecError::TypeMismatch {
+        expected: expected.to_string(),
+        found,
+    }
+}
+
 /// Convert an [`rmpv::Value`] to a [`Value`] under schema `ty`.
 fn from_mp(mp: &Mp, ty: &Type) -> Result<Value, CodecError> {
     // null and unknown are recognized before consulting the type.
