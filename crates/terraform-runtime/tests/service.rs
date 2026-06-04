@@ -648,6 +648,22 @@ impl terraform_runtime::DynResource for DynEchoArn {
         );
         Ok(terraform_value::Value::Object(fields))
     }
+
+    async fn validate(&self, config: terraform_value::Value) -> terraform_runtime::Diagnostics {
+        // Reject a bucket named "bad", pointing at the `name` attribute.
+        let name = match &config {
+            terraform_value::Value::Object(o) => match o.get("name") {
+                Some(terraform_value::Value::String(s)) => s.as_str(),
+                _ => "",
+            },
+            _ => "",
+        };
+        if name == "bad" {
+            vec![terraform_runtime::Diag::error("invalid name", "`bad` is reserved").at(["name"])]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 #[tokio::test]
@@ -787,4 +803,84 @@ async fn dyn_resource_serves_from_hand_built_schema() {
         "v0 `bucket` migrated to `name`"
     );
     assert_eq!(fields["arn"], Value::String("arn:aws:s3:::b3".into()));
+}
+
+#[tokio::test]
+async fn validate_resource_config_surfaces_diagnostics() {
+    use terraform_ir::{AttributeSchema, Block};
+    use terraform_value::{ObjectAttr, Type, Value};
+
+    let block = Block {
+        attributes: vec![
+            AttributeSchema {
+                required: true,
+                ..AttributeSchema::new("name", Type::String)
+            },
+            AttributeSchema {
+                computed: true,
+                ..AttributeSchema::new("arn", Type::String)
+            },
+        ],
+        nested_blocks: vec![],
+    };
+    let provider = Provider::builder()
+        .dyn_resource("aws_s3_bucket", 1, block, std::sync::Arc::new(DynEchoArn))
+        .build()
+        .expect("provider builds");
+    let svc = ProviderService::new(provider);
+
+    let cty = Type::Object(vec![
+        ObjectAttr {
+            name: "name".into(),
+            ty: Type::String,
+            optional: false,
+        },
+        ObjectAttr {
+            name: "arn".into(),
+            ty: Type::String,
+            optional: true,
+        },
+    ]);
+    let config = |name: &str| {
+        let mut o = std::collections::BTreeMap::new();
+        o.insert("name".to_string(), Value::String(name.into()));
+        o.insert("arn".to_string(), Value::Null);
+        tfplugin6::DynamicValue {
+            msgpack: terraform_codec::encode_msgpack(&Value::Object(o), &cty).unwrap(),
+            json: vec![],
+        }
+    };
+
+    // A bad name yields one diagnostic, pointed at the `name` attribute.
+    let bad = svc
+        .validate_resource_config(Request::new(tfplugin6::validate_resource_config::Request {
+            type_name: "aws_s3_bucket".into(),
+            config: Some(config("bad")),
+            ..Default::default()
+        }))
+        .await
+        .expect("validate")
+        .into_inner();
+    assert_eq!(bad.diagnostics.len(), 1);
+    assert_eq!(bad.diagnostics[0].summary, "invalid name");
+    let path = bad.diagnostics[0]
+        .attribute
+        .as_ref()
+        .expect("diagnostic carries an attribute path");
+    match path.steps[0].selector.as_ref().unwrap() {
+        tfplugin6::attribute_path::step::Selector::AttributeName(n) => assert_eq!(n, "name"),
+        other => panic!("expected an attribute-name step, got {other:?}"),
+    }
+
+    // A good name validates clean.
+    let ok = svc
+        .validate_resource_config(Request::new(tfplugin6::validate_resource_config::Request {
+            type_name: "aws_s3_bucket".into(),
+            config: Some(config("ok")),
+            ..Default::default()
+        }))
+        .await
+        .expect("validate")
+        .into_inner();
+    assert!(ok.diagnostics.is_empty());
 }

@@ -220,6 +220,39 @@ resource "aws_s3_bucket" "test" {
   }
 });
 
+test("rejects invalid config via a validate hook", () => {
+  const bin = engine();
+  const { dir, cfg, env } = workspace();
+  try {
+    writeFileSync(
+      join(cfg, "main.tf"),
+      `
+terraform {
+  required_providers {
+    aws = {
+      source = "example/aws"
+    }
+  }
+}
+
+resource "aws_s3_bucket" "test" {
+  name = "NotLowercase"
+}
+`,
+    );
+    // Planning runs ValidateResourceConfig; the validate hook rejects the name.
+    const plan = run(bin, ["plan", "-no-color"], cfg, env);
+    assert.notEqual(plan.status, 0, "plan should fail validation");
+    assert.match(
+      plan.stdout + plan.stderr,
+      /bucket name must be lowercase/,
+      `expected the validation diagnostic:\n${plan.stdout}\n${plan.stderr}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("imports an existing resource by id", () => {
   const bin = engine();
   const { dir, cfg, env } = workspace();

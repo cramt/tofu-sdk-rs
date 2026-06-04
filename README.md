@@ -101,11 +101,15 @@ impl is a working provider, exercised end-to-end against **real OpenTofu**
   `upgrade(from_version, prior)` migration; `UpgradeResourceState` runs it when
   stored state predates the current schema — verified by a real `tofu` refresh
   over pre-seeded v0 state
+- **Config validation ✅** — `Resource`/`DataSource` `validate(config)` hooks
+  return diagnostics (errors/warnings, optionally pointed at an attribute path)
+  on `Validate{Resource,DataResource}Config` — verified by a real `tofu plan`
+  that a `validate` hook rejects
 
 ### Not yet implemented
 
-HCL nested *block* syntax (nested object/list/map *attributes* work), config
-validation hooks, custom plan modification, functions, ephemeral resources,
+HCL nested *block* syntax (nested object/list/map *attributes* work), custom
+plan modification, provider-config validation, functions, ephemeral resources,
 move, and a `TfValue<T>` field wrapper to preserve known/unknown/null through
 decode (today `Unknown` decodes to the type's zero value). Numbers are held as
 `f64`. Not all `cty` corner cases are covered.

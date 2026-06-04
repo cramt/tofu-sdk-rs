@@ -70,9 +70,9 @@ are available for the Rust build.
 ## Status
 
 Early but functional. Resources (CRUD + `force_new` replacement + `import` +
-`version`/`upgrade` state migrations), provider configuration (`config`), and
-both singular (`dataSource`) and plural (`dataSourceList`) data sources work
-end-to-end against real OpenTofu — see `test/e2e.test.mjs`. Not yet wired up:
-config validation hooks, prebuilt multi-platform binaries, HCL block syntax, and
-a generated `terraform-provider-*` launcher (you write the shebang entry
-yourself for now).
+`version`/`upgrade` state migrations + a `validate` config hook), provider
+configuration (`config`), and both singular (`dataSource`) and plural
+(`dataSourceList`) data sources work end-to-end against real OpenTofu — see
+`test/e2e.test.mjs`. Not yet wired up: prebuilt multi-platform binaries, HCL
+block syntax, and a generated `terraform-provider-*` launcher (you write the
+shebang entry yourself for now).

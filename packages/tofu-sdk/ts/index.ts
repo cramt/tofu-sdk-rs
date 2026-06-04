@@ -47,8 +47,9 @@ interface RawProvider {
     del: RawHandler,
     imp: RawHandler,
     upgrade: RawHandler,
+    validate: RawHandler,
   ): void;
-  dataSource(typeName: string, schemaJson: string, read: RawHandler): void;
+  dataSource(typeName: string, schemaJson: string, read: RawHandler, validate: RawHandler): void;
   serve(): Promise<void>;
 }
 
@@ -137,6 +138,26 @@ interface Dispositions<S extends z.ZodObject<z.ZodRawShape>> {
   sensitive?: FieldName<S>[];
 }
 
+/** A validation diagnostic returned from a `validate` hook. */
+export interface Diagnostic {
+  /** Severity; defaults to `"error"`. */
+  severity?: "error" | "warning";
+  /** Short, one-line summary. */
+  summary: string;
+  /** Optional longer explanation. */
+  detail?: string;
+  /** Optional attribute path (a sequence of names) to point the diagnostic at. */
+  attribute?: string[];
+}
+
+/**
+ * A `validate` hook: inspect a config and return diagnostics (or nothing).
+ * Runs before planning. Attributes the user did not set — or whose values are
+ * not yet known (references to other resources) — arrive as `null`/`undefined`,
+ * so guard before validating them.
+ */
+type Validate<C> = (config: C) => Diagnostic[] | void | Promise<Diagnostic[] | void>;
+
 /** Build the `{ attributes: [...] }` schema JSON the native addon consumes. */
 function schemaJson(
   schema: z.ZodObject<z.ZodRawShape>,
@@ -198,12 +219,16 @@ export interface Resource<S extends z.ZodObject<z.ZodRawShape>> extends Disposit
    * `prior` is the raw stored state (untyped — it predates the current schema).
    */
   upgrade?(fromVersion: number, prior: unknown): Promise<z.infer<S>>;
+  /** Validate the configuration, returning diagnostics (or nothing). */
+  validate?: Validate<z.infer<S>>;
 }
 
 /** A singular read-only data source: given a config, produce a state. */
 export interface DataSource<S extends z.ZodObject<z.ZodRawShape>> extends Dispositions<S> {
   schema: S;
   read(config: z.infer<S>): Promise<z.infer<S>>;
+  /** Validate the configuration, returning diagnostics (or nothing). */
+  validate?: Validate<z.infer<S>>;
 }
 
 /**
@@ -229,6 +254,16 @@ function adapt<A, R>(fn: (arg: A) => Promise<R>): RawHandler {
     if (err) throw err;
     const result = await fn(JSON.parse(input) as A);
     return JSON.stringify(result ?? null);
+  };
+}
+
+/** Adapt a `validate` hook to the raw form, returning a JSON diagnostics array. */
+function validateAdapter<C>(validate: Validate<C> | undefined): RawHandler {
+  return async (err, input) => {
+    if (err) throw err;
+    if (!validate) return "[]";
+    const diagnostics = (await validate(JSON.parse(input) as C)) ?? [];
+    return JSON.stringify(diagnostics);
   };
 }
 
@@ -307,6 +342,7 @@ export class Provider {
       del,
       imp,
       upgrade,
+      validateAdapter(def.validate),
     );
     return this;
   }
@@ -319,6 +355,7 @@ export class Provider {
       adapt((config: z.infer<S>) =>
         def.read(config).then((s) => validateOut(def.schema, s, `data source ${typeName} read`)),
       ),
+      validateAdapter(def.validate),
     );
     return this;
   }
@@ -368,7 +405,7 @@ export class Provider {
       for (const key of def.searchKeys) inputs[key] = (config as Record<string, unknown>)[key];
       return JSON.stringify({ ...inputs, results: validated });
     };
-    this.raw.dataSource(typeName, JSON.stringify({ attributes }), read);
+    this.raw.dataSource(typeName, JSON.stringify({ attributes }), read, validateAdapter(undefined));
     return this;
   }
 

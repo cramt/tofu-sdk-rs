@@ -70,6 +70,9 @@ pub struct Diag {
     pub summary: String,
     /// Optional longer explanation.
     pub detail: String,
+    /// Optional path to the offending attribute, as a sequence of attribute
+    /// names (e.g. `["network", "subnet"]`). Empty means provider-wide.
+    pub attribute: Vec<String>,
 }
 
 impl Diag {
@@ -79,7 +82,28 @@ impl Diag {
             severity: Severity::Error,
             summary: summary.into(),
             detail: detail.into(),
+            attribute: Vec::new(),
         }
+    }
+
+    /// A warning diagnostic (non-fatal advisory).
+    pub fn warning(summary: impl Into<String>, detail: impl Into<String>) -> Self {
+        Diag {
+            severity: Severity::Warning,
+            summary: summary.into(),
+            detail: detail.into(),
+            attribute: Vec::new(),
+        }
+    }
+
+    /// Point this diagnostic at an attribute path (a sequence of names).
+    pub fn at<I, S>(mut self, attribute: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.attribute = attribute.into_iter().map(Into::into).collect();
+        self
     }
 }
 
@@ -89,6 +113,7 @@ impl From<ResourceError> for Diag {
             severity: Severity::Error,
             summary: e.summary,
             detail: e.detail,
+            attribute: Vec::new(),
         }
     }
 }
@@ -159,6 +184,15 @@ pub trait Resource: Send + Sync + 'static {
             "this resource does not support state upgrades",
         ))
     }
+
+    /// Validate the resource configuration, returning any diagnostics (errors
+    /// and/or warnings, optionally pointed at an attribute via [`Diag::at`]).
+    /// Runs early, before planning. Attributes the user did not set — or whose
+    /// values are not yet known (references to other resources) — arrive as
+    /// their zero value, so guard accordingly. Defaults to no diagnostics.
+    async fn validate(&self, _config: Self::Model) -> Vec<Diag> {
+        Vec::new()
+    }
 }
 
 /// Object-safe, value-oriented form of [`Resource`] that the service dispatches
@@ -172,6 +206,7 @@ pub trait DynResource: Send + Sync {
     async fn delete(&self, prior: Value) -> Result<(), Diagnostics>;
     async fn import(&self, id: String) -> Result<Value, Diagnostics>;
     async fn upgrade(&self, from_version: i64, prior: Value) -> Result<Value, Diagnostics>;
+    async fn validate(&self, config: Value) -> Diagnostics;
 }
 
 /// Wraps a typed [`Resource`] as an erased [`DynResource`].
@@ -264,5 +299,12 @@ impl<R: Resource> DynResource for ResourceAdapter<R> {
             .map_err(Diag::from)
             .map_err(|d| vec![d])?;
         to_value(&result).map_err(|e| codec_diag("encode upgraded state", e))
+    }
+
+    async fn validate(&self, config: Value) -> Diagnostics {
+        match from_value::<R::Model>(&config) {
+            Ok(model) => self.inner.validate(model).await,
+            Err(e) => codec_diag("decode config for validation", e),
+        }
     }
 }

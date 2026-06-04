@@ -69,6 +69,7 @@ impl From<DataSourceError> for Diag {
             severity: Severity::Error,
             summary: e.summary,
             detail: e.detail,
+            attribute: Vec::new(),
         }
     }
 }
@@ -88,6 +89,13 @@ pub trait DataSource: Send + Sync + 'static {
     /// Read the data source from its configuration and return the state with
     /// computed attributes filled in.
     async fn read(&self, config: Self::Model) -> Result<Self::Model, DataSourceError>;
+
+    /// Validate the data source configuration, returning any diagnostics. Runs
+    /// before reading; unset/unknown attributes arrive as their zero value.
+    /// Defaults to no diagnostics.
+    async fn validate(&self, _config: Self::Model) -> Vec<Diag> {
+        Vec::new()
+    }
 }
 
 /// Object-safe, value-oriented form of [`DataSource`] that the service
@@ -96,6 +104,7 @@ pub trait DataSource: Send + Sync + 'static {
 #[async_trait]
 pub trait DynDataSource: Send + Sync {
     async fn read(&self, config: Value) -> Result<Value, Diagnostics>;
+    async fn validate(&self, config: Value) -> Diagnostics;
 }
 
 /// Wraps a typed [`DataSource`] as an erased [`DynDataSource`].
@@ -122,6 +131,13 @@ impl<D: DataSource> DynDataSource for DataSourceAdapter<D> {
             .map_err(Diag::from)
             .map_err(|d| vec![d])?;
         to_value(&result).map_err(|e| codec_diag("encode data source state", e))
+    }
+
+    async fn validate(&self, config: Value) -> Diagnostics {
+        match from_value::<D::Model>(&config) {
+            Ok(model) => self.inner.validate(model).await,
+            Err(e) => codec_diag("decode data source config for validation", e),
+        }
     }
 }
 
@@ -190,5 +206,11 @@ impl<D: DataSourceList> DynDataSource for DataSourceListAdapter<D> {
         }
         wrapper.insert("results".to_string(), Value::List(results));
         Ok(Value::Object(wrapper))
+    }
+
+    async fn validate(&self, _config: Value) -> Diagnostics {
+        // Plural data sources expose only search-key inputs; validation of the
+        // query is left to the read handler for now.
+        Vec::new()
     }
 }

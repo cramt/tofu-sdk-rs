@@ -52,6 +52,18 @@ new Provider()
       const name = prior?.name ?? prior?.bucket ?? "";
       return { name, arn: `${ARN_PREFIX}${name}`, region };
     },
+    // Reject invalid config early. `name` may be null (unset/unknown), so guard.
+    validate(config) {
+      const diagnostics = [];
+      if (config.name && config.name !== config.name.toLowerCase()) {
+        diagnostics.push({
+          severity: "error",
+          summary: "bucket name must be lowercase",
+          attribute: ["name"],
+        });
+      }
+      return diagnostics;
+    },
   })
   // A singular data source: look a bucket up by name and compute its arn.
   .dataSource("aws_s3_bucket", {

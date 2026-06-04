@@ -107,6 +107,47 @@ fn handler_err(ctx: &str, e: impl std::fmt::Display) -> Diagnostics {
     vec![Diag::error(format!("{ctx} handler failed"), e.to_string())]
 }
 
+/// Parse a validate handler's JSON result — an array of
+/// `{ severity, summary, detail?, attribute? }` — into [`Diagnostics`].
+fn parse_diagnostics(json: &str) -> Diagnostics {
+    let parsed: facet_value::Value = match facet_json::from_slice(json.as_bytes()) {
+        Ok(v) => v,
+        Err(e) => return handler_err("validate", e),
+    };
+    let Some(items) = parsed.as_array() else {
+        return Vec::new();
+    };
+    let text = |obj: &facet_value::Value, key: &str| {
+        obj.as_object()
+            .and_then(|o| o.get(key))
+            .and_then(|v| v.as_string())
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_default()
+    };
+    items
+        .iter()
+        .map(|item| {
+            let attribute = item
+                .as_object()
+                .and_then(|o| o.get("attribute"))
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_string().map(|s| s.as_str().to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let (summary, detail) = (text(item, "summary"), text(item, "detail"));
+            let diag = if text(item, "severity") == "warning" {
+                Diag::warning(summary, detail)
+            } else {
+                Diag::error(summary, detail)
+            };
+            diag.at(attribute)
+        })
+        .collect()
+}
+
 /// Invoke an async JS handler with `input` and await its JSON result.
 async fn call_handler(
     handler: &Handler,
@@ -133,6 +174,7 @@ struct JsResource {
     delete: Handler,
     import: Handler,
     upgrade: Handler,
+    validate: Handler,
 }
 
 #[async_trait]
@@ -209,6 +251,13 @@ impl DynResource for JsResource {
         let out = call_handler(&self.upgrade, &input, "upgrade").await?;
         json_to_value(&out, &self.ty).map_err(|e| handler_err("upgrade", e))
     }
+
+    async fn validate(&self, config: Value) -> Diagnostics {
+        match call_handler(&self.validate, &config, "validate").await {
+            Ok(out) => parse_diagnostics(&out),
+            Err(diags) => diags,
+        }
+    }
 }
 
 /// A data source whose read is one async JS callback. Singular vs plural is
@@ -217,6 +266,7 @@ impl DynResource for JsResource {
 struct JsDataSource {
     ty: Type,
     read: Handler,
+    validate: Handler,
 }
 
 #[async_trait]
@@ -224,6 +274,13 @@ impl DynDataSource for JsDataSource {
     async fn read(&self, config: Value) -> std::result::Result<Value, Diagnostics> {
         let out = call_handler(&self.read, &config, "data source read").await?;
         json_to_value(&out, &self.ty).map_err(|e| handler_err("data source read", e))
+    }
+
+    async fn validate(&self, config: Value) -> Diagnostics {
+        match call_handler(&self.validate, &config, "data source validate").await {
+            Ok(out) => parse_diagnostics(&out),
+            Err(diags) => diags,
+        }
     }
 }
 
@@ -322,6 +379,7 @@ impl Provider {
         delete: ThreadsafeFunction<String, Promise<String>>,
         import: ThreadsafeFunction<String, Promise<String>>,
         upgrade: ThreadsafeFunction<String, Promise<String>>,
+        validate: ThreadsafeFunction<String, Promise<String>>,
     ) -> Result<()> {
         let block = block_from_schema_json(&schema_json).map_err(napi_err)?;
         let ty = block.cty_type();
@@ -337,6 +395,7 @@ impl Provider {
                 delete,
                 import,
                 upgrade,
+                validate,
             }),
         });
         Ok(())
@@ -351,13 +410,14 @@ impl Provider {
         type_name: String,
         schema_json: String,
         read: ThreadsafeFunction<String, Promise<String>>,
+        validate: ThreadsafeFunction<String, Promise<String>>,
     ) -> Result<()> {
         let block = block_from_schema_json(&schema_json).map_err(napi_err)?;
         let ty = block.cty_type();
         self.data_sources.push(DataSourceReg {
             name: type_name,
             block,
-            handler: Arc::new(JsDataSource { ty, read }),
+            handler: Arc::new(JsDataSource { ty, read, validate }),
         });
         Ok(())
     }

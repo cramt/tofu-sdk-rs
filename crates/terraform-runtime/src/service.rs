@@ -126,16 +126,63 @@ impl tfplugin6::provider_server::Provider for ProviderService {
 
     async fn validate_resource_config(
         &self,
-        _request: Request<tfplugin6::validate_resource_config::Request>,
+        request: Request<tfplugin6::validate_resource_config::Request>,
     ) -> Result<Response<tfplugin6::validate_resource_config::Response>, Status> {
-        Ok(Response::new(Default::default()))
+        use tfplugin6::validate_resource_config::Response as Resp;
+        let req = request.into_inner();
+
+        let Some(ty) = self.provider.resource_cty(&req.type_name) else {
+            return Ok(Response::new(Resp {
+                diagnostics: unknown_resource(&req.type_name),
+            }));
+        };
+        // ValidateResourceConfig runs before ConfigureProvider, so a meta-backed
+        // handler may not exist yet. The resource is still known (it's in the
+        // schema), so skip validation rather than erroring.
+        let Some(handler) = self.provider.resource_handler(&req.type_name) else {
+            return Ok(Response::new(Resp::default()));
+        };
+        let config = match decode_dynamic(&req.config, &ty) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to decode config", e.to_string()),
+                }))
+            }
+        };
+        Ok(Response::new(Resp {
+            diagnostics: pb_diagnostics(handler.validate(config).await),
+        }))
     }
 
     async fn validate_data_resource_config(
         &self,
-        _request: Request<tfplugin6::validate_data_resource_config::Request>,
+        request: Request<tfplugin6::validate_data_resource_config::Request>,
     ) -> Result<Response<tfplugin6::validate_data_resource_config::Response>, Status> {
-        Ok(Response::new(Default::default()))
+        use tfplugin6::validate_data_resource_config::Response as Resp;
+        let req = request.into_inner();
+
+        let Some(ty) = self.provider.data_source_cty(&req.type_name) else {
+            return Ok(Response::new(Resp {
+                diagnostics: unknown_data_source(&req.type_name),
+            }));
+        };
+        // As with resources, the handler may not be built yet (runs before
+        // ConfigureProvider); skip validation rather than erroring.
+        let Some(handler) = self.provider.data_source_handler(&req.type_name) else {
+            return Ok(Response::new(Resp::default()));
+        };
+        let config = match decode_dynamic(&req.config, &ty) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to decode config", e.to_string()),
+                }))
+            }
+        };
+        Ok(Response::new(Resp {
+            diagnostics: pb_diagnostics(handler.validate(config).await),
+        }))
     }
 
     // --- Resource lifecycle ------------------------------------------------
@@ -585,7 +632,9 @@ fn respond_state<R>(
 
 /// Convert SDK diagnostics into protocol diagnostics.
 fn pb_diagnostics(diags: Diagnostics) -> Vec<tfplugin6::Diagnostic> {
+    use tfplugin6::attribute_path::{step::Selector, Step};
     use tfplugin6::diagnostic::Severity as Pb;
+    use tfplugin6::AttributePath;
     diags
         .into_iter()
         .map(|d| tfplugin6::Diagnostic {
@@ -595,7 +644,15 @@ fn pb_diagnostics(diags: Diagnostics) -> Vec<tfplugin6::Diagnostic> {
             } as i32,
             summary: d.summary,
             detail: d.detail,
-            ..Default::default()
+            attribute: (!d.attribute.is_empty()).then(|| AttributePath {
+                steps: d
+                    .attribute
+                    .into_iter()
+                    .map(|name| Step {
+                        selector: Some(Selector::AttributeName(name)),
+                    })
+                    .collect(),
+            }),
         })
         .collect()
 }
