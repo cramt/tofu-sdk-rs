@@ -30,6 +30,10 @@ use terraform_runtime::{
 use terraform_value::{Type, Value};
 
 /// An async JS handler: takes a JSON string, returns a `Promise<string>`.
+///
+/// Note: napi's type-def generator can't see through this alias, so the
+/// `#[napi]` method signatures below spell the type out in full (which makes the
+/// generated `index.d.ts` correct); this alias is only for the Rust internals.
 type Handler = ThreadsafeFunction<String, Promise<String>>;
 
 // --- marshalling ------------------------------------------------------------
@@ -201,9 +205,15 @@ impl DynResource for JsResource {
     async fn update(
         &self,
         planned: Value,
-        _prior: Value,
+        prior: Value,
     ) -> std::result::Result<Value, Diagnostics> {
-        let out = call_handler(&self.update, &planned, "update").await?;
+        // The update handler sees both states as `{ planned, prior }`.
+        let input = Value::Object(
+            [("planned".to_string(), planned), ("prior".to_string(), prior)]
+                .into_iter()
+                .collect(),
+        );
+        let out = call_handler(&self.update, &input, "update").await?;
         json_to_value(&out, &self.ty).map_err(|e| handler_err("update", e))
     }
 
@@ -276,10 +286,10 @@ impl Provider {
         &mut self,
         type_name: String,
         schema_json: String,
-        create: Handler,
-        read: Handler,
-        update: Handler,
-        delete: Handler,
+        create: ThreadsafeFunction<String, Promise<String>>,
+        read: ThreadsafeFunction<String, Promise<String>>,
+        update: ThreadsafeFunction<String, Promise<String>>,
+        delete: ThreadsafeFunction<String, Promise<String>>,
     ) -> Result<()> {
         let block = block_from_schema_json(&schema_json).map_err(napi_err)?;
         let ty = block.cty_type();
@@ -305,7 +315,7 @@ impl Provider {
         &mut self,
         type_name: String,
         schema_json: String,
-        read: Handler,
+        read: ThreadsafeFunction<String, Promise<String>>,
     ) -> Result<()> {
         let block = block_from_schema_json(&schema_json).map_err(napi_err)?;
         let ty = block.cty_type();

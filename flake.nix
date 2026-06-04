@@ -55,6 +55,12 @@
 
             # interop / debugging against real Terraform/OpenTofu
             opentofu
+
+            # JS toolchain for the @tofu-sdk/core Node binding (packages/tofu-sdk).
+            # `napi build` shells out to cargo, so node/pnpm must share this shell
+            # (where PROTOC is set for the terraform-tfplugin6 build).
+            nodejs_22
+            pnpm
           ];
 
           env = {
@@ -69,6 +75,7 @@
             echo "  cargo:  $(cargo --version)"
             echo "  protoc: $(protoc --version)"
             echo "  tofu:   $(tofu version 2>/dev/null | head -1)"
+            echo "  node:   $(node --version)  pnpm: $(pnpm --version)"
           '';
         };
       }
