@@ -13,6 +13,7 @@ use std::pin::Pin;
 use terraform_codec::{decode_json, decode_json_value, decode_msgpack, encode_msgpack, CodecError};
 use terraform_tfplugin6::{emit_metadata, emit_provider_schema, tfplugin6};
 use terraform_value::{Type, Value};
+use tokio_util::sync::CancellationToken;
 use tonic::codegen::tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
@@ -24,16 +25,74 @@ use crate::resource::{Diag, Diagnostics, Severity};
 /// associated stream types for the not-yet-implemented streaming RPCs.
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
+tokio::task_local! {
+    /// The cancellation token for the in-flight RPC's handler, scoped around each
+    /// dispatch so handlers can observe `StopProvider` via [`current_cancellation`].
+    static CANCEL: CancellationToken;
+}
+
+/// The cancellation token for the currently-executing handler, if called from
+/// within the runtime's dispatch. A handler can `select!` on
+/// [`CancellationToken::cancelled`] to abort promptly when Terraform sends
+/// `StopProvider`. Returns `None` when called outside a dispatch (e.g. a unit
+/// test invoking a handler directly).
+pub fn current_cancellation() -> Option<CancellationToken> {
+    CANCEL.try_with(|token| token.clone()).ok()
+}
+
 /// Adapts a [`Provider`] to the generated gRPC service trait.
 #[derive(Clone)]
 pub struct ProviderService {
     provider: Provider,
+    /// Tripped by `StopProvider`; cloned into each handler dispatch's task-local.
+    cancel: CancellationToken,
 }
 
 impl ProviderService {
     /// Wrap a built provider.
     pub fn new(provider: Provider) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    /// Run an erased handler future under the cancellation scope, converting a
+    /// panic into an error diagnostic so a buggy handler yields a clean failure
+    /// instead of unwinding out of the async task and tearing down the plugin
+    /// process. Requires the default `panic = "unwind"`.
+    async fn guard<T>(
+        &self,
+        op: &str,
+        fut: impl std::future::Future<Output = Result<T, Diagnostics>>,
+    ) -> Result<T, Diagnostics> {
+        use futures_util::future::FutureExt;
+        let scoped = CANCEL.scope(self.cancel.clone(), fut);
+        match std::panic::AssertUnwindSafe(scoped).catch_unwind().await {
+            Ok(res) => res,
+            Err(payload) => Err(vec![Diag::error(
+                format!("the {op} handler panicked"),
+                panic_message(payload),
+            )]),
+        }
+    }
+
+    /// Like [`guard`](Self::guard), for a handler returning bare [`Diagnostics`]
+    /// (validation).
+    async fn guard_diags(
+        &self,
+        op: &str,
+        fut: impl std::future::Future<Output = Diagnostics>,
+    ) -> Diagnostics {
+        use futures_util::future::FutureExt;
+        let scoped = CANCEL.scope(self.cancel.clone(), fut);
+        match std::panic::AssertUnwindSafe(scoped).catch_unwind().await {
+            Ok(diags) => diags,
+            Err(payload) => vec![Diag::error(
+                format!("the {op} handler panicked"),
+                panic_message(payload),
+            )],
+        }
     }
 }
 
@@ -98,6 +157,7 @@ impl tfplugin6::provider_server::Provider for ProviderService {
     ) -> Result<Response<tfplugin6::configure_provider::Response>, Status> {
         use tfplugin6::configure_provider::Response as Resp;
         let req = request.into_inner();
+        tracing::debug!("ConfigureProvider");
 
         let ty = self.provider.provider_config_ty();
         let config = match decode_dynamic(&req.config, &ty) {
@@ -119,9 +179,23 @@ impl tfplugin6::provider_server::Provider for ProviderService {
 
     async fn validate_provider_config(
         &self,
-        _request: Request<tfplugin6::validate_provider_config::Request>,
+        request: Request<tfplugin6::validate_provider_config::Request>,
     ) -> Result<Response<tfplugin6::validate_provider_config::Response>, Status> {
-        Ok(Response::new(Default::default()))
+        use tfplugin6::validate_provider_config::Response as Resp;
+        let req = request.into_inner();
+
+        let ty = self.provider.provider_config_ty();
+        let config = match decode_dynamic(&req.config, &ty) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to decode provider config", e.to_string()),
+                }))
+            }
+        };
+        Ok(Response::new(Resp {
+            diagnostics: pb_diagnostics(self.provider.validate_config(config).await),
+        }))
     }
 
     async fn validate_resource_config(
@@ -151,7 +225,10 @@ impl tfplugin6::provider_server::Provider for ProviderService {
             }
         };
         Ok(Response::new(Resp {
-            diagnostics: pb_diagnostics(handler.validate(config).await),
+            diagnostics: pb_diagnostics(
+                self.guard_diags("validate resource config", handler.validate(config))
+                    .await,
+            ),
         }))
     }
 
@@ -181,7 +258,10 @@ impl tfplugin6::provider_server::Provider for ProviderService {
             }
         };
         Ok(Response::new(Resp {
-            diagnostics: pb_diagnostics(handler.validate(config).await),
+            diagnostics: pb_diagnostics(
+                self.guard_diags("validate data source config", handler.validate(config))
+                    .await,
+            ),
         }))
     }
 
@@ -246,7 +326,13 @@ impl tfplugin6::provider_server::Provider for ProviderService {
                     }))
                 }
             };
-            match handler.upgrade(req.version, prior).await {
+            match self
+                .guard(
+                    "upgrade resource state",
+                    handler.upgrade(req.version, prior),
+                )
+                .await
+            {
                 Ok(v) => Ok(v),
                 Err(diags) => {
                     return Ok(Response::new(Resp {
@@ -275,6 +361,7 @@ impl tfplugin6::provider_server::Provider for ProviderService {
     ) -> Result<Response<tfplugin6::plan_resource_change::Response>, Status> {
         use tfplugin6::plan_resource_change::Response as Resp;
         let req = request.into_inner();
+        tracing::debug!(type_name = %req.type_name, "PlanResourceChange");
 
         let (Some(ty), Some(block)) = (
             self.provider.resource_cty(&req.type_name),
@@ -326,6 +413,7 @@ impl tfplugin6::provider_server::Provider for ProviderService {
     ) -> Result<Response<tfplugin6::read_resource::Response>, Status> {
         use tfplugin6::read_resource::Response as Resp;
         let req = request.into_inner();
+        tracing::debug!(type_name = %req.type_name, "ReadResource");
 
         let (Some(ty), Some(handler)) = (
             self.provider.resource_cty(&req.type_name),
@@ -347,7 +435,7 @@ impl tfplugin6::provider_server::Provider for ProviderService {
             }
         };
 
-        let outcome = handler.read(current).await;
+        let outcome = self.guard("read resource", handler.read(current)).await;
         let new_value = match outcome {
             Ok(Some(v)) => v,
             Ok(None) => Value::Null, // resource is gone
@@ -409,12 +497,24 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         };
 
         // null planned => destroy; null prior => create; otherwise update.
-        let outcome: Result<Value, Diagnostics> = if planned.is_null() {
-            handler.delete(prior.clone()).await.map(|()| Value::Null)
+        let action = if planned.is_null() {
+            "delete"
         } else if prior.is_null() {
-            handler.create(planned).await
+            "create"
         } else {
-            handler.update(planned, prior.clone()).await
+            "update"
+        };
+        tracing::debug!(type_name = %req.type_name, action, "ApplyResourceChange");
+        let outcome: Result<Value, Diagnostics> = if planned.is_null() {
+            self.guard("delete", async {
+                handler.delete(prior.clone()).await.map(|()| Value::Null)
+            })
+            .await
+        } else if prior.is_null() {
+            self.guard("create", handler.create(planned)).await
+        } else {
+            self.guard("update", handler.update(planned, prior.clone()))
+                .await
         };
 
         match outcome {
@@ -445,6 +545,7 @@ impl tfplugin6::provider_server::Provider for ProviderService {
     ) -> Result<Response<tfplugin6::read_data_source::Response>, Status> {
         use tfplugin6::read_data_source::Response as Resp;
         let req = request.into_inner();
+        tracing::debug!(type_name = %req.type_name, "ReadDataSource");
 
         let (Some(ty), Some(handler)) = (
             self.provider.data_source_cty(&req.type_name),
@@ -466,7 +567,7 @@ impl tfplugin6::provider_server::Provider for ProviderService {
             }
         };
 
-        match handler.read(config).await {
+        match self.guard("read data source", handler.read(config)).await {
             Ok(state) => match encode_dynamic(&state, &ty) {
                 Ok(dv) => Ok(Response::new(Resp {
                     state: Some(dv),
@@ -490,6 +591,7 @@ impl tfplugin6::provider_server::Provider for ProviderService {
     ) -> Result<Response<tfplugin6::import_resource_state::Response>, Status> {
         use tfplugin6::import_resource_state::{ImportedResource, Response as Resp};
         let req = request.into_inner();
+        tracing::debug!(type_name = %req.type_name, id = %req.id, "ImportResourceState");
 
         let (Some(ty), Some(handler)) = (
             self.provider.resource_cty(&req.type_name),
@@ -503,7 +605,10 @@ impl tfplugin6::provider_server::Provider for ProviderService {
 
         // The provider produces the imported state from the ID; Terraform then
         // refreshes it with ReadResource.
-        match handler.import(req.id).await {
+        match self
+            .guard("import resource state", handler.import(req.id))
+            .await
+        {
             Ok(state) => match encode_dynamic(&state, &ty) {
                 Ok(dv) => Ok(Response::new(Resp {
                     imported_resources: vec![ImportedResource {
@@ -545,7 +650,18 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         delete_state => delete_state,
         plan_action => plan_action,
         validate_action_config => validate_action_config,
-        stop_provider => stop_provider,
+    }
+
+    async fn stop_provider(
+        &self,
+        _request: Request<tfplugin6::stop_provider::Request>,
+    ) -> Result<Response<tfplugin6::stop_provider::Response>, Status> {
+        tracing::debug!("StopProvider");
+        // Trip the shared token; in-flight handlers scoped under it (via `guard`)
+        // can observe cancellation through `current_cancellation`. Acknowledge
+        // with an empty error (success).
+        self.cancel.cancel();
+        Ok(Response::new(Default::default()))
     }
 
     // Client-streaming request, unary response — does not fit the macro shape.
@@ -587,6 +703,19 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         Err(Status::unimplemented(
             "invoke_action is not implemented yet",
         ))
+    }
+}
+
+/// Best-effort extraction of a panic message from its boxed payload. Takes the
+/// `Box` by value: passing `&box` would erase the `Box` itself as the `Any`
+/// value (downcast always failing) rather than its `&str`/`String` contents.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
     }
 }
 

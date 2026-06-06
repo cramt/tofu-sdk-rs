@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -48,6 +49,107 @@ use crate::resource::{Diag, Diagnostics, DynResource, Resource, ResourceAdapter}
 #[async_trait]
 pub trait DynConfigure: Send + Sync {
     async fn configure(&self, config: Value) -> Result<(), Diagnostics>;
+}
+
+/// An erased provider-config validation callback, the dynamic-seam counterpart to
+/// [`ProviderBuilder::validate_config`]. It runs in `ValidateProviderConfig`
+/// (before `ConfigureProvider`) and returns diagnostics for a bad provider block.
+/// Paired with [`ProviderBuilder::dyn_validate_config`].
+#[async_trait]
+pub trait DynValidateConfig: Send + Sync {
+    async fn validate(&self, config: Value) -> Diagnostics;
+}
+
+/// Bridges a typed `Fn(C) -> Future<Output = Diagnostics>` closure to the erased
+/// [`DynValidateConfig`], decoding the dynamic [`Value`] into `C` first.
+struct TypedValidateConfig<C, F> {
+    f: F,
+    _marker: PhantomData<fn(C)>,
+}
+
+#[async_trait]
+impl<C, F, Fut> DynValidateConfig for TypedValidateConfig<C, F>
+where
+    C: Facet<'static> + Send,
+    F: Fn(C) -> Fut + Send + Sync,
+    Fut: Future<Output = Diagnostics> + Send,
+{
+    async fn validate(&self, config: Value) -> Diagnostics {
+        match from_value::<C>(&config) {
+            Ok(cfg) => (self.f)(cfg).await,
+            Err(e) => vec![Diag::error(
+                "failed to decode provider config for validation",
+                e.to_string(),
+            )],
+        }
+    }
+}
+
+/// An error returned by a provider [`ProviderBuilder::configure`] closure,
+/// surfaced to Terraform as a configuration diagnostic (e.g. bad credentials or
+/// an unreachable endpoint).
+#[derive(Debug, Clone)]
+pub struct ConfigureError {
+    /// Short, one-line summary.
+    pub summary: String,
+    /// Optional longer explanation.
+    pub detail: String,
+}
+
+impl ConfigureError {
+    /// Create an error with a summary.
+    pub fn new(summary: impl Into<String>) -> Self {
+        ConfigureError {
+            summary: summary.into(),
+            detail: String::new(),
+        }
+    }
+
+    /// Attach a longer detail message.
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = detail.into();
+        self
+    }
+}
+
+impl From<&str> for ConfigureError {
+    fn from(s: &str) -> Self {
+        ConfigureError::new(s)
+    }
+}
+
+impl From<String> for ConfigureError {
+    fn from(s: String) -> Self {
+        ConfigureError::new(s)
+    }
+}
+
+impl From<ConfigureError> for Diag {
+    fn from(e: ConfigureError) -> Self {
+        Diag::error(e.summary, e.detail)
+    }
+}
+
+/// Conversion from a [`ProviderBuilder::configure`] closure's output into the
+/// shared meta (or a diagnostic). Implemented for both the infallible `Arc<M>`
+/// (always succeeds) and the fallible `Result<Arc<M>, E>` for any `E: Into<Diag>`
+/// (e.g. [`ConfigureError`]), so an author can write either
+/// `async { Arc::new(client) }` or `async { Ok(Arc::new(connect().await?)) }`.
+pub trait IntoConfigured<M> {
+    /// Resolve to the shared meta, mapping any error into diagnostics.
+    fn into_configured(self) -> Result<Arc<M>, Diagnostics>;
+}
+
+impl<M> IntoConfigured<M> for Arc<M> {
+    fn into_configured(self) -> Result<Arc<M>, Diagnostics> {
+        Ok(self)
+    }
+}
+
+impl<M, E: Into<Diag>> IntoConfigured<M> for Result<Arc<M>, E> {
+    fn into_configured(self) -> Result<Arc<M>, Diagnostics> {
+        self.map_err(|e| vec![e.into()])
+    }
 }
 
 /// A `Send` boxed future, the erased form of a handler/closure's async result.
@@ -119,6 +221,9 @@ pub struct Provider {
     /// A dynamic-seam configure callback (e.g. the Node binding), run on
     /// `ConfigureProvider`. Independent of the typed `configure` above.
     dyn_configure: Option<Arc<dyn DynConfigure>>,
+    /// A provider-config validation callback, run on `ValidateProviderConfig`
+    /// (before configure). `None` validates clean.
+    validate_config: Option<Arc<dyn DynValidateConfig>>,
 }
 
 impl Provider {
@@ -194,6 +299,16 @@ impl Provider {
             .unwrap_or_else(|| Type::Object(Vec::new()))
     }
 
+    /// Validate the decoded provider `config`, returning any diagnostics. Runs in
+    /// `ValidateProviderConfig`, before configure. No-op (clean) when the provider
+    /// registered no validation callback.
+    pub(crate) async fn validate_config(&self, config: Value) -> Diagnostics {
+        match &self.validate_config {
+            Some(handler) => handler.validate(config).await,
+            None => Vec::new(),
+        }
+    }
+
     /// Run the provider's configure step with the decoded `config`, building the
     /// shared meta and meta-backed handlers exactly once. A no-op (and `Ok`) for
     /// providers without a `configure` step.
@@ -223,6 +338,7 @@ pub struct ProviderBuilder<M = ()> {
     data_factories: Vec<(String, DataSourceFactory<M>)>,
     configure: Option<MetaFn<M>>,
     dyn_configure: Option<Arc<dyn DynConfigure>>,
+    validate_config: Option<Arc<dyn DynValidateConfig>>,
     error: Option<BuildError>,
 }
 
@@ -237,6 +353,7 @@ impl<M> Default for ProviderBuilder<M> {
             data_factories: Vec::new(),
             configure: None,
             dyn_configure: None,
+            validate_config: None,
             error: None,
         }
     }
@@ -424,6 +541,37 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
         self
     }
 
+    /// Register a provider-config validation callback: a closure decoding the
+    /// provider block into `C` and returning diagnostics (errors and/or warnings,
+    /// optionally pointed at an attribute via [`Diag::at`]). Runs in
+    /// `ValidateProviderConfig`, before configure — so it sees the raw config and
+    /// must not assume any configured state. Mirrors [`Resource::validate`] for
+    /// the provider block. Pair with [`ProviderBuilder::provider_config`] to
+    /// publish `C`'s schema.
+    ///
+    /// [`Resource::validate`]: crate::Resource::validate
+    pub fn validate_config<C, F, Fut>(mut self, f: F) -> Self
+    where
+        C: Facet<'static> + Send,
+        F: Fn(C) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Diagnostics> + Send + 'static,
+    {
+        self.validate_config = Some(Arc::new(TypedValidateConfig {
+            f,
+            _marker: PhantomData,
+        }));
+        self
+    }
+
+    /// Register a dynamic-seam provider-config validation callback, run with the
+    /// decoded config in `ValidateProviderConfig`. The dynamic counterpart to
+    /// [`ProviderBuilder::validate_config`] (e.g. the Node binding validating its
+    /// own schema).
+    pub fn dyn_validate_config(mut self, handler: Arc<dyn DynValidateConfig>) -> Self {
+        self.validate_config = Some(handler);
+        self
+    }
+
     /// Register a managed resource from a hand-built schema `block` and an
     /// erased [`DynResource`] handler, bypassing facet reflection.
     pub fn dyn_resource(
@@ -512,6 +660,7 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
             configure,
             configured: Arc::new(OnceCell::new()),
             dyn_configure: self.dyn_configure,
+            validate_config: self.validate_config,
         })
     }
 
@@ -535,12 +684,16 @@ impl ProviderBuilder<()> {
     ///
     /// Call [`ProviderBuilder::provider_config`] as well to publish `C`'s schema;
     /// `configure` only wires the runtime behavior.
-    pub fn configure<C, M, F, Fut>(self, f: F) -> ProviderBuilder<M>
+    /// The closure may be infallible (returning `Arc<M>`) or fallible (returning
+    /// `Result<Arc<M>, E>` for any `E: Into<Diag>`, e.g. [`ConfigureError`]); a
+    /// returned error becomes a configuration diagnostic and aborts configure.
+    pub fn configure<C, M, F, Fut, O>(self, f: F) -> ProviderBuilder<M>
     where
         C: Facet<'static>,
         M: Send + Sync + 'static,
         F: Fn(C) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Arc<M>> + Send + 'static,
+        Fut: Future<Output = O> + Send + 'static,
+        O: IntoConfigured<M> + Send + 'static,
     {
         let f = Arc::new(f);
         let meta_fn: MetaFn<M> = Arc::new(move |config: Value| {
@@ -548,7 +701,7 @@ impl ProviderBuilder<()> {
             Box::pin(async move {
                 let cfg: C = from_value(&config)
                     .map_err(|e| vec![Diag::error("decode provider config", e.to_string())])?;
-                Ok(f(cfg).await)
+                f(cfg).await.into_configured()
             }) as BoxFuture<Result<Arc<M>, Diagnostics>>
         });
 
@@ -564,6 +717,7 @@ impl ProviderBuilder<()> {
             data_factories: Vec::new(),
             configure: Some(meta_fn),
             dyn_configure: self.dyn_configure,
+            validate_config: self.validate_config,
             error: self.error,
         }
     }

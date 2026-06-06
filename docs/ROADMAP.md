@@ -16,7 +16,16 @@ and don't reshape the public API.
 
 Already shipped: full CRUD + planning, provider config + meta, data sources
 (singular/plural from one model), import, state upgrades, config validation,
-nested blocks, resource/data-source **name inference**, `sensitive`.
+nested blocks, resource/data-source **name inference**, `sensitive`,
+**fallible `configure`** (1.1), **provider-config `validate`** (1.3), **panic
+safety** (2.1), **attribute-pathed CRUD errors + warnings** (2.2), **`tracing` →
+Terraform JSON log bridge** (2.3), and **`StopProvider` + cancellation** (3.1).
+
+**Status: the "landed" cut is done except Tier 1.2** (plan modification +
+defaults + `TfValue<T>`). 1.1/1.3/2.1/2.2/2.3/3.1 all merged and verified against
+real OpenTofu (`cargo test --workspace` green, including the `tofu test` e2e).
+Remaining caveat from 2.2: CRUD warnings ride on `ResourceError` (warnings *with*
+an error); success-path warnings await the handler ctx introduced in 1.2.
 
 ## How to verify (the four test layers)
 
@@ -60,7 +69,11 @@ harness/provider changed.
 
 ## Tier 1 — real providers hit these immediately
 
-### 1.1 Fallible `configure`
+### 1.1 Fallible `configure` — ✅ DONE
+Shipped: `configure` accepts an infallible `Arc<M>` *or* `Result<Arc<M>, E>`
+(`E: Into<Diag>`, e.g. `ConfigureError`) via the `IntoConfigured` shim; an `Err`
+becomes a config diagnostic. `dyn_configure` unchanged.
+
 - **Why:** a provider must be able to reject bad credentials / an unreachable
   endpoint with a diagnostic. Today it can't.
 - **Current:** `ProviderBuilder::configure` (`builder.rs`) takes
@@ -124,7 +137,10 @@ The big one; three intertwined pieces. Can land incrementally.
   its own plan, and a computed attribute inside a block no longer trips
   "inconsistent result after apply".
 
-### 1.3 Provider-config `validate` hook
+### 1.3 Provider-config `validate` hook — ✅ DONE
+Shipped: `ProviderBuilder::validate_config` (typed) + `dyn_validate_config`
+(seam), erased behind `DynValidateConfig`, wired into `validate_provider_config`.
+
 - **Why:** resources/data sources have `validate()`; the provider block has none.
 - **Current:** `service.rs::validate_provider_config` returns `Default` (no-op).
 - **Approach:** add a provider-level validate callback on `ProviderBuilder`
@@ -139,7 +155,11 @@ The big one; three intertwined pieces. Can land incrementally.
 
 ## Tier 2 — production hardening (don't crash, be debuggable)
 
-### 2.1 Panic safety
+### 2.1 Panic safety — ✅ DONE
+Shipped: `ProviderService::guard`/`guard_diags` wrap every handler dispatch with
+`AssertUnwindSafe(..).catch_unwind()` (futures-util), turning a panic into an
+error diagnostic. Requires `panic = "unwind"` (default).
+
 - **Why:** a handler `panic!` currently unwinds out of the async task and can take
   down the plugin process; Terraform sees a dead transport, not a diagnostic.
 - **Current:** no `catch_unwind` anywhere (`grep catch_unwind` is empty).
@@ -152,7 +172,12 @@ The big one; three intertwined pieces. Can land incrementally.
   diagnostic (not a process abort). Note: requires `panic = "unwind"` (default).
 - **Done when:** a panicking handler yields a clean diagnostic.
 
-### 2.2 Richer CRUD diagnostics
+### 2.2 Richer CRUD diagnostics — ✅ DONE (partial)
+Shipped (non-breaking): `ResourceError::at(path)` + `with_warning(diag)`;
+`From<ResourceError> for Diagnostics` emits the error (with attribute path) plus
+its warnings. `DynResource` and the Node binding untouched. **Deferred:**
+warnings on a *successful* operation — needs the handler ctx from 1.2.
+
 - **Why:** CRUD handlers can only return a flat `ResourceError` (summary/detail,
   no attribute path, no warnings). `validate` already returns `Vec<Diag>` with
   `Diag::at(path)`.
@@ -167,7 +192,12 @@ The big one; three intertwined pieces. Can land incrementally.
 - **Done when:** a handler can point an error at a specific attribute and emit
   warnings.
 
-### 2.3 `tracing` → Terraform log bridge
+### 2.3 `tracing` → Terraform log bridge — ✅ DONE
+Shipped: a hand-rolled `tracing::Subscriber` (`log.rs`, no `tracing-subscriber`
+dep) emits hclog JSON (`@level`/`@message`/`@module`/`@timestamp`) to **stderr**,
+gated on `TF_LOG_PROVIDER`/`TF_LOG`; installed in `serve.rs`; RPC entry points
+instrumented with `tracing::debug!`.
+
 - **Why:** zero logging in the runtime today; `TF_LOG` shows nothing from the
   provider, so real debugging is blind.
 - **Current:** no `tracing`/`log` dep in `terraform-runtime`.
@@ -185,7 +215,11 @@ The big one; three intertwined pieces. Can land incrementally.
 
 ## Tier 3 — protocol completeness (graceful operation)
 
-### 3.1 StopProvider + cancellation *(part of the "landed" cut)*
+### 3.1 StopProvider + cancellation *(part of the "landed" cut)* — ✅ DONE
+Shipped: `ProviderService` holds a `CancellationToken`; `stop_provider` trips it
+and acks. Each dispatch is scoped under a `CANCEL` task-local; handlers read it
+via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`).
+
 - **Current:** `stop_provider` is in the `unimplemented_unary!` list in
   `service.rs` (returns `Unimplemented`). Shutdown is SIGTERM/Ctrl-C only
   (`serve.rs`); do not watch stdin.

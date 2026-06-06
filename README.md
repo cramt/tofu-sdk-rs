@@ -90,7 +90,10 @@ impl is a working provider, exercised end-to-end against **real OpenTofu**
 - **Provider configuration ✅** — `ConfigureProvider` decodes the provider
   config block and a `configure` closure turns it into shared state (an
   `Arc<Meta>`, e.g. an API client) handed to every resource handler — verified
-  by a real `tofu` test that flows a `provider` block region into a resource
+  by a real `tofu` test that flows a `provider` block region into a resource.
+  `configure` may be fallible (`Result<Arc<Meta>, ConfigureError>`), and a
+  provider-level `validate_config` hook rejects a bad provider block on
+  `ValidateProviderConfig`
 - **Data sources ✅** — read-only lookups dispatched on `ReadDataSource`,
   projectable from the *same* `Model` as the resource via
   `#[facet(terraform::search_key(exclusive|shared))]`: an `exclusive` key gives a
@@ -113,18 +116,26 @@ impl is a working provider, exercised end-to-end against **real OpenTofu**
   map) and the element struct is reflected recursively (blocks may contain
   attributes and further blocks) — verified by a real `tofu apply` over single
   and list blocks
+- **Production hardening ✅** — a handler `panic!` is caught and returned as an
+  error diagnostic instead of crashing the plugin; CRUD errors can point at an
+  attribute path and carry warnings (`ResourceError::at`/`with_warning`);
+  `tracing` is bridged to Terraform's JSON log stream on stderr under `TF_LOG`;
+  and `StopProvider` trips a `CancellationToken` that in-flight handlers can
+  observe via `current_cancellation()`
 
 ### Not yet implemented
 
-Custom plan modification, attribute defaults, provider-config validation,
-functions, ephemeral resources, move, and a `TfValue<T>` field wrapper to
+Custom plan modification, attribute defaults, and a `TfValue<T>` field wrapper to
 preserve known/unknown/null through decode (today `Unknown` decodes to the
-type's zero value). Numbers are held as `f64`. Some nested-block refinements are
-also pending: the planner does not yet mark *computed attributes inside blocks*
-unknown (so keep computed fields at the top level), required single blocks
-(`min_items`) are not distinguished from optional, and data-source projections
-render a `block` field as an object attribute rather than a block. Not all `cty`
-corner cases are covered.
+type's zero value) — these three are the remaining
+[roadmap](docs/ROADMAP.md) item (Tier 1.2). Also pending: provider-defined
+functions, ephemeral resources, and move. Warnings currently ride on a CRUD
+*error*; success-path warnings await the handler ctx from 1.2. Numbers are held
+as `f64`. Some nested-block refinements remain: the planner does not yet mark
+*computed attributes inside blocks* unknown (so keep computed fields at the top
+level), required single blocks (`min_items`) are not distinguished from optional,
+and data-source projections render a `block` field as an object attribute rather
+than a block. Not all `cty` corner cases are covered.
 
 ## Workspace layout
 

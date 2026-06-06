@@ -11,13 +11,17 @@
 mod builder;
 mod data_source;
 pub mod handshake;
+mod log;
 mod plan;
 mod resource;
 mod serve;
 mod service;
 mod tls;
 
-pub use builder::{BuildError, DynConfigure, Provider, ProviderBuilder};
+pub use builder::{
+    BuildError, ConfigureError, DynConfigure, DynValidateConfig, IntoConfigured, Provider,
+    ProviderBuilder,
+};
 pub use data_source::{DataSource, DataSourceError, DataSourceList};
 pub use resource::{Resource, ResourceError};
 pub use serve::{serve, ServeError};
@@ -28,7 +32,12 @@ pub use serve::{serve, ServeError};
 /// Rust authors use the typed [`Resource`] / [`DataSource`] traits instead.
 pub use data_source::DynDataSource;
 pub use resource::{Diag, Diagnostics, DynResource, Severity};
-pub use service::ProviderService;
+pub use service::{current_cancellation, ProviderService};
+
+/// Re-export of `tokio_util`'s [`CancellationToken`](tokio_util::sync::CancellationToken)
+/// so handlers can type the token returned by [`current_cancellation`] (e.g. to
+/// `select!` on `token.cancelled()` and abort promptly on `StopProvider`).
+pub use tokio_util::sync::CancellationToken;
 
 /// Re-export of `async_trait` so authors can `#[terraform_runtime::async_trait]`
 /// their `impl Resource`.

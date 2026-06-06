@@ -17,6 +17,13 @@ thiserror = { workspace = true }
 facet-json = { workspace = true }
 facet-value = { workspace = true }
 async-trait = "0.1"
+# `FutureExt::catch_unwind` to contain a handler panic as a diagnostic instead of
+# letting it unwind out and kill the plugin process.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Structured logging bridged to Terraform's JSON log format on stderr (TF_LOG).
+# We hand-roll a tiny `tracing::Subscriber` rather than pull `tracing-subscriber`.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+time = { version = "0.3", default-features = false, features = ["std", "formatting"] }
 
 tonic = { version = "0.14", default-features = false, features = [
     "server",
@@ -35,6 +42,8 @@ tokio = { version = "1", features = [
     "sync",
 ] }
 tokio-stream = { version = "0.1", features = ["net"] }
+# `CancellationToken` for StopProvider: tripped on stop, observed by handlers.
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 rcgen = "0.14"
 base64 = "0.22"
 # Terminate auto-mTLS ourselves: tonic's ServerTlsConfig hardcodes a WebPKI

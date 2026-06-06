@@ -48,6 +48,15 @@ pub enum ServeError {
 /// Blocks until the process is signalled (SIGTERM/Ctrl-C) — Terraform terminates
 /// the plugin subprocess when it is done with it.
 pub async fn serve(provider: Provider) -> Result<(), ServeError> {
+    // Bridge `tracing` to Terraform's log stream first, so the handshake and
+    // setup steps below are visible under `TF_LOG`.
+    crate::log::init();
+    tracing::info!(
+        resources = provider.schema().resources.len(),
+        data_sources = provider.schema().data_sources.len(),
+        "starting provider"
+    );
+
     // Layer 1: handshake preconditions.
     handshake::check_magic_cookie(std::env::var(handshake::MAGIC_COOKIE_KEY).ok().as_deref())?;
     let protocol_version = handshake::negotiate_protocol(

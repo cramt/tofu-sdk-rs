@@ -11,8 +11,8 @@ use std::sync::Arc;
 use facet::Facet;
 use terraform_attrs as terraform;
 use terraform_runtime::{
-    async_trait, DataSource, DataSourceError, DataSourceList, Provider, ProviderService, Resource,
-    ResourceError,
+    async_trait, ConfigureError, DataSource, DataSourceError, DataSourceList, Diag, Provider,
+    ProviderService, Resource, ResourceError,
 };
 use terraform_tfplugin6::tfplugin6::{self, provider_server::Provider as _};
 use tonic::{Code, Request};
@@ -165,6 +165,93 @@ async fn unimplemented_rpc_returns_unimplemented() {
         .await
         .expect_err("move_resource_state is not implemented yet");
     assert_eq!(status.code(), Code::Unimplemented);
+}
+
+/// A resource whose `create` records whether it observed cancellation, proving
+/// the runtime exposes the `StopProvider` token to in-flight handlers.
+#[derive(Facet)]
+#[facet(terraform::resource("cancel_probe"))]
+#[allow(dead_code)]
+struct CancelProbe {
+    #[facet(terraform::required)]
+    name: String,
+}
+
+struct CancelProbeResource {
+    observed: Arc<std::sync::Mutex<Option<bool>>>,
+}
+
+#[async_trait]
+impl Resource for CancelProbeResource {
+    type Model = CancelProbe;
+
+    async fn create(&self, planned: CancelProbe) -> Result<CancelProbe, ResourceError> {
+        let cancelled = terraform_runtime::current_cancellation().map(|t| t.is_cancelled());
+        *self.observed.lock().unwrap() = cancelled;
+        Ok(planned)
+    }
+}
+
+#[tokio::test]
+async fn stop_provider_acknowledges_and_handlers_observe_cancellation() {
+    let observed = Arc::new(std::sync::Mutex::new(None));
+    let svc = Provider::builder()
+        .resource(CancelProbeResource {
+            observed: Arc::clone(&observed),
+        })
+        .build()
+        .map(ProviderService::new)
+        .expect("provider builds");
+
+    let ty = terraform_value::Type::Object(vec![terraform_value::ObjectAttr {
+        name: "name".into(),
+        ty: terraform_value::Type::String,
+        optional: false,
+    }]);
+    let planned_dv = |name: &str| {
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(
+            "name".to_string(),
+            terraform_value::Value::String(name.into()),
+        );
+        tfplugin6::DynamicValue {
+            msgpack: terraform_codec::encode_msgpack(&terraform_value::Value::Object(obj), &ty)
+                .unwrap(),
+            json: vec![],
+        }
+    };
+    let apply = |dv: tfplugin6::DynamicValue| {
+        svc.apply_resource_change(Request::new(tfplugin6::apply_resource_change::Request {
+            type_name: "cancel_probe".into(),
+            prior_state: None,
+            planned_state: Some(dv),
+            ..Default::default()
+        }))
+    };
+
+    // Before StopProvider, the handler sees a live (un-cancelled) token.
+    apply(planned_dv("before")).await.expect("apply before");
+    assert_eq!(
+        *observed.lock().unwrap(),
+        Some(false),
+        "handler should see an un-cancelled token during normal dispatch"
+    );
+
+    // StopProvider acknowledges (no longer Unimplemented) with no error.
+    let stop = svc
+        .stop_provider(Request::new(tfplugin6::stop_provider::Request {}))
+        .await
+        .expect("stop_provider returns OK")
+        .into_inner();
+    assert!(stop.error.is_empty(), "stop error: {:?}", stop.error);
+
+    // After StopProvider, an in-flight handler observes the tripped token.
+    apply(planned_dv("after")).await.expect("apply after");
+    assert_eq!(
+        *observed.lock().unwrap(),
+        Some(true),
+        "handler should observe cancellation after StopProvider"
+    );
 }
 
 #[tokio::test]
@@ -547,6 +634,119 @@ async fn configure_then_apply_uses_provider_meta() {
     );
 }
 
+/// A provider whose `configure` closure rejects a bad region with a diagnostic.
+fn fallible_service() -> ProviderService {
+    Provider::builder()
+        .provider_config::<AwsConfig>()
+        .configure(|cfg: AwsConfig| async move {
+            match cfg.region.as_deref() {
+                Some("bad") => Err(ConfigureError::new("invalid region")
+                    .with_detail("`bad` is not a valid region")),
+                _ => Ok(Arc::new(AwsClient {
+                    region: cfg.region.unwrap_or_else(|| "us-east-1".to_string()),
+                })),
+            }
+        })
+        .resource_with(|client: Arc<AwsClient>| RegionResource { client })
+        .build()
+        .map(ProviderService::new)
+        .expect("fallible provider builds")
+}
+
+fn aws_config_dv(region: &str) -> tfplugin6::DynamicValue {
+    let cfg_ty = terraform_value::Type::Object(vec![terraform_value::ObjectAttr {
+        name: "region".into(),
+        ty: terraform_value::Type::String,
+        optional: true,
+    }]);
+    let mut cfg = std::collections::BTreeMap::new();
+    cfg.insert(
+        "region".to_string(),
+        terraform_value::Value::String(region.into()),
+    );
+    tfplugin6::DynamicValue {
+        msgpack: terraform_codec::encode_msgpack(&terraform_value::Value::Object(cfg), &cfg_ty)
+            .unwrap(),
+        json: vec![],
+    }
+}
+
+#[tokio::test]
+async fn configure_provider_rejects_bad_config_with_diagnostic() {
+    let svc = fallible_service();
+    let resp = svc
+        .configure_provider(Request::new(tfplugin6::configure_provider::Request {
+            config: Some(aws_config_dv("bad")),
+            ..Default::default()
+        }))
+        .await
+        .expect("configure call returns")
+        .into_inner();
+    assert_eq!(resp.diagnostics.len(), 1, "{:?}", resp.diagnostics);
+    assert_eq!(resp.diagnostics[0].summary, "invalid region");
+    assert_eq!(resp.diagnostics[0].detail, "`bad` is not a valid region");
+}
+
+#[tokio::test]
+async fn configure_provider_accepts_good_config_when_fallible() {
+    let svc = fallible_service();
+    let resp = svc
+        .configure_provider(Request::new(tfplugin6::configure_provider::Request {
+            config: Some(aws_config_dv("eu-west-1")),
+            ..Default::default()
+        }))
+        .await
+        .expect("configure call returns")
+        .into_inner();
+    assert!(resp.diagnostics.is_empty(), "{:?}", resp.diagnostics);
+}
+
+#[tokio::test]
+async fn validate_provider_config_surfaces_diagnostics() {
+    let svc = Provider::builder()
+        .provider_config::<AwsConfig>()
+        .validate_config(|cfg: AwsConfig| async move {
+            match cfg.region.as_deref() {
+                Some("bad") => {
+                    vec![Diag::error("invalid region", "`bad` is reserved").at(["region"])]
+                }
+                _ => Vec::new(),
+            }
+        })
+        .build()
+        .map(ProviderService::new)
+        .expect("provider builds");
+
+    // A bad region yields one diagnostic, pointed at the `region` attribute.
+    let bad = svc
+        .validate_provider_config(Request::new(tfplugin6::validate_provider_config::Request {
+            config: Some(aws_config_dv("bad")),
+        }))
+        .await
+        .expect("validate_provider_config")
+        .into_inner();
+    assert_eq!(bad.diagnostics.len(), 1, "{:?}", bad.diagnostics);
+    assert_eq!(bad.diagnostics[0].summary, "invalid region");
+    let path = bad.diagnostics[0]
+        .attribute
+        .as_ref()
+        .expect("diagnostic carries an attribute path");
+    match path.steps[0].selector.as_ref().unwrap() {
+        tfplugin6::attribute_path::step::Selector::AttributeName(n) => assert_eq!(n, "region"),
+        other => panic!("expected an attribute-name step, got {other:?}"),
+    }
+
+    // A good region validates clean.
+    let ok = svc
+        .validate_provider_config(Request::new(tfplugin6::validate_provider_config::Request {
+            config: Some(aws_config_dv("eu-west-1")),
+        }))
+        .await
+        .expect("validate_provider_config")
+        .into_inner();
+    assert!(ok.diagnostics.is_empty(), "{:?}", ok.diagnostics);
+}
+
 /// The `cty` JSON type-constraint bytes from an attribute's `type` field, as a
 /// JSON string.
 fn cty(bytes: &[u8]) -> String {
@@ -803,6 +1003,198 @@ async fn dyn_resource_serves_from_hand_built_schema() {
         "v0 `bucket` migrated to `name`"
     );
     assert_eq!(fields["arn"], Value::String("arn:aws:s3:::b3".into()));
+}
+
+/// A typed resource whose `create` fails with an attribute-pathed error and an
+/// accompanying warning — proving CRUD handlers can do more than a flat error.
+#[derive(Facet)]
+#[facet(terraform::resource("failing"))]
+#[allow(dead_code)]
+struct Failing {
+    #[facet(terraform::required)]
+    name: String,
+}
+
+struct FailingResource;
+
+#[async_trait]
+impl Resource for FailingResource {
+    type Model = Failing;
+
+    async fn create(&self, _planned: Failing) -> Result<Failing, ResourceError> {
+        Err(ResourceError::new("create failed")
+            .with_detail("the backend rejected it")
+            .at(["name"])
+            .with_warning(Diag::warning("deprecated", "`name` will be renamed")))
+    }
+}
+
+#[tokio::test]
+async fn crud_error_carries_attribute_path_and_warnings() {
+    let svc = Provider::builder()
+        .resource(FailingResource)
+        .build()
+        .map(ProviderService::new)
+        .expect("provider builds");
+
+    let ty = terraform_value::Type::Object(vec![terraform_value::ObjectAttr {
+        name: "name".into(),
+        ty: terraform_value::Type::String,
+        optional: false,
+    }]);
+    let mut obj = std::collections::BTreeMap::new();
+    obj.insert(
+        "name".to_string(),
+        terraform_value::Value::String("x".into()),
+    );
+    let planned = tfplugin6::DynamicValue {
+        msgpack: terraform_codec::encode_msgpack(&terraform_value::Value::Object(obj), &ty)
+            .unwrap(),
+        json: vec![],
+    };
+
+    let apply = svc
+        .apply_resource_change(Request::new(tfplugin6::apply_resource_change::Request {
+            type_name: "failing".into(),
+            prior_state: None,
+            planned_state: Some(planned),
+            ..Default::default()
+        }))
+        .await
+        .expect("apply")
+        .into_inner();
+
+    // One error (pointed at `name`) plus one warning.
+    assert_eq!(apply.diagnostics.len(), 2, "{:?}", apply.diagnostics);
+    let error = &apply.diagnostics[0];
+    assert_eq!(
+        error.severity,
+        tfplugin6::diagnostic::Severity::Error as i32
+    );
+    assert_eq!(error.summary, "create failed");
+    let path = error
+        .attribute
+        .as_ref()
+        .expect("error carries an attribute path");
+    match path.steps[0].selector.as_ref().unwrap() {
+        tfplugin6::attribute_path::step::Selector::AttributeName(n) => assert_eq!(n, "name"),
+        other => panic!("expected an attribute-name step, got {other:?}"),
+    }
+
+    let warning = &apply.diagnostics[1];
+    assert_eq!(
+        warning.severity,
+        tfplugin6::diagnostic::Severity::Warning as i32
+    );
+    assert_eq!(warning.summary, "deprecated");
+}
+
+/// A handler that panics in `create` — used to prove the runtime contains the
+/// panic as a diagnostic rather than letting it abort the plugin process.
+struct PanicOnCreate;
+
+#[async_trait]
+impl terraform_runtime::DynResource for PanicOnCreate {
+    async fn create(
+        &self,
+        _planned: terraform_value::Value,
+    ) -> Result<terraform_value::Value, terraform_runtime::Diagnostics> {
+        panic!("boom in create");
+    }
+    async fn read(
+        &self,
+        current: terraform_value::Value,
+    ) -> Result<Option<terraform_value::Value>, terraform_runtime::Diagnostics> {
+        Ok(Some(current))
+    }
+    async fn update(
+        &self,
+        planned: terraform_value::Value,
+        _prior: terraform_value::Value,
+    ) -> Result<terraform_value::Value, terraform_runtime::Diagnostics> {
+        Ok(planned)
+    }
+    async fn delete(
+        &self,
+        _prior: terraform_value::Value,
+    ) -> Result<(), terraform_runtime::Diagnostics> {
+        Ok(())
+    }
+    async fn import(
+        &self,
+        _id: String,
+    ) -> Result<terraform_value::Value, terraform_runtime::Diagnostics> {
+        Ok(terraform_value::Value::Null)
+    }
+    async fn upgrade(
+        &self,
+        _from_version: i64,
+        prior: terraform_value::Value,
+    ) -> Result<terraform_value::Value, terraform_runtime::Diagnostics> {
+        Ok(prior)
+    }
+    async fn validate(&self, _config: terraform_value::Value) -> terraform_runtime::Diagnostics {
+        Vec::new()
+    }
+}
+
+#[tokio::test]
+async fn handler_panic_becomes_diagnostic() {
+    use terraform_ir::{AttributeSchema, Block};
+    use terraform_value::{ObjectAttr, Type, Value};
+
+    let block = Block {
+        attributes: vec![AttributeSchema {
+            required: true,
+            ..AttributeSchema::new("name", Type::String)
+        }],
+        nested_blocks: vec![],
+    };
+    let provider = Provider::builder()
+        .dyn_resource("boom", 1, block, std::sync::Arc::new(PanicOnCreate))
+        .build()
+        .expect("provider builds");
+    let svc = ProviderService::new(provider);
+
+    let cty = Type::Object(vec![ObjectAttr {
+        name: "name".into(),
+        ty: Type::String,
+        optional: false,
+    }]);
+    let mut obj = std::collections::BTreeMap::new();
+    obj.insert("name".to_string(), Value::String("b1".into()));
+    let planned = tfplugin6::DynamicValue {
+        msgpack: terraform_codec::encode_msgpack(&Value::Object(obj), &cty).unwrap(),
+        json: vec![],
+    };
+
+    // Silence the default panic hook so the (expected) panic doesn't spam test
+    // output; the runtime still catches it and reports a diagnostic.
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let apply = svc
+        .apply_resource_change(Request::new(tfplugin6::apply_resource_change::Request {
+            type_name: "boom".into(),
+            prior_state: None,
+            planned_state: Some(planned),
+            ..Default::default()
+        }))
+        .await
+        .expect("apply call returns (not a process abort)")
+        .into_inner();
+    std::panic::set_hook(prev);
+
+    assert_eq!(apply.diagnostics.len(), 1, "{:?}", apply.diagnostics);
+    assert!(
+        apply.diagnostics[0].summary.contains("panicked"),
+        "summary was {:?}",
+        apply.diagnostics[0].summary
+    );
+    assert!(
+        apply.diagnostics[0].detail.contains("boom in create"),
+        "detail was {:?}",
+        apply.diagnostics[0].detail
+    );
 }
 
 #[tokio::test]

@@ -15,12 +15,22 @@ use terraform_value::Value;
 
 /// An error returned by a resource operation, surfaced to Terraform as an error
 /// diagnostic.
+///
+/// Beyond a `summary`/`detail`, the error can be pointed at a specific attribute
+/// with [`ResourceError::at`] and can carry accompanying warning diagnostics with
+/// [`ResourceError::with_warning`] — both surface to Terraform alongside the
+/// failure.
 #[derive(Debug, Clone)]
 pub struct ResourceError {
     /// Short, one-line summary.
     pub summary: String,
     /// Optional longer explanation.
     pub detail: String,
+    /// Optional path to the offending attribute, as a sequence of attribute
+    /// names (e.g. `["network", "subnet"]`). Empty means resource-wide.
+    pub attribute: Vec<String>,
+    /// Warning diagnostics to surface alongside the error.
+    pub warnings: Vec<Diag>,
 }
 
 impl ResourceError {
@@ -29,12 +39,30 @@ impl ResourceError {
         ResourceError {
             summary: summary.into(),
             detail: String::new(),
+            attribute: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
     /// Attach a longer detail message.
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = detail.into();
+        self
+    }
+
+    /// Point this error at an attribute path (a sequence of names).
+    pub fn at<I, S>(mut self, attribute: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.attribute = attribute.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Attach a warning diagnostic to surface alongside this error.
+    pub fn with_warning(mut self, warning: Diag) -> Self {
+        self.warnings.push(warning);
         self
     }
 }
@@ -56,8 +84,8 @@ impl From<String> for ResourceError {
 pub enum Severity {
     /// A fatal problem; the operation failed.
     Error,
-    /// A non-fatal advisory. Not yet producible by handlers; reserved.
-    #[allow(dead_code)]
+    /// A non-fatal advisory (e.g. via [`ResourceError::with_warning`] or
+    /// [`Resource::validate`]).
     Warning,
 }
 
@@ -113,8 +141,29 @@ impl From<ResourceError> for Diag {
             severity: Severity::Error,
             summary: e.summary,
             detail: e.detail,
-            attribute: Vec::new(),
+            attribute: e.attribute,
         }
+    }
+}
+
+impl From<ResourceError> for Diagnostics {
+    /// The error diagnostic first, then any attached warnings.
+    fn from(e: ResourceError) -> Self {
+        let ResourceError {
+            summary,
+            detail,
+            attribute,
+            warnings,
+        } = e;
+        let mut diags = Vec::with_capacity(1 + warnings.len());
+        diags.push(Diag {
+            severity: Severity::Error,
+            summary,
+            detail,
+            attribute,
+        });
+        diags.extend(warnings);
+        diags
     }
 }
 
@@ -231,25 +280,14 @@ impl<R: Resource> DynResource for ResourceAdapter<R> {
     async fn create(&self, planned: Value) -> Result<Value, Diagnostics> {
         let model: R::Model =
             from_value(&planned).map_err(|e| codec_diag("decode planned state", e))?;
-        let result = self
-            .inner
-            .create(model)
-            .await
-            .map_err(Diag::from)
-            .map_err(|d| vec![d])?;
+        let result = self.inner.create(model).await.map_err(Diagnostics::from)?;
         to_value(&result).map_err(|e| codec_diag("encode new state", e))
     }
 
     async fn read(&self, current: Value) -> Result<Option<Value>, Diagnostics> {
         let model: R::Model =
             from_value(&current).map_err(|e| codec_diag("decode current state", e))?;
-        match self
-            .inner
-            .read(model)
-            .await
-            .map_err(Diag::from)
-            .map_err(|d| vec![d])?
-        {
+        match self.inner.read(model).await.map_err(Diagnostics::from)? {
             Some(refreshed) => Ok(Some(
                 to_value(&refreshed).map_err(|e| codec_diag("encode refreshed state", e))?,
             )),
@@ -266,28 +304,18 @@ impl<R: Resource> DynResource for ResourceAdapter<R> {
             .inner
             .update(planned_model, prior_model)
             .await
-            .map_err(Diag::from)
-            .map_err(|d| vec![d])?;
+            .map_err(Diagnostics::from)?;
         to_value(&result).map_err(|e| codec_diag("encode new state", e))
     }
 
     async fn delete(&self, prior: Value) -> Result<(), Diagnostics> {
         let model: R::Model =
             from_value(&prior).map_err(|e| codec_diag("decode prior state", e))?;
-        self.inner
-            .delete(model)
-            .await
-            .map_err(Diag::from)
-            .map_err(|d| vec![d])
+        self.inner.delete(model).await.map_err(Diagnostics::from)
     }
 
     async fn import(&self, id: String) -> Result<Value, Diagnostics> {
-        let result = self
-            .inner
-            .import(id)
-            .await
-            .map_err(Diag::from)
-            .map_err(|d| vec![d])?;
+        let result = self.inner.import(id).await.map_err(Diagnostics::from)?;
         to_value(&result).map_err(|e| codec_diag("encode imported state", e))
     }
 
@@ -296,8 +324,7 @@ impl<R: Resource> DynResource for ResourceAdapter<R> {
             .inner
             .upgrade(from_version, prior)
             .await
-            .map_err(Diag::from)
-            .map_err(|d| vec![d])?;
+            .map_err(Diagnostics::from)?;
         to_value(&result).map_err(|e| codec_diag("encode upgraded state", e))
     }
 
