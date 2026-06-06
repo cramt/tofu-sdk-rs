@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 
 use facet::{Def, Facet, Partial, Peek, ScalarType, Type as FType, UserType};
-use terraform_value::Value;
+use terraform_value::{Number, Value};
 
 /// A null constant for defaulting absent struct fields.
 const NULL: Value = Value::Null;
@@ -141,20 +141,42 @@ fn scalar_to_value(peek: &Peek<'_, '_>, scalar: ScalarType) -> Result<Value, Typ
                 .ok_or(TypedError::Unsupported("string"))?
                 .to_string(),
         ),
-        ScalarType::F64 => Value::Number(*peek.get::<f64>().map_err(reflect)?),
-        ScalarType::F32 => Value::Number(*peek.get::<f32>().map_err(reflect)? as f64),
-        ScalarType::I8 => Value::Number(*peek.get::<i8>().map_err(reflect)? as f64),
-        ScalarType::I16 => Value::Number(*peek.get::<i16>().map_err(reflect)? as f64),
-        ScalarType::I32 => Value::Number(*peek.get::<i32>().map_err(reflect)? as f64),
-        ScalarType::I64 => Value::Number(*peek.get::<i64>().map_err(reflect)? as f64),
-        ScalarType::I128 => Value::Number(*peek.get::<i128>().map_err(reflect)? as f64),
-        ScalarType::ISize => Value::Number(*peek.get::<isize>().map_err(reflect)? as f64),
-        ScalarType::U8 => Value::Number(*peek.get::<u8>().map_err(reflect)? as f64),
-        ScalarType::U16 => Value::Number(*peek.get::<u16>().map_err(reflect)? as f64),
-        ScalarType::U32 => Value::Number(*peek.get::<u32>().map_err(reflect)? as f64),
-        ScalarType::U64 => Value::Number(*peek.get::<u64>().map_err(reflect)? as f64),
-        ScalarType::U128 => Value::Number(*peek.get::<u128>().map_err(reflect)? as f64),
-        ScalarType::USize => Value::Number(*peek.get::<usize>().map_err(reflect)? as f64),
+        ScalarType::F64 => Value::Number(Number::from_f64(*peek.get::<f64>().map_err(reflect)?)),
+        ScalarType::F32 => {
+            Value::Number(Number::from_f64(*peek.get::<f32>().map_err(reflect)? as f64))
+        }
+        ScalarType::I8 => Value::Number(Number::from_i128(
+            *peek.get::<i8>().map_err(reflect)? as i128
+        )),
+        ScalarType::I16 => Value::Number(Number::from_i128(
+            *peek.get::<i16>().map_err(reflect)? as i128
+        )),
+        ScalarType::I32 => Value::Number(Number::from_i128(
+            *peek.get::<i32>().map_err(reflect)? as i128
+        )),
+        ScalarType::I64 => Value::Number(Number::from_i128(
+            *peek.get::<i64>().map_err(reflect)? as i128
+        )),
+        ScalarType::I128 => Value::Number(Number::from_i128(*peek.get::<i128>().map_err(reflect)?)),
+        ScalarType::ISize => Value::Number(Number::from_i128(
+            *peek.get::<isize>().map_err(reflect)? as i128,
+        )),
+        ScalarType::U8 => Value::Number(Number::from_u128(
+            *peek.get::<u8>().map_err(reflect)? as u128
+        )),
+        ScalarType::U16 => Value::Number(Number::from_u128(
+            *peek.get::<u16>().map_err(reflect)? as u128
+        )),
+        ScalarType::U32 => Value::Number(Number::from_u128(
+            *peek.get::<u32>().map_err(reflect)? as u128
+        )),
+        ScalarType::U64 => Value::Number(Number::from_u128(
+            *peek.get::<u64>().map_err(reflect)? as u128
+        )),
+        ScalarType::U128 => Value::Number(Number::from_u128(*peek.get::<u128>().map_err(reflect)?)),
+        ScalarType::USize => Value::Number(Number::from_u128(
+            *peek.get::<usize>().map_err(reflect)? as u128,
+        )),
         ScalarType::Char => return Err(TypedError::Unsupported("char")),
         ScalarType::Unit => return Err(TypedError::Unsupported("unit")),
         _ => return Err(TypedError::Unsupported("scalar")),
@@ -284,29 +306,29 @@ fn set_scalar<'f, const B: bool>(
     } else if shape.is_type::<bool>() {
         partial.set(as_bool(value)).map_err(reflect)
     } else if shape.is_type::<f64>() {
-        partial.set(as_number(value)).map_err(reflect)
+        partial.set(as_f64(value)).map_err(reflect)
     } else if shape.is_type::<f32>() {
-        partial.set(as_number(value) as f32).map_err(reflect)
+        partial.set(as_f64(value) as f32).map_err(reflect)
     } else if shape.is_type::<i64>() {
-        partial.set(as_number(value) as i64).map_err(reflect)
+        partial.set(as_i128(value) as i64).map_err(reflect)
     } else if shape.is_type::<i32>() {
-        partial.set(as_number(value) as i32).map_err(reflect)
+        partial.set(as_i128(value) as i32).map_err(reflect)
     } else if shape.is_type::<i16>() {
-        partial.set(as_number(value) as i16).map_err(reflect)
+        partial.set(as_i128(value) as i16).map_err(reflect)
     } else if shape.is_type::<i8>() {
-        partial.set(as_number(value) as i8).map_err(reflect)
+        partial.set(as_i128(value) as i8).map_err(reflect)
     } else if shape.is_type::<isize>() {
-        partial.set(as_number(value) as isize).map_err(reflect)
+        partial.set(as_i128(value) as isize).map_err(reflect)
     } else if shape.is_type::<u64>() {
-        partial.set(as_number(value) as u64).map_err(reflect)
+        partial.set(as_u128(value) as u64).map_err(reflect)
     } else if shape.is_type::<u32>() {
-        partial.set(as_number(value) as u32).map_err(reflect)
+        partial.set(as_u128(value) as u32).map_err(reflect)
     } else if shape.is_type::<u16>() {
-        partial.set(as_number(value) as u16).map_err(reflect)
+        partial.set(as_u128(value) as u16).map_err(reflect)
     } else if shape.is_type::<u8>() {
-        partial.set(as_number(value) as u8).map_err(reflect)
+        partial.set(as_u128(value) as u8).map_err(reflect)
     } else if shape.is_type::<usize>() {
-        partial.set(as_number(value) as usize).map_err(reflect)
+        partial.set(as_u128(value) as usize).map_err(reflect)
     } else {
         Err(TypedError::Unsupported(shape.type_identifier))
     }
@@ -339,10 +361,30 @@ fn as_bool(value: &Value) -> bool {
     matches!(value, Value::Bool(true))
 }
 
-fn as_number(value: &Value) -> f64 {
+/// Narrow a number to `f64` for a float field (zero for null/unknown).
+fn as_f64(value: &Value) -> f64 {
     match value {
-        Value::Number(n) => *n,
+        Value::Number(n) => n.to_f64_lossy(),
         _ => 0.0,
+    }
+}
+
+/// Narrow a number to `i128` for a signed integer field — preserves full
+/// 64-bit precision before the final cast to the field's width (zero for
+/// null/unknown).
+fn as_i128(value: &Value) -> i128 {
+    match value {
+        Value::Number(n) => n.to_i128_lossy(),
+        _ => 0,
+    }
+}
+
+/// Narrow a number to `u128` for an unsigned integer field (zero for
+/// null/unknown).
+fn as_u128(value: &Value) -> u128 {
+    match value {
+        Value::Number(n) => n.to_u128_lossy(),
+        _ => 0,
     }
 }
 
@@ -397,8 +439,8 @@ mod tests {
         };
 
         assert_eq!(fields["name"], Value::String("bucket".into()));
-        assert_eq!(fields["count"], Value::Number(3.0));
-        assert_eq!(fields["ratio"], Value::Number(1.5));
+        assert_eq!(fields["count"], Value::number(3));
+        assert_eq!(fields["ratio"], Value::number(1.5));
         assert_eq!(fields["enabled"], Value::Bool(true));
         assert_eq!(
             fields["items"],
@@ -415,7 +457,7 @@ mod tests {
             panic!("inner should be an object");
         };
         assert_eq!(inner["a"], Value::String("x".into()));
-        assert_eq!(inner["b"], Value::Number(7.0));
+        assert_eq!(inner["b"], Value::number(7));
     }
 
     #[test]
@@ -427,7 +469,7 @@ mod tests {
         let Value::Object(fields) = to_value(&sample).unwrap() else {
             panic!();
         };
-        assert_eq!(fields["b"], Value::Number(42.0));
+        assert_eq!(fields["b"], Value::number(42));
     }
 
     // Decode round-trips: Rust -> Value -> Rust.
@@ -492,8 +534,8 @@ mod tests {
     fn decodes_value_into_rust() {
         let mut obj = BTreeMap::new();
         obj.insert("name".to_string(), Value::String("bucket".into()));
-        obj.insert("count".to_string(), Value::Number(3.0));
-        obj.insert("ratio".to_string(), Value::Number(2.5));
+        obj.insert("count".to_string(), Value::number(3));
+        obj.insert("ratio".to_string(), Value::number(2.5));
         obj.insert("enabled".to_string(), Value::Bool(true));
         obj.insert(
             "items".to_string(),
@@ -603,6 +645,31 @@ mod tests {
         };
         let value = to_value(&original).unwrap();
         let back: Decoded = from_value(&value).unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[derive(Facet, Debug, PartialEq)]
+    struct Ids {
+        signed: i64,
+        unsigned: u64,
+    }
+
+    #[test]
+    fn large_64bit_integers_survive_the_typed_round_trip() {
+        // Regression for the f64 precision bug: values above 2^53 must not be
+        // truncated when reflected through the value tree.
+        let original = Ids {
+            signed: 9_007_199_254_740_993, // 2^53 + 1
+            unsigned: u64::MAX,
+        };
+        let value = to_value(&original).unwrap();
+        let Value::Object(ref fields) = value else {
+            panic!("expected object");
+        };
+        assert_eq!(fields["signed"], Value::number(9_007_199_254_740_993_i64));
+        assert_eq!(fields["unsigned"], Value::number(u64::MAX));
+
+        let back: Ids = from_value(&value).unwrap();
         assert_eq!(back, original);
     }
 }

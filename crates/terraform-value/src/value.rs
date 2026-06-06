@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::number::Number;
 use crate::ty::{ObjectAttr, Type};
 
 /// A dynamic Terraform value tree.
@@ -22,10 +23,12 @@ pub enum Value {
     Bool(bool),
     /// A number.
     ///
-    /// Terraform numbers are arbitrary precision; this representation uses `f64`,
-    /// which is exact for the integer and typical decimal values that appear in
-    /// real configurations but cannot represent every `cty` number losslessly.
-    Number(f64),
+    /// Terraform numbers are arbitrary precision. [`Number`] preserves that:
+    /// 64-bit integers stay exact (no silent `f64` truncation above 2^53), and
+    /// values beyond `i64`/`u64`/`f64` are kept verbatim as canonical decimal
+    /// text. The lossy narrowing to a concrete Rust numeric type happens only at
+    /// the typed-model boundary, not here.
+    Number(Number),
     /// A string.
     String(String),
     /// An ordered, homogeneous list.
@@ -49,6 +52,13 @@ impl Value {
     /// Returns `true` if this node is [`Value::Unknown`].
     pub fn is_unknown(&self) -> bool {
         matches!(self, Value::Unknown)
+    }
+
+    /// Construct a [`Value::Number`] from anything convertible into a [`Number`]
+    /// (any Rust integer or float), e.g. `Value::number(3)` or
+    /// `Value::number(1.5)`.
+    pub fn number(n: impl Into<Number>) -> Value {
+        Value::Number(n.into())
     }
 
     /// Best-effort inference of a concrete [`Type`] from this value.

@@ -12,9 +12,11 @@
 //! Neither concept depends on the Terraform plugin protocol; both are part of the
 //! backend-agnostic core.
 
+mod number;
 mod ty;
 mod value;
 
+pub use number::Number;
 pub use ty::{ObjectAttr, Type};
 pub use value::Value;
 

@@ -42,11 +42,11 @@ The items below are what a *large or precision-sensitive* provider (think
 `aws`/`google`) hits in practice. None reshape the public API; all are additive.
 Rough priority order, each pointing at its tracked item:
 
-1. **`f64` numbers — silent precision loss (highest priority, correctness).**
-   `Value::Number` is `f64`, so 64-bit IDs, large byte counts, and
-   high-precision decimals lose precision above 2^53 *with no error*. cty is
-   arbitrary-precision (`big.Float`). This can silently corrupt real state — it
-   is the single most important blocker for a serious provider. → **3.3**.
+1. **~~`f64` numbers — silent precision loss.~~ ✅ DONE (3.3).** `Value::Number`
+   now holds an arbitrary-precision [`Number`] (i64/u64/f64 fast paths + a
+   canonical-decimal-text `Big` arm), so 64-bit IDs and beyond round-trip
+   through msgpack without loss. (JSON-encode is still `u64`-capped by
+   `facet-value`; see 3.3.)
 2. **Success-path warnings.** Warnings only ride alongside a CRUD *error* today;
    real providers warn on successful applies (deprecations, drift hints). Needs
    the handler ctx. → **2.2 (deferred)** + ctx work in **3.4**.
@@ -102,7 +102,12 @@ harness/provider changed.
   from a *known* planned value ("inconsistent result after apply"). `plan.rs`
   only marks a computed attr unknown when it's null or the resource is replacing,
   and only walks **top-level** `block.attributes` (not inside nested blocks).
-- **Numbers are `f64`** in the `Value` tree (`terraform-value/src/value.rs`).
+- **Numbers are arbitrary precision** — `Value::Number` holds a `Number`
+  (`terraform-value/src/number.rs`): `i64`/`u64`/`f64` fast paths plus a `Big`
+  decimal-text arm. Narrowing to a concrete Rust numeric type is lossy and lives
+  only at the typed-model boundary (`terraform-codec/src/typed.rs`), never in the
+  `Value` tree. msgpack preserves all of it; the JSON-encode path is `u64`-capped
+  by `facet-value`.
 - **No serde** — JSON is `facet-json` + `facet-value`; maps decode with
   `begin_key`/`begin_value` (not `begin_object_entry`).
 
@@ -292,27 +297,35 @@ via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`)
 - `moved {}` blocks and cross-resource-type state moves. In `unimplemented_unary!`.
   Add a `Resource::move_state(from_type, from_state) -> Model` hook + dispatch.
 
-### 3.3 Number precision — ⚠️ highest-priority correctness gap
-- **Why:** `Value::Number(f64)` silently loses precision above 2^53. Real
-  providers carry 64-bit IDs, large byte counts, and high-precision decimals;
-  cty is arbitrary-precision (`big.Float`). A truncated ID round-tripped through
-  state is a *silent* data-correctness bug (no error, wrong value), which is why
-  this ranks above every other open item for a serious provider.
-- **Current:** `Value::Number(f64)` (`terraform-value/src/value.rs`); the codec
-  and reflection map `cty.Number` ↔ `f64`; `AttributeSchema.default` holding a
-  `Value` is why IR types are `PartialEq` but not `Eq`.
-- **Approach:** back numbers with a decimal/bignum type (e.g. an arbitrary-
-  precision decimal) preserving the msgpack/JSON wire forms. Wide blast radius:
-  `terraform-value`, `terraform-codec` (encode/decode), `terraform-reflect`
-  (integer/float field types), and every `as f64`. Decide the public surface —
-  authors with plain `i64`/`f64`/`u64` fields must keep working; the lossy
-  conversion should live only at the typed-model boundary, not in the `Value`
-  tree.
-- **Verify:** codec round-trip unit test for an integer > 2^53 (e.g.
-  `9_007_199_254_740_993`) that today fails; a `harness/` config writing a large
-  numeric attribute whose `expected/` JSON proves no precision loss.
-- **Done when:** a 64-bit integer attribute round-trips through plan/apply/state
-  without losing precision.
+### 3.3 Number precision — ✅ DONE
+Shipped: `Value::Number(f64)` became `Value::Number(Number)`, where `Number`
+(`terraform-value/src/number.rs`) is an arbitrary-precision `cty` number —
+`I64`/`U64`/`F64` fast paths plus a `Big(String)` arm holding canonical decimal
+text for values outside those (go-cty's msgpack/JSON string fallback). 64-bit
+integers and beyond now round-trip through msgpack without loss; lossy narrowing
+to a concrete Rust numeric type happens only at the typed-model boundary
+(`terraform-codec/src/typed.rs::set_scalar` via `to_i128_lossy`/`to_u128_lossy`/
+`to_f64_lossy`), never in the `Value` tree. `Value::number(impl Into<Number>)` is
+the ergonomic constructor.
+
+- **Original why:** `Value::Number(f64)` silently lost precision above 2^53 — a
+  truncated 64-bit ID round-tripped through state was a *silent* correctness bug.
+- **What changed:** `terraform-value` (new `Number` type), `terraform-codec`
+  (`encode`/`decode`/`typed` all carry `Number`; msgpack maps `I64`→int,
+  `U64`→uint, `F64`→float-or-int, `Big`→string, exactly like go-cty),
+  `terraform-reflect` (`field_default` parses via `Number::try_parse`). IR types
+  stay `PartialEq` but not `Eq` (the `F64` arm).
+- **Known limitation:** the cty-**JSON** encode path (`encode_json`) routes
+  through `facet-value`, whose number storage caps at `i64`/`u64`/`f64`, so a
+  `Big` value beyond `u64` falls back to a lossy `f64` *on the JSON path only*
+  (state-upgrade reads and the Node binding, where JS numbers are `f64`
+  regardless). The msgpack wire path — the path Terraform actually uses — is
+  exact. Lifting this needs an arbitrary-precision JSON number in `facet-value`.
+- **Verified:** `terraform-codec` round-trips `9_007_199_254_740_993` (2^53+1),
+  `u64::MAX`, `i64::MIN`, and a `>u64` integer through msgpack; a typed
+  `to_value`/`from_value` round trip of `i64`/`u64` large values; `Number` unit
+  tests in `terraform-value/src/number.rs`. Full `cargo test --workspace` (incl.
+  the `tofu test` e2e + schema contract) and the TS harness are green.
 
 ### 3.4 Misc completeness
 - **Private state to handlers:** `service.rs` round-trips Terraform's per-resource

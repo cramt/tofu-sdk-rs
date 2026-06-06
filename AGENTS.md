@@ -164,13 +164,19 @@ entirely TS-side; it compiles down to the same cty-JSON the addon already takes.
   and applied by the planner to unset optional attributes; defaults are **not**
   emitted into the schema (Terraform has no schema-level default). Note IR types
   are now `PartialEq` but **not `Eq`** (an `AttributeSchema.default` holds a
-  `Value`, hence `f64`).
+  `Value`, whose `Number` may hold an `f64`).
 - **`Resource::modify_plan`** runs after the mechanical plan and returns
   `PlanModifications` (top-level attr names to force-replace / mark unknown). It
   is a defaulted `DynResource` method, so the Node binding and other seam
   implementors need no change.
-- **Numbers are `f64`** in the `Value` tree (lossy for very large/precise
-  numbers; fine for real configs).
+- **Numbers are arbitrary precision.** `Value::Number` holds a `Number`
+  (`terraform-value/src/number.rs`): `I64`/`U64`/`F64` fast paths plus a `Big`
+  arm carrying canonical decimal text (go-cty's msgpack/JSON string fallback), so
+  64-bit IDs round-trip without loss. Narrowing to a concrete Rust numeric type
+  is lossy and lives only at the typed-model boundary (`set_scalar` in
+  `terraform-codec/src/typed.rs`), never in the `Value` tree. Build one with
+  `Value::number(n)`. msgpack preserves all of it; the JSON-**encode** path
+  (`encode_json`) is `u64`-capped by `facet-value`'s number storage.
 - **auto-mTLS is server-auth-only.** tonic's `client_ca_root` is
   go-plugin-incompatible (advertises CA-name hints; the Go client then withholds
   its cert). We terminate TLS ourselves (tokio-rustls), present + advertise a

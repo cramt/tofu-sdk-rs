@@ -67,9 +67,22 @@ mod tests {
     #[test]
     fn primitives_round_trip() {
         round_trip(Value::Bool(true), &Type::Bool);
-        round_trip(Value::Number(42.0), &Type::Number);
-        round_trip(Value::Number(3.5), &Type::Number);
+        round_trip(Value::number(42), &Type::Number);
+        round_trip(Value::number(3.5), &Type::Number);
         round_trip(Value::String("hello".into()), &Type::String);
+    }
+
+    #[test]
+    fn large_numbers_round_trip_without_precision_loss() {
+        // Regression for the f64 precision bug: cty is arbitrary precision, so a
+        // 64-bit integer above 2^53 must survive the msgpack round trip exactly.
+        round_trip(Value::number(9_007_199_254_740_993_i64), &Type::Number); // 2^53 + 1
+        round_trip(Value::number(u64::MAX), &Type::Number);
+        round_trip(Value::number(i64::MIN), &Type::Number);
+        // Integers beyond u64 ride go-cty's msgpack string fallback.
+        let huge = terraform_value::Number::try_parse("170141183460469231731687303715884105729")
+            .expect("parses");
+        round_trip(Value::Number(huge), &Type::Number);
     }
 
     #[test]
@@ -87,7 +100,7 @@ mod tests {
             &Type::list(Type::String),
         );
         round_trip(
-            Value::Set(vec![Value::Number(1.0), Value::Number(2.0)]),
+            Value::Set(vec![Value::number(1), Value::number(2)]),
             &Type::set(Type::Number),
         );
         let mut m = BTreeMap::new();
@@ -124,7 +137,7 @@ mod tests {
     #[test]
     fn tuple_round_trips() {
         round_trip(
-            Value::Tuple(vec![Value::String("x".into()), Value::Number(1.0)]),
+            Value::Tuple(vec![Value::String("x".into()), Value::number(1)]),
             &Type::Tuple(vec![Type::String, Type::Number]),
         );
     }
@@ -164,7 +177,7 @@ mod tests {
         tags.insert("env".to_string(), Value::String("prod".into()));
         let mut obj = BTreeMap::new();
         obj.insert("name".to_string(), Value::String("bucket".into()));
-        obj.insert("count".to_string(), Value::Number(3.0));
+        obj.insert("count".to_string(), Value::number(3));
         obj.insert("enabled".to_string(), Value::Bool(true));
         obj.insert("tags".to_string(), Value::Map(tags));
         obj.insert(
@@ -245,7 +258,7 @@ mod tests {
             panic!("expected object")
         };
         assert_eq!(fields["name"], Value::String("bucket".into()));
-        assert_eq!(fields["count"], Value::Number(3.0));
+        assert_eq!(fields["count"], Value::number(3));
         let Value::Map(ref tags) = fields["tags"] else {
             panic!("tags map")
         };

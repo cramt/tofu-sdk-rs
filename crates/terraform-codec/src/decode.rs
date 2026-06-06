@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use facet_value::Value as Json;
 use rmpv::Value as Mp;
-use terraform_value::{Type, Value};
+use terraform_value::{Number, Type, Value};
 
 use crate::CodecError;
 
@@ -37,12 +37,12 @@ pub fn decode_json(json: &Json, ty: &Type) -> Result<Value, CodecError> {
             .ok_or_else(|| json_mismatch("bool", json)),
         Type::Number => {
             if let Some(n) = json.as_number() {
-                Ok(Value::Number(n.to_f64_lossy()))
+                Ok(Value::Number(number_from_json(n)))
             } else if let Some(s) = json.as_string() {
-                s.as_str()
-                    .parse::<f64>()
+                // cty encodes numbers beyond f64 as a JSON string.
+                Number::try_parse(s.as_str())
                     .map(Value::Number)
-                    .map_err(|_| json_mismatch("number", json))
+                    .ok_or_else(|| json_mismatch("number", json))
             } else {
                 Err(json_mismatch("number", json))
             }
@@ -119,7 +119,7 @@ fn decode_json_dynamic(json: &Json) -> Result<Value, CodecError> {
         return Ok(Value::Bool(b));
     }
     if let Some(n) = json.as_number() {
-        return Ok(Value::Number(n.to_f64_lossy()));
+        return Ok(Value::Number(number_from_json(n)));
     }
     if let Some(s) = json.as_string() {
         return Ok(Value::String(s.as_str().to_string()));
@@ -285,18 +285,32 @@ fn decode_dynamic(mp: &Mp) -> Result<Value, CodecError> {
     from_mp(&items[1], &ty)
 }
 
-/// Interpret an rmpv number as `f64`.
-fn number_from_mp(mp: &Mp) -> Option<f64> {
+/// Interpret an rmpv number as a [`Number`], preserving 64-bit integer
+/// precision (no `f64` round-trip) and go-cty's string fallback for values
+/// beyond `i64`/`u64`/`f64`.
+fn number_from_mp(mp: &Mp) -> Option<Number> {
     match mp {
         Mp::Integer(i) => i
             .as_i64()
-            .map(|x| x as f64)
-            .or_else(|| i.as_u64().map(|x| x as f64)),
-        Mp::F64(f) => Some(*f),
-        Mp::F32(f) => Some(*f as f64),
+            .map(Number::I64)
+            .or_else(|| i.as_u64().map(Number::U64)),
+        Mp::F64(f) => Some(Number::from_f64(*f)),
+        Mp::F32(f) => Some(Number::from_f64(*f as f64)),
         // go-cty falls back to a string for numbers that don't fit i64/f64.
-        Mp::String(s) => s.as_str().and_then(|x| x.parse::<f64>().ok()),
+        Mp::String(s) => s.as_str().and_then(Number::try_parse),
         _ => None,
+    }
+}
+
+/// Interpret a `facet-value` JSON number as a [`Number`], preserving integer
+/// precision up to `u64` (the ceiling of `facet-value`'s number storage).
+fn number_from_json(n: &facet_value::VNumber) -> Number {
+    if let Some(i) = n.to_i64() {
+        Number::I64(i)
+    } else if let Some(u) = n.to_u64() {
+        Number::U64(u)
+    } else {
+        Number::from_f64(n.to_f64_lossy())
     }
 }
 

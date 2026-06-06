@@ -5,7 +5,7 @@ use terraform_attrs::Attr as TfAttr;
 use terraform_ir::{
     AttributeSchema, Block, DataSourceSchema, NestedBlock, NestingMode, ResourceSchema,
 };
-use terraform_value::{ObjectAttr, Type, Value};
+use terraform_value::{Number, ObjectAttr, Type, Value};
 
 /// The facet namespace string for our extension attributes.
 const NS: &str = "terraform";
@@ -418,7 +418,7 @@ fn field_default(field: &'static Field, ty: &Type) -> Option<Value> {
         return None;
     };
     match ty {
-        Type::Number => literal.parse::<f64>().ok().map(Value::Number),
+        Type::Number => Number::try_parse(literal).map(Value::Number),
         Type::Bool => literal.parse::<bool>().ok().map(Value::Bool),
         _ => Some(Value::String(literal.to_string())),
     }
@@ -600,7 +600,7 @@ mod tests {
             attr(&block, "region").default,
             Some(Value::String("us-east-1".into()))
         );
-        assert_eq!(attr(&block, "retries").default, Some(Value::Number(3.0)));
+        assert_eq!(attr(&block, "retries").default, Some(Value::number(3)));
         assert_eq!(attr(&block, "enabled").default, Some(Value::Bool(true)));
         assert_eq!(attr(&block, "name").default, None);
     }

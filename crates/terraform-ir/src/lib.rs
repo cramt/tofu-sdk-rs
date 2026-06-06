@@ -17,7 +17,7 @@ use terraform_value::{ObjectAttr, Type, Value};
 /// and data source it exposes.
 ///
 /// These IR types are `PartialEq` but not `Eq`: an [`AttributeSchema`] can carry
-/// a `default` [`Value`], and `Value` holds `f64` (no total equality).
+/// a `default` [`Value`], whose `Number` may hold an `f64` (no total equality).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ProviderSchema {
     /// Provider-level configuration block (e.g. credentials, region).

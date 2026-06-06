@@ -134,10 +134,12 @@ impl is a working provider, exercised end-to-end against **real OpenTofu**
 
 Provider-defined functions, ephemeral resources, and cross-type state move.
 Warnings currently ride on a CRUD *error*; success-path warnings await a handler
-ctx. Numbers are held as `f64`. Some nested-block refinements remain: required
-single blocks (`min_items`) are not distinguished from optional, and data-source
-projections render a `block` field as an object attribute rather than a block.
-Not all `cty` corner cases are covered.
+ctx. Numbers are arbitrary precision (64-bit IDs and beyond round-trip exactly);
+the only residual cap is the cty-JSON *encode* path, which `facet-value` limits
+to `u64`. Some nested-block refinements remain: required single blocks
+(`min_items`) are not distinguished from optional, and data-source projections
+render a `block` field as an object attribute rather than a block. Not all `cty`
+corner cases are covered.
 
 ## Workspace layout
 
