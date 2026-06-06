@@ -1,0 +1,28 @@
+[package]
+name = "example-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+# A deliberately side-effecting example provider used by the TypeScript test
+# harness (`../../harness`). Unlike `example-aws` (which is backing-free), every
+# resource here persists its attributes to a JSON file under a configured
+# `output_dir`, so the harness can apply a sequence of configurations and assert
+# the real filesystem effects of the create/update/delete/replace lifecycle.
+
+[[bin]]
+name = "example-fs"
+path = "src/main.rs"
+
+[dependencies]
+facet = { workspace = true }
+facet-json = { workspace = true }
+terraform-provider = { workspace = true }
+terraform-runtime = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

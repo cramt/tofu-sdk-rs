@@ -1,0 +1,5 @@
+# Allow esbuild (a vitest/vite dependency) to run its postinstall, which fetches
+# its native binary. pnpm 11 blocks build scripts by default; this opts esbuild
+# in. (pnpm reads build-script settings from here, not package.json.)
+allowBuilds:
+  esbuild: true

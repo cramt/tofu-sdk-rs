@@ -47,6 +47,13 @@ facet::define_attr_grammar! {
         ForceNew,
         /// The value is sensitive and should be redacted.
         Sensitive,
+        /// Render this field as a nested *block* (HCL `name { … }` syntax) rather
+        /// than an attribute. The field's Rust type fixes the nesting mode:
+        /// a struct (or `Option<struct>`) is a single block, `Vec<struct>` a
+        /// list, a set a set, and `HashMap<String, struct>` a map. The element
+        /// struct is reflected recursively, so blocks may contain attributes and
+        /// further nested blocks.
+        Block,
         /// Marks a struct as a managed resource.
         Resource,
         /// Marks a struct as a data source.

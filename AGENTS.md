@@ -51,10 +51,16 @@ terraform-runtime   Resource trait, gRPC service impl, planning, handshake/serve
 terraform-provider  public author-facing facade (re-exports)
 terraform-macros    reserved (empty)
 example-aws         example provider binary + the real-tofu contract tests
+example-fs          side-effecting example provider (writes resource JSON files);
+                    subject of the TS iteration-sequence harness
 
 packages/tofu-sdk   @tofu-sdk/core — write providers in TypeScript
   native/           napi-rs Node addon (cdylib) over the dynamic seam
   ts/               typed wrapper compiled to dist/
+
+harness/            TS (Vitest) iteration-sequence harness over example-fs:
+                    applies ordered config folders into one shared-state
+                    workspace and asserts the JSON files the provider writes
 ```
 
 Keep `terraform-ir` free of Terraform protocol concerns. All Terraform-specific
@@ -108,9 +114,26 @@ entirely TS-side; it compiles down to the same cty-JSON the addon already takes.
   `terraform` (re-exported via `terraform-provider`).
 - **`reflect` feature**: `terraform-codec` enables facet's `reflect` feature for
   `Peek`/`Partial`.
+- **Decoding a `Def::Map` (`HashMap`) uses `begin_key`/`begin_value`, not
+  `begin_object_entry`.** The latter is `Def::DynamicValue`-only and errors
+  ("begin_object_entry can only be called on DynamicValue types") on a real map.
+  See `fill`'s `Def::Map` arm in `terraform-codec/src/typed.rs` (regression test:
+  `decodes_map_fields_via_key_value_frames`).
 - **`force_new` is a plan behavior, not a schema property** — it is reflected
   but emitted as `requires_replace` during `PlanResourceChange`, never into the
   schema.
+- **Nested blocks come only from `#[facet(terraform::block)]`.** A field without
+  it that happens to be a struct/`Vec<struct>` stays an *object/list attribute*
+  (assigned with `=`); the marker is what makes `terraform-reflect` emit a
+  `NestedBlock` (HCL `name { … }`). The IR, the `tfplugin6` emitter, and the
+  codec already handle blocks — a block is just an object/list/set/map on the
+  wire — so block support lives entirely in `reader.rs::nested_block_from_field`.
+  Limitations: `plan.rs` only walks top-level `block.attributes`, so a *computed*
+  attribute inside a block is **not** marked unknown (keep computed fields at the
+  top level, or you'll trip "inconsistent result after apply"); required single
+  blocks aren't distinguished (`min_items` is always 0); and the data-source
+  projection (`model_attributes`) ignores the marker, rendering a block field as
+  an object attribute.
 - **Decode of `Unknown`/null-on-non-`Option` → the type's zero value.** Plain
   Rust types can't hold "unknown"; resource handlers fill computed fields, so
   this is fine in practice. A `TfValue<T>` wrapper to preserve the distinction
@@ -183,10 +206,18 @@ Three layers, deliberately:
 3. **Schema contract test** — `example-aws/tests/tofu_schema.rs` parses
    `providers schema -json` (the native test framework only asserts plan/apply
    state, not schema, so this stays a Rust test).
+4. **TS iteration-sequence harness** (`harness/`, Vitest) — drives `example-fs`
+   over a sequence of config folders that share one local-backend state file,
+   asserting the JSON files the provider writes after each apply. This is the
+   place to cover multi-step lifecycles (create → update → replace → delete)
+   end-to-end; add a `configs/<name>/<n>/` folder with `*.tf` + `expected/`.
+   Run with `cd harness && pnpm install && pnpm test` inside the dev shell. See
+   `harness/README.md`.
 
-Both engine-backed layers **require `tofu` or `terraform` on `PATH`** (the dev
-shell provides it) and are the source of truth for protocol compatibility. The
-shared `dev_overrides` workspace plumbing lives in `tests/common/mod.rs`.
+The three engine-backed layers **require `tofu` or `terraform` on `PATH`** (the
+dev shell provides it) and are the source of truth for protocol compatibility.
+The shared `dev_overrides` workspace plumbing lives in `tests/common/mod.rs`
+(Rust) and `harness/src/harness.ts` (TS).
 
 Notes / gotchas for the `tofu test` suite:
 - **`force_new` is asserted indirectly via `last_action`.** The framework can

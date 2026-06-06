@@ -2,7 +2,9 @@
 
 use facet::{Def, Facet, Field, PrimitiveType, Shape, Type as FType, UserType};
 use terraform_attrs::Attr as TfAttr;
-use terraform_ir::{AttributeSchema, Block, DataSourceSchema, ResourceSchema};
+use terraform_ir::{
+    AttributeSchema, Block, DataSourceSchema, NestedBlock, NestingMode, ResourceSchema,
+};
 use terraform_value::{ObjectAttr, Type};
 
 /// The facet namespace string for our extension attributes.
@@ -215,16 +217,63 @@ pub fn reflect_data_source_list<T: Facet<'static>>(
     })
 }
 
-/// Build a [`Block`] from a struct shape.
+/// Build a [`Block`] from a struct shape. A field marked
+/// `#[facet(terraform::block)]` becomes a [`NestedBlock`] (recursively); every
+/// other field becomes an [`AttributeSchema`].
 fn block_from_shape(shape: &'static Shape) -> Result<Block, ReflectError> {
     let fields = struct_fields(shape)?;
-    let mut attributes = Vec::with_capacity(fields.len());
+    let mut attributes = Vec::new();
+    let mut nested_blocks = Vec::new();
     for field in fields {
-        attributes.push(attribute_from_field(field)?);
+        if field.has_attr(Some(NS), "block") {
+            nested_blocks.push(nested_block_from_field(field)?);
+        } else {
+            attributes.push(attribute_from_field(field)?);
+        }
     }
     Ok(Block {
         attributes,
-        nested_blocks: Vec::new(),
+        nested_blocks,
+    })
+}
+
+/// Lower a `#[facet(terraform::block)]` field into a [`NestedBlock`]. The field's
+/// type fixes the nesting mode and the element struct (peeling an outer
+/// `Option`): a struct is [`NestingMode::Single`], a list/slice/array is
+/// [`NestingMode::List`], a set is [`NestingMode::Set`], and a string-keyed map
+/// is [`NestingMode::Map`]. The element struct is reflected recursively, so a
+/// block may itself contain attributes and further nested blocks.
+fn nested_block_from_field(field: &'static Field) -> Result<NestedBlock, ReflectError> {
+    let name = field.rename.unwrap_or(field.name).to_string();
+
+    // An `Option<…>` block is just an optional block; peel it before classifying.
+    let shape = match &field.shape().def {
+        Def::Option(d) => d.t,
+        _ => field.shape(),
+    };
+
+    let (nesting, element) = match &shape.def {
+        Def::List(d) => (NestingMode::List, d.t),
+        Def::Slice(d) => (NestingMode::List, d.t),
+        Def::Array(d) => (NestingMode::List, d.t),
+        Def::Set(d) => (NestingMode::Set, d.t),
+        Def::Map(d) => {
+            if !is_string_like(d.k) {
+                return Err(ReflectError::UnsupportedMapKey {
+                    field: name,
+                    key_type: d.k.type_identifier,
+                });
+            }
+            (NestingMode::Map, d.v)
+        }
+        // A bare struct (single block).
+        _ => (NestingMode::Single, shape),
+    };
+
+    Ok(NestedBlock {
+        name,
+        nesting,
+        block: block_from_shape(element)?,
     })
 }
 
@@ -460,6 +509,130 @@ mod tests {
     fn non_string_map_key_errors() {
         let err = reflect_block::<BadMap>().unwrap_err();
         assert!(matches!(err, ReflectError::UnsupportedMapKey { .. }));
+    }
+
+    // --- nested blocks ------------------------------------------------------
+
+    #[derive(Facet, Hash, PartialEq, Eq)]
+    #[allow(dead_code)]
+    struct Rule {
+        #[facet(terraform::required)]
+        port: String,
+    }
+
+    #[derive(Facet)]
+    #[allow(dead_code)]
+    struct Meta {
+        #[facet(terraform::required)]
+        author: String,
+        note: Option<String>,
+    }
+
+    #[derive(Facet)]
+    #[facet(terraform::resource)]
+    #[allow(dead_code)]
+    struct Firewall {
+        #[facet(terraform::required)]
+        name: String,
+
+        // Single block (optional).
+        #[facet(terraform::block)]
+        meta: Option<Meta>,
+
+        // List, set, and map blocks of the same element struct.
+        #[facet(terraform::block)]
+        ingress: Vec<Rule>,
+        #[facet(terraform::block)]
+        egress: HashSet<Rule>,
+        #[facet(terraform::block)]
+        named: HashMap<String, Rule>,
+    }
+
+    fn nested<'a>(block: &'a Block, name: &str) -> &'a NestedBlock {
+        block
+            .nested_blocks
+            .iter()
+            .find(|b| b.name == name)
+            .unwrap_or_else(|| panic!("missing nested block `{name}`"))
+    }
+
+    #[test]
+    fn block_marker_emits_nested_blocks_with_nesting_modes() {
+        let block = reflect_block::<Firewall>().expect("Firewall reflects");
+
+        // `name` stays a plain attribute; the four block fields are nested blocks.
+        assert_eq!(block.attributes.len(), 1);
+        assert_eq!(block.attributes[0].name, "name");
+        assert_eq!(block.nested_blocks.len(), 4);
+
+        assert_eq!(nested(&block, "meta").nesting, NestingMode::Single);
+        assert_eq!(nested(&block, "ingress").nesting, NestingMode::List);
+        assert_eq!(nested(&block, "egress").nesting, NestingMode::Set);
+        assert_eq!(nested(&block, "named").nesting, NestingMode::Map);
+    }
+
+    #[test]
+    fn nested_block_reflects_element_attributes() {
+        let block = reflect_block::<Firewall>().expect("Firewall reflects");
+
+        // The single block's element struct keeps its attribute dispositions.
+        let meta = &nested(&block, "meta").block;
+        assert_eq!(attr(meta, "author").ty, Type::String);
+        assert!(attr(meta, "author").required);
+        assert!(attr(meta, "note").optional, "Option field is optional");
+
+        // The repeatable blocks carry the element struct's attribute.
+        assert!(attr(&nested(&block, "ingress").block, "port").required);
+    }
+
+    #[derive(Facet)]
+    #[allow(dead_code)]
+    struct Level2 {
+        #[facet(terraform::required)]
+        value: String,
+    }
+
+    #[derive(Facet)]
+    #[allow(dead_code)]
+    struct Level1 {
+        #[facet(terraform::required)]
+        label: String,
+        #[facet(terraform::block)]
+        deep: Vec<Level2>,
+    }
+
+    #[derive(Facet)]
+    #[facet(terraform::resource)]
+    #[allow(dead_code)]
+    struct Nested {
+        #[facet(terraform::required)]
+        name: String,
+        #[facet(terraform::block)]
+        level1: Vec<Level1>,
+    }
+
+    #[test]
+    fn blocks_nest_recursively() {
+        let block = reflect_block::<Nested>().expect("Nested reflects");
+        let l1 = &nested(&block, "level1").block;
+        assert!(attr(l1, "label").required);
+        let l2 = &nested(l1, "deep").block;
+        assert_eq!(l2.nested_blocks.len(), 0);
+        assert!(attr(l2, "value").required);
+    }
+
+    #[derive(Facet)]
+    #[facet(terraform::resource)]
+    #[allow(dead_code)]
+    struct BadBlock {
+        #[facet(terraform::block)]
+        oops: String,
+    }
+
+    #[test]
+    fn block_on_non_struct_errors() {
+        let err = reflect_block::<BadBlock>().unwrap_err();
+        assert!(matches!(err, ReflectError::NotAStruct { .. }));
     }
 
     // --- data source projections (search keys) ------------------------------

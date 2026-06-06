@@ -1,0 +1,13 @@
+{
+  "name": "report",
+  "id": "doc:report",
+  "action": "created",
+  "meta": {
+    "author": "alice",
+    "note": "draft"
+  },
+  "sections": [
+    { "heading": "intro", "body": "hello" },
+    { "heading": "body", "body": null }
+  ]
+}

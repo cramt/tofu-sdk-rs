@@ -1,0 +1,9 @@
+{
+  "name": "gamma",
+  "id": "file:gamma",
+  "action": "created",
+  "content": {
+    "hello": "there",
+    "extra": "yes"
+  }
+}

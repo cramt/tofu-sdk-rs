@@ -1,0 +1,9 @@
+{
+  "name": "archive",
+  "id": "doc:archive",
+  "action": "created",
+  "meta": null,
+  "sections": [
+    { "heading": "intro", "body": "world" }
+  ]
+}

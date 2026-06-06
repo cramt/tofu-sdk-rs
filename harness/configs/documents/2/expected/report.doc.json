@@ -1,0 +1,12 @@
+{
+  "name": "report",
+  "id": "doc:report",
+  "action": "updated",
+  "meta": {
+    "author": "alice",
+    "note": "final"
+  },
+  "sections": [
+    { "heading": "intro", "body": "world" }
+  ]
+}

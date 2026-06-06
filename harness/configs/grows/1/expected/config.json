@@ -1,0 +1,8 @@
+{
+  "name": "config",
+  "id": "file:config",
+  "action": "created",
+  "content": {
+    "a": "1"
+  }
+}

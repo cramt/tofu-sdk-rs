@@ -1,0 +1,9 @@
+{
+  "name": "alpha",
+  "id": "file:alpha",
+  "action": "updated",
+  "content": {
+    "hello": "there",
+    "extra": "yes"
+  }
+}

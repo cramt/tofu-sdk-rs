@@ -1,0 +1,9 @@
+{
+  "name": "alpha",
+  "id": "file:alpha",
+  "action": "created",
+  "content": {
+    "hello": "world",
+    "n": "1"
+  }
+}

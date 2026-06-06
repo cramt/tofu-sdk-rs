@@ -183,7 +183,13 @@ fn fill<'f, const B: bool>(
             let mut partial = partial.init_map().map_err(reflect)?;
             if let Some(entries) = mapping(value) {
                 for (key, v) in entries {
-                    partial = partial.begin_object_entry(key).map_err(reflect)?;
+                    // A real `Def::Map` (e.g. `HashMap`) is filled with key/value
+                    // frame pairs — `begin_key`/`begin_value`. `begin_object_entry`
+                    // is reserved for `Def::DynamicValue` objects and errors here.
+                    partial = partial.begin_key().map_err(reflect)?;
+                    partial = fill(partial, &Value::String(key.clone()))?;
+                    partial = partial.end().map_err(reflect)?;
+                    partial = partial.begin_value().map_err(reflect)?;
                     partial = fill(partial, v)?;
                     partial = partial.end().map_err(reflect)?;
                 }
@@ -384,6 +390,51 @@ mod tests {
         items: Vec<String>,
         maybe: Option<String>,
         nope: Option<String>,
+    }
+
+    #[derive(Facet, Debug, PartialEq)]
+    struct WithMaps {
+        tags: std::collections::HashMap<String, String>,
+        labels: Option<std::collections::HashMap<String, String>>,
+    }
+
+    #[test]
+    fn decodes_map_fields_via_key_value_frames() {
+        // Regression: a real `Def::Map` must be filled with `begin_key`/
+        // `begin_value`, not `begin_object_entry` (which is DynamicValue-only and
+        // errors on a `HashMap`). Covers both a bare map and a `Some(map)`.
+        let mut tags = BTreeMap::new();
+        tags.insert("env".to_string(), Value::String("prod".into()));
+        tags.insert("team".to_string(), Value::String("infra".into()));
+        let mut labels = BTreeMap::new();
+        labels.insert("tier".to_string(), Value::String("gold".into()));
+
+        let mut obj = BTreeMap::new();
+        obj.insert("tags".to_string(), Value::Map(tags));
+        obj.insert("labels".to_string(), Value::Map(labels));
+
+        let decoded: WithMaps = from_value(&Value::Object(obj)).expect("decode maps");
+        assert_eq!(decoded.tags.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(decoded.tags.get("team").map(String::as_str), Some("infra"));
+        assert_eq!(
+            decoded
+                .labels
+                .as_ref()
+                .and_then(|m| m.get("tier"))
+                .map(String::as_str),
+            Some("gold"),
+        );
+    }
+
+    #[test]
+    fn decodes_absent_map_as_empty_or_none() {
+        // A null map field decodes to empty (bare) / None (optional).
+        let mut obj = BTreeMap::new();
+        obj.insert("tags".to_string(), Value::Null);
+        obj.insert("labels".to_string(), Value::Null);
+        let decoded: WithMaps = from_value(&Value::Object(obj)).expect("decode");
+        assert!(decoded.tags.is_empty());
+        assert_eq!(decoded.labels, None);
     }
 
     #[test]

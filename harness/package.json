@@ -1,0 +1,17 @@
+{
+  "name": "tofu-sdk-harness",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Iteration-sequence test harness for tofu-sdk-rs: applies sequences of Terraform configs against the example-fs provider and asserts the JSON files it writes.",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "typescript": "^5.6.0",
+    "vitest": "^3.2.0"
+  }
+}

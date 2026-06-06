@@ -105,14 +105,24 @@ impl is a working provider, exercised end-to-end against **real OpenTofu**
   return diagnostics (errors/warnings, optionally pointed at an attribute path)
   on `Validate{Resource,DataResource}Config` — verified by a real `tofu plan`
   that a `validate` hook rejects
+- **Nested blocks ✅** — `#[facet(terraform::block)]` renders a field as an HCL
+  nested block (`name { … }`); the Rust type fixes the nesting mode (struct /
+  `Option<struct>` → single, `Vec` → list, set → set, `HashMap<String, _>` →
+  map) and the element struct is reflected recursively (blocks may contain
+  attributes and further blocks) — verified by a real `tofu apply` over single
+  and list blocks
 
 ### Not yet implemented
 
-HCL nested *block* syntax (nested object/list/map *attributes* work), custom
-plan modification, provider-config validation, functions, ephemeral resources,
-move, and a `TfValue<T>` field wrapper to preserve known/unknown/null through
-decode (today `Unknown` decodes to the type's zero value). Numbers are held as
-`f64`. Not all `cty` corner cases are covered.
+Custom plan modification, attribute defaults, provider-config validation,
+functions, ephemeral resources, move, and a `TfValue<T>` field wrapper to
+preserve known/unknown/null through decode (today `Unknown` decodes to the
+type's zero value). Numbers are held as `f64`. Some nested-block refinements are
+also pending: the planner does not yet mark *computed attributes inside blocks*
+unknown (so keep computed fields at the top level), required single blocks
+(`min_items`) are not distinguished from optional, and data-source projections
+render a `block` field as an object attribute rather than a block. Not all `cty`
+corner cases are covered.
 
 ## Workspace layout
 
