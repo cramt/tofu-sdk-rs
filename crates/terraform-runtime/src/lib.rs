@@ -23,7 +23,7 @@ pub use builder::{
     ProviderBuilder,
 };
 pub use data_source::{DataSource, DataSourceError, DataSourceList};
-pub use resource::{Resource, ResourceError};
+pub use resource::{PlanModifications, Resource, ResourceError};
 pub use serve::{serve, ServeError};
 
 /// The erased, `Value`-oriented handler traits and diagnostic types. These are

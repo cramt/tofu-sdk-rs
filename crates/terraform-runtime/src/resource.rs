@@ -170,6 +170,39 @@ impl From<ResourceError> for Diagnostics {
 /// A collection of diagnostics returned from an erased resource operation.
 pub type Diagnostics = Vec<Diag>;
 
+/// Adjustments a resource's [`Resource::modify_plan`] makes to the
+/// mechanically-produced plan: extra attributes to force replacement, and
+/// computed attributes to mark unknown by custom rule. Both name **top-level**
+/// attributes (nested-block paths are a future refinement).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanModifications {
+    /// Top-level attribute names whose planned change should force replacement,
+    /// in addition to the `force_new` attributes handled mechanically.
+    pub require_replace: Vec<String>,
+    /// Top-level attribute names to mark unknown in the planned state (a value
+    /// the provider will compute by rule during apply).
+    pub unknown: Vec<String>,
+}
+
+impl PlanModifications {
+    /// No modifications (the default).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Force replacement when the named top-level attribute changes.
+    pub fn require_replace(mut self, name: impl Into<String>) -> Self {
+        self.require_replace.push(name.into());
+        self
+    }
+
+    /// Mark the named top-level attribute unknown in the plan.
+    pub fn unknown(mut self, name: impl Into<String>) -> Self {
+        self.unknown.push(name.into());
+        self
+    }
+}
+
 /// A managed resource type.
 ///
 /// Implement this over a `Model` struct that reflects (via `#[derive(Facet)]`)
@@ -242,6 +275,23 @@ pub trait Resource: Send + Sync + 'static {
     async fn validate(&self, _config: Self::Model) -> Vec<Diag> {
         Vec::new()
     }
+
+    /// Adjust the plan after the SDK's mechanical pass (defaults applied,
+    /// `force_new` replacements and computed-unknowns marked). Return
+    /// [`PlanModifications`] to force replacement by custom rule or mark a
+    /// computed attribute unknown.
+    ///
+    /// `prior` is the current state (`None` on create); `proposed` is the planned
+    /// model. Note both decode through the zero-value rule, so a computed field
+    /// that planned as *unknown* reads here as its zero value — compare the
+    /// config-driven fields, not computed ones. Defaults to no modifications.
+    async fn modify_plan(
+        &self,
+        _prior: Option<Self::Model>,
+        _proposed: Self::Model,
+    ) -> Result<PlanModifications, ResourceError> {
+        Ok(PlanModifications::default())
+    }
 }
 
 /// Object-safe, value-oriented form of [`Resource`] that the service dispatches
@@ -256,6 +306,17 @@ pub trait DynResource: Send + Sync {
     async fn import(&self, id: String) -> Result<Value, Diagnostics>;
     async fn upgrade(&self, from_version: i64, prior: Value) -> Result<Value, Diagnostics>;
     async fn validate(&self, config: Value) -> Diagnostics;
+
+    /// Adjust the mechanically-produced plan. `prior` is the prior state (null on
+    /// create), `proposed` the planned value. Defaults to no modifications, so
+    /// dynamic-seam implementors (e.g. the Node binding) need not implement it.
+    async fn modify_plan(
+        &self,
+        _prior: Value,
+        _proposed: Value,
+    ) -> Result<PlanModifications, Diagnostics> {
+        Ok(PlanModifications::default())
+    }
 }
 
 /// Wraps a typed [`Resource`] as an erased [`DynResource`].
@@ -333,5 +394,24 @@ impl<R: Resource> DynResource for ResourceAdapter<R> {
             Ok(model) => self.inner.validate(model).await,
             Err(e) => codec_diag("decode config for validation", e),
         }
+    }
+
+    async fn modify_plan(
+        &self,
+        prior: Value,
+        proposed: Value,
+    ) -> Result<PlanModifications, Diagnostics> {
+        let prior_model = match &prior {
+            Value::Null => None,
+            _ => Some(
+                from_value::<R::Model>(&prior).map_err(|e| codec_diag("decode prior state", e))?,
+            ),
+        };
+        let proposed_model: R::Model =
+            from_value(&proposed).map_err(|e| codec_diag("decode proposed state", e))?;
+        self.inner
+            .modify_plan(prior_model, proposed_model)
+            .await
+            .map_err(Diagnostics::from)
     }
 }

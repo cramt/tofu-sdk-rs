@@ -22,6 +22,8 @@ use terraform_tfplugin6::tfplugin6::{
 };
 use terraform_value::Value;
 
+use crate::resource::PlanModifications;
+
 /// The outcome of planning a single resource change.
 pub struct Plan {
     /// The planned new state.
@@ -139,6 +141,25 @@ fn mark_block_computed_unknown(
             }
             other => other,
         },
+    }
+}
+
+/// Apply a resource's [`PlanModifications`] to the mechanically-produced plan:
+/// mark named top-level attributes unknown and add `require_replace` paths
+/// (deduped against the mechanical ones).
+pub fn apply_modifications(plan: &mut Plan, mods: PlanModifications) {
+    if let Value::Object(fields) = &mut plan.planned {
+        for name in &mods.unknown {
+            if fields.contains_key(name) {
+                fields.insert(name.clone(), Value::Unknown);
+            }
+        }
+    }
+    for name in mods.require_replace {
+        let path = attribute_path(&name);
+        if !plan.requires_replace.contains(&path) {
+            plan.requires_replace.push(path);
+        }
     }
 }
 

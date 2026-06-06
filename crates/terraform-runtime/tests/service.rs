@@ -11,8 +11,8 @@ use std::sync::Arc;
 use facet::Facet;
 use terraform_attrs as terraform;
 use terraform_runtime::{
-    async_trait, ConfigureError, DataSource, DataSourceError, DataSourceList, Diag, Provider,
-    ProviderService, Resource, ResourceError,
+    async_trait, ConfigureError, DataSource, DataSourceError, DataSourceList, Diag,
+    PlanModifications, Provider, ProviderService, Resource, ResourceError,
 };
 use terraform_tfplugin6::tfplugin6::{self, provider_server::Provider as _};
 use tonic::{Code, Request};
@@ -165,6 +165,115 @@ async fn unimplemented_rpc_returns_unimplemented() {
         .await
         .expect_err("move_resource_state is not implemented yet");
     assert_eq!(status.code(), Code::Unimplemented);
+}
+
+/// A resource that forces replacement when its (non-force_new) `tier` changes,
+/// via `modify_plan` — proving the author plan hook runs and feeds back into the
+/// mechanical plan.
+#[derive(Facet)]
+#[facet(terraform::resource("planmod"))]
+#[allow(dead_code)]
+struct PlanMod {
+    #[facet(terraform::required)]
+    name: String,
+    #[facet(terraform::optional)]
+    tier: Option<String>,
+}
+
+struct PlanModResource;
+
+#[async_trait]
+impl Resource for PlanModResource {
+    type Model = PlanMod;
+
+    async fn create(&self, planned: PlanMod) -> Result<PlanMod, ResourceError> {
+        Ok(planned)
+    }
+
+    async fn modify_plan(
+        &self,
+        prior: Option<PlanMod>,
+        proposed: PlanMod,
+    ) -> Result<PlanModifications, ResourceError> {
+        let mods = PlanModifications::new();
+        match prior {
+            Some(prior) if prior.tier != proposed.tier => Ok(mods.require_replace("tier")),
+            _ => Ok(mods),
+        }
+    }
+}
+
+#[tokio::test]
+async fn modify_plan_can_force_replacement() {
+    let svc = Provider::builder()
+        .resource(PlanModResource)
+        .build()
+        .map(ProviderService::new)
+        .expect("provider builds");
+
+    let ty = terraform_value::Type::Object(vec![
+        terraform_value::ObjectAttr {
+            name: "name".into(),
+            ty: terraform_value::Type::String,
+            optional: false,
+        },
+        terraform_value::ObjectAttr {
+            name: "tier".into(),
+            ty: terraform_value::Type::String,
+            optional: true,
+        },
+    ]);
+    let state = |name: &str, tier: &str| {
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(
+            "name".to_string(),
+            terraform_value::Value::String(name.into()),
+        );
+        obj.insert(
+            "tier".to_string(),
+            terraform_value::Value::String(tier.into()),
+        );
+        tfplugin6::DynamicValue {
+            msgpack: terraform_codec::encode_msgpack(&terraform_value::Value::Object(obj), &ty)
+                .unwrap(),
+            json: vec![],
+        }
+    };
+
+    // tier changes silver -> gold: modify_plan forces replacement on `tier`.
+    let plan = svc
+        .plan_resource_change(Request::new(tfplugin6::plan_resource_change::Request {
+            type_name: "planmod".into(),
+            prior_state: Some(state("a", "silver")),
+            proposed_new_state: Some(state("a", "gold")),
+            ..Default::default()
+        }))
+        .await
+        .expect("plan")
+        .into_inner();
+    assert!(plan.diagnostics.is_empty(), "{:?}", plan.diagnostics);
+    assert_eq!(plan.requires_replace.len(), 1, "tier change forces replace");
+    match plan.requires_replace[0].steps[0].selector.as_ref().unwrap() {
+        tfplugin6::attribute_path::step::Selector::AttributeName(n) => assert_eq!(n, "tier"),
+        other => panic!("expected attribute-name step, got {other:?}"),
+    }
+
+    // tier unchanged: no replacement.
+    let plan = svc
+        .plan_resource_change(Request::new(tfplugin6::plan_resource_change::Request {
+            type_name: "planmod".into(),
+            prior_state: Some(state("a", "gold")),
+            proposed_new_state: Some(state("a", "gold")),
+            ..Default::default()
+        }))
+        .await
+        .expect("plan")
+        .into_inner();
+    assert!(
+        plan.requires_replace.is_empty(),
+        "no tier change, no replace: {:?}",
+        plan.requires_replace
+    );
 }
 
 /// A resource whose `create` records whether it observed cancellation, proving

@@ -392,7 +392,29 @@ impl tfplugin6::provider_server::Provider for ProviderService {
             }
         };
 
-        let plan = plan(&prior, proposed, block);
+        let mut plan = plan(&prior, proposed, block);
+
+        // Author plan modification: adjust the mechanical plan (force-replace by
+        // rule, mark computed-by-rule unknown). Skipped when no handler is built
+        // yet (a meta-backed handler exists only after ConfigureProvider).
+        if let Some(handler) = self.provider.resource_handler(&req.type_name) {
+            match self
+                .guard(
+                    "modify_plan",
+                    handler.modify_plan(prior, plan.planned.clone()),
+                )
+                .await
+            {
+                Ok(mods) => crate::plan::apply_modifications(&mut plan, mods),
+                Err(diags) => {
+                    return Ok(Response::new(Resp {
+                        diagnostics: pb_diagnostics(diags),
+                        ..Default::default()
+                    }))
+                }
+            }
+        }
+
         match encode_dynamic(&plan.planned, &ty) {
             Ok(dv) => Ok(Response::new(Resp {
                 planned_state: Some(dv),
