@@ -7,6 +7,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# Optional: derives `Facet` for `TfValue<T>` so it can be a model field. The
+# optional dep implicitly creates a `facet` feature; `terraform-codec` and
+# `terraform-reflect` enable it. Off by default keeps the core lean.
+facet = { workspace = true, optional = true }
 facet-json = { workspace = true }
 facet-value = { workspace = true }
 

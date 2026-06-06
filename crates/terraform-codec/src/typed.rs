@@ -24,6 +24,10 @@ use terraform_value::Value;
 /// A null constant for defaulting absent struct fields.
 const NULL: Value = Value::Null;
 
+/// The type identifier of [`terraform_value::TfValue`], special-cased by the
+/// codec to preserve the known/unknown/null distinction.
+const TFVALUE: &str = "TfValue";
+
 /// Errors from reflecting a Rust value into a [`Value`].
 #[derive(Debug, thiserror::Error)]
 pub enum TypedError {
@@ -52,6 +56,13 @@ fn reflect<E: std::fmt::Display>(e: E) -> TypedError {
 /// Convert a [`Peek`] (a reflected value cursor) into a [`Value`].
 fn peek_to_value(peek: Peek<'_, '_>) -> Result<Value, TypedError> {
     let shape = peek.shape();
+
+    // `TfValue<T>` preserves the known/unknown/null trichotomy that plain types
+    // collapse: Known(inner) -> the inner value, Unknown -> Value::Unknown,
+    // Null -> Value::Null.
+    if shape.type_identifier == TFVALUE {
+        return tfvalue_to_value(peek);
+    }
 
     // Containers and option are recognized by their semantic `Def`.
     match shape.def {
@@ -105,6 +116,22 @@ fn peek_to_value(peek: Peek<'_, '_>) -> Result<Value, TypedError> {
     }
 }
 
+/// Convert a `TfValue<T>` [`Peek`] into a [`Value`], reading its active variant.
+fn tfvalue_to_value(peek: Peek<'_, '_>) -> Result<Value, TypedError> {
+    let en = peek.into_enum().map_err(reflect)?;
+    match en.variant_name_active().map_err(reflect)? {
+        "Known" => {
+            let inner = en
+                .field(0)
+                .map_err(reflect)?
+                .ok_or(TypedError::Unsupported("TfValue::Known payload"))?;
+            peek_to_value(inner)
+        }
+        "Unknown" => Ok(Value::Unknown),
+        _ => Ok(Value::Null),
+    }
+}
+
 /// Convert a scalar [`Peek`] into a [`Value`].
 fn scalar_to_value(peek: &Peek<'_, '_>, scalar: ScalarType) -> Result<Value, TypedError> {
     let value = match scalar {
@@ -152,6 +179,12 @@ fn fill<'f, const B: bool>(
     partial: Partial<'f, B>,
     value: &Value,
 ) -> Result<Partial<'f, B>, TypedError> {
+    // `TfValue<T>` decodes preserving the distinction plain types collapse:
+    // Unknown -> the `Unknown` variant, Null -> `Null`, anything else -> `Known`.
+    if partial.shape().type_identifier == TFVALUE {
+        return fill_tfvalue(partial, value);
+    }
+
     match &partial.shape().def {
         Def::Option(_) => match value {
             Value::Null | Value::Unknown => partial.set_default().map_err(reflect),
@@ -200,6 +233,24 @@ fn fill<'f, const B: bool>(
             FType::User(UserType::Struct(st)) => fill_struct(partial, st.fields, value),
             _ => set_scalar(partial, value),
         },
+    }
+}
+
+/// Fill a `TfValue<T>` partial, selecting the variant from the value's
+/// known/unknown/null state.
+fn fill_tfvalue<'f, const B: bool>(
+    partial: Partial<'f, B>,
+    value: &Value,
+) -> Result<Partial<'f, B>, TypedError> {
+    match value {
+        Value::Unknown => partial.select_variant_named("Unknown").map_err(reflect),
+        Value::Null => partial.select_variant_named("Null").map_err(reflect),
+        inner => {
+            let partial = partial.select_variant_named("Known").map_err(reflect)?;
+            let partial = partial.begin_nth_field(0).map_err(reflect)?;
+            let partial = fill(partial, inner)?;
+            partial.end().map_err(reflect)
+        }
     }
 }
 
@@ -485,6 +536,58 @@ mod tests {
         assert!(!decoded.enabled);
         assert!(decoded.items.is_empty());
         assert_eq!(decoded.maybe, None);
+    }
+
+    #[derive(Facet, Debug, PartialEq)]
+    struct WithTfValue {
+        name: String,
+        token: terraform_value::TfValue<String>,
+        size: terraform_value::TfValue<i64>,
+    }
+
+    #[test]
+    fn tfvalue_preserves_known_unknown_null() {
+        use terraform_value::TfValue;
+
+        // Encode: Known -> inner value, Unknown -> Value::Unknown, Null -> Null.
+        let v = WithTfValue {
+            name: "x".into(),
+            token: TfValue::Known("t".into()),
+            size: TfValue::Unknown,
+        };
+        let Value::Object(fields) = to_value(&v).expect("encode") else {
+            panic!("expected object");
+        };
+        assert_eq!(fields["token"], Value::String("t".into()));
+        assert_eq!(fields["size"], Value::Unknown);
+
+        // Decode each variant back, preserving the distinction a plain type loses.
+        let mut obj = BTreeMap::new();
+        obj.insert("name".to_string(), Value::String("x".into()));
+        obj.insert("token".to_string(), Value::Null);
+        obj.insert("size".to_string(), Value::Unknown);
+        let decoded: WithTfValue = from_value(&Value::Object(obj)).expect("decode");
+        assert_eq!(
+            decoded,
+            WithTfValue {
+                name: "x".into(),
+                token: TfValue::Null,
+                size: TfValue::Unknown,
+            }
+        );
+    }
+
+    #[test]
+    fn tfvalue_known_round_trips() {
+        use terraform_value::TfValue;
+        let original = WithTfValue {
+            name: "rt".into(),
+            token: TfValue::Known("tok".into()),
+            size: TfValue::Known(7),
+        };
+        let value = to_value(&original).unwrap();
+        let back: WithTfValue = from_value(&value).unwrap();
+        assert_eq!(back, original);
     }
 
     #[test]

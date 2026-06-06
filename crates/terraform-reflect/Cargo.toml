@@ -8,7 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 facet = { workspace = true }
-terraform-value = { workspace = true }
+terraform-value = { workspace = true, features = ["facet"] }
 terraform-ir = { workspace = true }
 # Needed to decode the structured `search_key` payload (`terraform_attrs::Attr`)
 # off a field; the unit flags are still read by string key.

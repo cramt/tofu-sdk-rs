@@ -43,6 +43,11 @@ pub use terraform_ir as ir;
 /// Terraform value semantics (the `cty` type system and known/unknown/null).
 pub use terraform_value as value;
 
+/// The known/unknown/null field wrapper. Use `TfValue<T>` for a model field that
+/// must preserve Terraform's "unknown" (computed, not yet resolved) distinctly
+/// from "null" — a plain `T` decodes both to its zero value.
+pub use terraform_value::TfValue;
+
 /// Reflection entry points: Rust types -> provider IR.
 pub use terraform_reflect::{
     data_source_list_name, data_source_name, reflect_block, reflect_data_source,

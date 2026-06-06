@@ -25,6 +25,8 @@ pub use value::Value;
 /// because it depends on something that will only exist after apply). Collapsing
 /// the two is the most common source of planning bugs, so they are distinct
 /// variants here rather than an `Option`.
+#[cfg_attr(feature = "facet", derive(facet::Facet))]
+#[cfg_attr(feature = "facet", repr(u8))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TfValue<T> {
     /// A concrete, known value.

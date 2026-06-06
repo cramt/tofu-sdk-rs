@@ -123,19 +123,21 @@ impl is a working provider, exercised end-to-end against **real OpenTofu**
   and `StopProvider` trips a `CancellationToken` that in-flight handlers can
   observe via `current_cancellation()`
 
+- **Plan modification, defaults & `TfValue<T>` ✅** — an optional attribute can
+  carry a `#[facet(terraform::default("…"))]`; `Resource::modify_plan` adjusts the
+  plan (force-replace by rule, mark computed-by-rule unknown); a `TfValue<T>`
+  field preserves Terraform's known/unknown/null through decode (a plain `T` still
+  zero-value-decodes); and computed attributes *inside nested blocks* are now
+  planned unknown correctly
+
 ### Not yet implemented
 
-Custom plan modification, attribute defaults, and a `TfValue<T>` field wrapper to
-preserve known/unknown/null through decode (today `Unknown` decodes to the
-type's zero value) — these three are the remaining
-[roadmap](docs/ROADMAP.md) item (Tier 1.2). Also pending: provider-defined
-functions, ephemeral resources, and move. Warnings currently ride on a CRUD
-*error*; success-path warnings await the handler ctx from 1.2. Numbers are held
-as `f64`. Some nested-block refinements remain: the planner does not yet mark
-*computed attributes inside blocks* unknown (so keep computed fields at the top
-level), required single blocks (`min_items`) are not distinguished from optional,
-and data-source projections render a `block` field as an object attribute rather
-than a block. Not all `cty` corner cases are covered.
+Provider-defined functions, ephemeral resources, and cross-type state move.
+Warnings currently ride on a CRUD *error*; success-path warnings await a handler
+ctx. Numbers are held as `f64`. Some nested-block refinements remain: required
+single blocks (`min_items`) are not distinguished from optional, and data-source
+projections render a `block` field as an object attribute rather than a block.
+Not all `cty` corner cases are covered.
 
 ## Workspace layout
 

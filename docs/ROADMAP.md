@@ -21,11 +21,18 @@ nested blocks, resource/data-source **name inference**, `sensitive`,
 safety** (2.1), **attribute-pathed CRUD errors + warnings** (2.2), **`tracing` →
 Terraform JSON log bridge** (2.3), and **`StopProvider` + cancellation** (3.1).
 
-**Status: the "landed" cut is done except Tier 1.2** (plan modification +
-defaults + `TfValue<T>`). 1.1/1.3/2.1/2.2/2.3/3.1 all merged and verified against
-real OpenTofu (`cargo test --workspace` green, including the `tofu test` e2e).
-Remaining caveat from 2.2: CRUD warnings ride on `ResourceError` (warnings *with*
-an error); success-path warnings await the handler ctx introduced in 1.2.
+**Status: the full "landed" cut is COMPLETE** — Tier 1 (all), Tier 2 (all), and
+StopProvider/cancellation. 1.1/1.2/1.3/2.1/2.2/2.3/3.1 all merged and verified
+against real OpenTofu (`cargo test --workspace` green, including the `tofu test`
+e2e). Tier 1.2 shipped its three pieces: attribute defaults, `Resource::
+modify_plan`, computed-attr-in-block consistency, and the `TfValue<T>` field
+wrapper (known/unknown/null preserved through decode).
+
+Remaining caveats (additive, not part of the landed cut): CRUD success-path
+warnings (2.2 carries warnings only alongside an *error* today); `modify_plan`
+operates on top-level attribute names and decodes the proposed model through the
+zero-value rule (use `TfValue<T>` fields to read unknowns); a no-arg handler ctx
+unifying cancellation + private state is a future refinement.
 
 ## How to verify (the four test layers)
 
@@ -94,7 +101,22 @@ becomes a config diagnostic. `dyn_configure` unchanged.
 - **Done when:** an author can write `configure(|cfg| async { Err(..) })` and the
   diagnostic reaches Terraform.
 
-### 1.2 Plan modification + attribute defaults + `TfValue<T>`
+### 1.2 Plan modification + attribute defaults + `TfValue<T>` — ✅ DONE
+Shipped all three pieces:
+- **`TfValue<T>`** (`terraform-value`, feature-gated `Facet` derive): a model
+  field typed `TfValue<T>` round-trips `Known`/`Unknown`/`Null` through the codec
+  (special-cased by type identifier in `terraform-codec`) and reflects to `T`'s
+  cty type as a nullable attribute (`terraform-reflect`). Re-exported as
+  `terraform_provider::TfValue`. Plain `T` still zero-value-decodes.
+- **Defaults**: `AttributeSchema.default: Option<Value>` from
+  `#[facet(terraform::default("…"))]` (parsed per cty type); applied in the
+  planner to unset optional attributes, ahead of computed-unknown marking.
+- **`Resource::modify_plan(prior, proposed) -> PlanModifications`**: force-replace
+  by rule / mark computed-by-rule unknown, folded into the mechanical plan. New
+  defaulted `DynResource::modify_plan` (Node binding unaffected).
+- **Computed-in-block consistency**: `mark_computed_unknown` recurses into nested
+  blocks, so the README/AGENTS limitation note no longer applies.
+
 The big one; three intertwined pieces. Can land incrementally.
 
 - **Why:** defaults are table-stakes; plan logic (computed-by-rule, diff

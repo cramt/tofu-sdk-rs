@@ -41,7 +41,8 @@ cargo test --workspace
 ## Crate layout & dependency direction
 
 ```
-terraform-value     cty Type, dynamic Value tree, TfValue (no deps)
+terraform-value     cty Type, dynamic Value tree, TfValue (only an optional
+                    `facet` feature to derive Facet on TfValue; off by default)
 terraform-ir        provider IR  (depends on value only)
 terraform-attrs     the `terraform` facet attribute namespace (its own crate, see below)
 terraform-reflect   facet::Shape -> IR
@@ -143,16 +144,31 @@ entirely TS-side; it compiles down to the same cty-JSON the addon already takes.
   `NestedBlock` (HCL `name { … }`). The IR, the `tfplugin6` emitter, and the
   codec already handle blocks — a block is just an object/list/set/map on the
   wire — so block support lives entirely in `reader.rs::nested_block_from_field`.
-  Limitations: `plan.rs` only walks top-level `block.attributes`, so a *computed*
-  attribute inside a block is **not** marked unknown (keep computed fields at the
-  top level, or you'll trip "inconsistent result after apply"); required single
-  blocks aren't distinguished (`min_items` is always 0); and the data-source
-  projection (`model_attributes`) ignores the marker, rendering a block field as
-  an object attribute.
+  `plan.rs::mark_computed_unknown` now **recurses into nested blocks**, so a
+  *computed* attribute inside a block is marked unknown correctly. Remaining
+  limitations: required single blocks aren't distinguished (`min_items` is always
+  0); and the data-source projection (`model_attributes`) ignores the marker,
+  rendering a block field as an object attribute.
 - **Decode of `Unknown`/null-on-non-`Option` → the type's zero value.** Plain
   Rust types can't hold "unknown"; resource handlers fill computed fields, so
-  this is fine in practice. A `TfValue<T>` wrapper to preserve the distinction
-  is a future refinement.
+  this is fine in practice. Use **`TfValue<T>`** (`terraform-value`, re-exported
+  as `terraform_provider::TfValue`) for a field that must preserve the
+  known/unknown/null distinction through decode — it's special-cased by type
+  identifier in `terraform-codec` (`fill_tfvalue`/`tfvalue_to_value`) and
+  `terraform-reflect` (`tfvalue_inner`, maps to the inner `T`'s cty type as a
+  nullable attribute). The `Facet` derive on `TfValue` is gated behind
+  terraform-value's optional `facet` feature (codec/reflect enable it).
+- **Attribute defaults** come from `#[facet(terraform::default("…"))]` (a
+  struct-payload attr → its consumer crate needs `terraform-attrs` directly). The
+  literal is parsed against the attribute's cty type in `reader.rs::field_default`
+  and applied by the planner to unset optional attributes; defaults are **not**
+  emitted into the schema (Terraform has no schema-level default). Note IR types
+  are now `PartialEq` but **not `Eq`** (an `AttributeSchema.default` holds a
+  `Value`, hence `f64`).
+- **`Resource::modify_plan`** runs after the mechanical plan and returns
+  `PlanModifications` (top-level attr names to force-replace / mark unknown). It
+  is a defaulted `DynResource` method, so the Node binding and other seam
+  implementors need no change.
 - **Numbers are `f64`** in the `Value` tree (lossy for very large/precise
   numbers; fine for real configs).
 - **auto-mTLS is server-auth-only.** tonic's `client_ca_root` is

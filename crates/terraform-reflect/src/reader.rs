@@ -352,11 +352,27 @@ fn struct_fields(shape: &'static Shape) -> Result<&'static [Field], ReflectError
     }
 }
 
+/// The inner type `T` of a `TfValue<T>` shape, or `None` for any other type.
+/// `TfValue<T>` is the known/unknown/null wrapper from `terraform-value`; for
+/// schema purposes it behaves exactly like its inner `T`, but (like `Option`)
+/// makes the attribute nullable.
+fn tfvalue_inner(shape: &'static Shape) -> Option<&'static Shape> {
+    if shape.type_identifier != "TfValue" {
+        return None;
+    }
+    let FType::User(UserType::Enum(en)) = &shape.ty else {
+        return None;
+    };
+    let known = en.variants.iter().find(|v| v.name == "Known")?;
+    Some(known.data.fields.first()?.shape())
+}
+
 /// Lower a single struct field into an [`AttributeSchema`].
 fn attribute_from_field(field: &'static Field) -> Result<AttributeSchema, ReflectError> {
     let name = field.rename.unwrap_or(field.name).to_string();
     let shape = field.shape();
-    let is_option = matches!(shape.def, Def::Option(_));
+    // `Option<T>` and `TfValue<T>` are both nullable wrappers for inference.
+    let is_option = matches!(shape.def, Def::Option(_)) || tfvalue_inner(shape).is_some();
     let ty = map_type(shape, &name)?;
 
     // Explicit `#[facet(terraform::...)]` flags take precedence.
@@ -431,6 +447,12 @@ fn description(field: &Field) -> Option<String> {
 ///
 /// `field_path` is used only to produce useful error messages.
 fn map_type(shape: &'static Shape, field_path: &str) -> Result<Type, ReflectError> {
+    // `TfValue<T>` maps to its inner `T`'s cty type (the wrapper only carries the
+    // known/unknown/null distinction, which is value-level, not type-level).
+    if let Some(inner) = tfvalue_inner(shape) {
+        return map_type(inner, field_path);
+    }
+
     // Collections and option are recognized by their semantic `Def`.
     match &shape.def {
         Def::List(d) => return Ok(Type::list(map_type(d.t, field_path)?)),
@@ -473,7 +495,9 @@ fn object_type(fields: &'static [Field], field_path: &str) -> Result<Type, Refle
         let name = field.rename.unwrap_or(field.name);
         let path = format!("{field_path}.{name}");
         let shape = field.shape();
-        let optional = matches!(shape.def, Def::Option(_)) || field.has_attr(Some(NS), "optional");
+        let optional = matches!(shape.def, Def::Option(_))
+            || tfvalue_inner(shape).is_some()
+            || field.has_attr(Some(NS), "optional");
         attrs.push(ObjectAttr {
             name: name.to_string(),
             ty: map_type(shape, &path)?,
@@ -579,6 +603,32 @@ mod tests {
         assert_eq!(attr(&block, "retries").default, Some(Value::Number(3.0)));
         assert_eq!(attr(&block, "enabled").default, Some(Value::Bool(true)));
         assert_eq!(attr(&block, "name").default, None);
+    }
+
+    #[derive(Facet)]
+    #[facet(terraform::resource)]
+    #[allow(dead_code)]
+    struct WithTfValue {
+        #[facet(terraform::required)]
+        name: String,
+        // A `TfValue<T>` field reflects to T's cty type and is nullable
+        // (optional), like an `Option`.
+        token: terraform_value::TfValue<String>,
+        #[facet(terraform::computed)]
+        size: terraform_value::TfValue<i64>,
+    }
+
+    #[test]
+    fn tfvalue_field_maps_to_inner_type_and_is_optional() {
+        let block = reflect_block::<WithTfValue>().expect("WithTfValue reflects");
+        let token = attr(&block, "token");
+        assert_eq!(token.ty, Type::String, "TfValue<String> -> string");
+        assert!(token.optional, "TfValue field is nullable -> optional");
+        assert!(!token.required);
+
+        let size = attr(&block, "size");
+        assert_eq!(size.ty, Type::Number, "TfValue<i64> -> number");
+        assert!(size.computed);
     }
 
     #[derive(Facet)]
