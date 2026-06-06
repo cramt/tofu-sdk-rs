@@ -26,9 +26,11 @@ use facet::Facet;
 use terraform_provider::terraform;
 use terraform_runtime::{async_trait, serve, Provider, Resource, ResourceError};
 
-/// The resource's schema, reflected from a plain Rust struct.
+/// The resource's schema, reflected from a plain Rust struct. The name comes
+/// from the marker; bare `#[facet(terraform::resource)]` would infer it as
+/// `snake_case` of the struct (`bucket`).
 #[derive(Facet)]
-#[facet(terraform::resource)]
+#[facet(terraform::resource("aws_s3_bucket"))]
 struct Bucket {
     #[facet(terraform::required)]
     #[facet(terraform::force_new)]
@@ -55,7 +57,7 @@ impl Resource for BucketResource {
 #[tokio::main]
 async fn main() {
     let provider = Provider::builder()
-        .resource("aws_s3_bucket", BucketResource)
+        .resource(BucketResource) // name comes from the `Bucket` model's marker
         .build()
         .expect("provider definition is valid");
     serve(provider).await.expect("serve");

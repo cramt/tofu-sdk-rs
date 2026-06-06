@@ -13,8 +13,8 @@
 mod reader;
 
 pub use reader::{
-    reflect_block, reflect_data_source, reflect_data_source_list, reflect_resource,
-    PluralDataSource, ReflectError,
+    data_source_name, reflect_block, reflect_data_source, reflect_data_source_list,
+    reflect_resource, resource_name, PluralDataSource, ReflectError,
 };
 
 #[cfg(test)]

@@ -80,6 +80,64 @@ pub fn reflect_resource<T: Facet<'static>>(
     })
 }
 
+/// The Terraform type name for a resource model: the explicit name from
+/// `#[facet(terraform::resource("name"))]` if present, otherwise the struct
+/// identifier converted to `snake_case` (e.g. `AwsS3Bucket` → `aws_s3_bucket`).
+pub fn resource_name<T: Facet<'static>>() -> String {
+    container_name(T::SHAPE, "resource")
+}
+
+/// The Terraform type name for a data source model — the explicit name from
+/// `#[facet(terraform::data_source("name"))]`, else `snake_case(Ident)`.
+pub fn data_source_name<T: Facet<'static>>() -> String {
+    container_name(T::SHAPE, "data_source")
+}
+
+/// Resolve a container's Terraform name: the optional string payload of the
+/// `terraform::<key>` attribute, else the snake-cased struct identifier.
+fn container_name(shape: &'static Shape, key: &str) -> String {
+    explicit_name(shape, key).unwrap_or_else(|| to_snake_case(shape.type_identifier))
+}
+
+/// The explicit name from a `#[facet(terraform::<key>("name"))]` container
+/// attribute, if one was given. A bare `#[facet(terraform::<key>)]` (or no such
+/// attribute) yields `None`.
+fn explicit_name(shape: &'static Shape, key: &str) -> Option<String> {
+    let attr = shape
+        .attributes
+        .iter()
+        .find(|a| a.ns == Some(NS) && a.key == key)?;
+    // The attribute decodes to the grammar enum; both container markers carry an
+    // `Option<&'static str>` name (`None` for the bare `resource` form).
+    let name = match attr.get_as::<TfAttr>()? {
+        TfAttr::Resource(name) | TfAttr::DataSource(name) => *name,
+        _ => return None,
+    };
+    name.map(str::to_string)
+}
+
+/// Convert a PascalCase/CamelCase identifier to `snake_case`. An underscore is
+/// inserted before an uppercase letter that follows a lowercase letter or digit,
+/// or that begins a new word after an acronym (an uppercase run followed by a
+/// lowercase letter). Digits stay attached to the preceding token.
+fn to_snake_case(ident: &str) -> String {
+    let chars: Vec<char> = ident.chars().collect();
+    let mut out = String::with_capacity(ident.len() + 4);
+    for (i, &c) in chars.iter().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            let prev = chars[i - 1];
+            let next_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+            // boundary after a lowercase/digit, or before the last letter of an
+            // acronym that starts the next word (e.g. the `B` in `S3Bucket`).
+            if prev.is_lowercase() || prev.is_numeric() || (prev.is_uppercase() && next_lower) {
+                out.push('_');
+            }
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
+}
+
 /// Cardinality of a data source search key.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SearchKind {
@@ -633,6 +691,44 @@ mod tests {
     fn block_on_non_struct_errors() {
         let err = reflect_block::<BadBlock>().unwrap_err();
         assert!(matches!(err, ReflectError::NotAStruct { .. }));
+    }
+
+    // --- resource name resolution ------------------------------------------
+
+    #[derive(Facet)]
+    #[facet(terraform::resource("aws_s3_bucket"))]
+    #[allow(dead_code)]
+    struct NamedResource {
+        #[facet(terraform::required)]
+        id: String,
+    }
+
+    #[derive(Facet)]
+    #[facet(terraform::resource)]
+    #[allow(dead_code)]
+    struct AwsS3Bucket {
+        #[facet(terraform::required)]
+        id: String,
+    }
+
+    #[test]
+    fn resource_name_prefers_explicit_attribute() {
+        assert_eq!(resource_name::<NamedResource>(), "aws_s3_bucket");
+    }
+
+    #[test]
+    fn resource_name_infers_snake_case_from_struct() {
+        // No explicit name: fall back to snake_case of the struct identifier,
+        // keeping the digit attached (`AwsS3Bucket` -> `aws_s3_bucket`).
+        assert_eq!(resource_name::<AwsS3Bucket>(), "aws_s3_bucket");
+    }
+
+    #[test]
+    fn snake_case_conversion_cases() {
+        assert_eq!(to_snake_case("Bucket"), "bucket");
+        assert_eq!(to_snake_case("FileModel"), "file_model");
+        assert_eq!(to_snake_case("AwsS3Bucket"), "aws_s3_bucket");
+        assert_eq!(to_snake_case("HTTPServer"), "http_server");
     }
 
     // --- data source projections (search keys) ------------------------------

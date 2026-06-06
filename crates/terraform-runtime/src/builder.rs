@@ -27,7 +27,7 @@ use facet::Facet;
 use terraform_codec::from_value;
 use terraform_ir::{Block, DataSourceSchema, ProviderSchema, ResourceSchema};
 use terraform_reflect::{
-    reflect_block, reflect_data_source, reflect_data_source_list, reflect_resource,
+    reflect_block, reflect_data_source, reflect_data_source_list, reflect_resource, resource_name,
     PluralDataSource, ReflectError,
 };
 use terraform_value::{Type, Value};
@@ -255,8 +255,12 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
     /// Register a managed resource type under `name` with its `handler`. Use this
     /// for resources that need no provider configuration; for resources that need
     /// the configured meta, use [`ProviderBuilder::resource_with`].
-    pub fn resource<R: Resource>(mut self, name: impl Into<String>, handler: R) -> Self {
-        let name = name.into();
+    ///
+    /// The type name comes from the model: an explicit
+    /// `#[facet(terraform::resource("name"))]`, or `snake_case` of the struct
+    /// identifier when none is given.
+    pub fn resource<R: Resource>(mut self, handler: R) -> Self {
+        let name = resource_name::<R::Model>();
         match reflect_resource::<R::Model>(name.clone()) {
             Ok(mut resource) => {
                 resource.version = R::SCHEMA_VERSION;
@@ -273,14 +277,15 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
     /// provider meta. `factory` receives the shared `Arc<M>` produced by
     /// [`ProviderBuilder::configure`] and returns the resource handler.
     ///
+    /// The type name comes from the model (see [`ProviderBuilder::resource`]).
     /// Requires a [`ProviderBuilder::configure`] step (which fixes `M`); building
     /// without one is a [`BuildError::MissingConfigure`].
-    pub fn resource_with<R, F>(mut self, name: impl Into<String>, factory: F) -> Self
+    pub fn resource_with<R, F>(mut self, factory: F) -> Self
     where
         R: Resource,
         F: Fn(Arc<M>) -> R + Send + Sync + 'static,
     {
-        let name = name.into();
+        let name = resource_name::<R::Model>();
         match reflect_resource::<R::Model>(name.clone()) {
             Ok(mut resource) => {
                 resource.version = R::SCHEMA_VERSION;

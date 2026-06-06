@@ -48,7 +48,7 @@ struct FsClient {
 /// `content` is an arbitrary string map written verbatim; `id` is a computed
 /// identifier derived from the name.
 #[derive(Facet)]
-#[facet(terraform::resource)]
+#[facet(terraform::resource("fs_file"))]
 struct FileModel {
     /// The file stem under `output_dir` (`<name>.json`). Renaming forces replace.
     #[facet(terraform::required)]
@@ -169,7 +169,7 @@ struct Section {
 
 /// A document resource whose schema uses nested blocks.
 #[derive(Facet)]
-#[facet(terraform::resource)]
+#[facet(terraform::resource("fs_document"))]
 struct DocumentModel {
     /// The file stem under `output_dir` (`<name>.doc.json`). Renaming replaces.
     #[facet(terraform::required)]
@@ -275,10 +275,8 @@ async fn main() {
                 output_dir: PathBuf::from(cfg.output_dir),
             })
         })
-        .resource_with("fs_file", |client: Arc<FsClient>| FileHandler { client })
-        .resource_with("fs_document", |client: Arc<FsClient>| DocumentHandler {
-            client,
-        })
+        .resource_with(|client: Arc<FsClient>| FileHandler { client })
+        .resource_with(|client: Arc<FsClient>| DocumentHandler { client })
         .build()
         .expect("provider definition is valid");
 

@@ -112,6 +112,17 @@ entirely TS-side; it compiles down to the same cty-JSON the addon already takes.
   `define_attr_grammar!` emits a `#[macro_export]` dispatcher that cannot be
   used by path within its own crate (rust-lang/rust#52234). Authors alias it as
   `terraform` (re-exported via `terraform-provider`).
+- **Resource type names come from the model, not the builder.**
+  `ProviderBuilder::resource` / `resource_with` take no name; it is resolved by
+  `terraform_reflect::resource_name::<Model>()` — an explicit
+  `#[facet(terraform::resource("aws_s3_bucket"))]`, else `snake_case` of the
+  struct identifier. Because `resource("…")` now carries a payload, it is a
+  *struct-payload* attribute (like `search_key`), so any crate that writes the
+  named form must depend on `terraform-attrs` directly (bare
+  `#[facet(terraform::resource)]` still works through the re-export alone).
+  Data sources keep explicit names on the builder — one model can project to a
+  singular and a (differently-named) plural data source, so the name can't be
+  inferred from the type alone.
 - **`reflect` feature**: `terraform-codec` enables facet's `reflect` feature for
   `Peek`/`Partial`.
 - **Decoding a `Def::Map` (`HashMap`) uses `begin_key`/`begin_value`, not

@@ -52,7 +52,7 @@ struct AwsClient {
 /// independent — a field can be computed on the resource yet an input on a data
 /// source.
 #[derive(Facet)]
-#[facet(terraform::resource)]
+#[facet(terraform::resource("aws_s3_bucket"))]
 #[facet(terraform::data_source)]
 #[allow(dead_code)]
 struct Bucket {
@@ -179,9 +179,7 @@ async fn main() {
                 region: cfg.region.unwrap_or_else(|| "us-east-1".to_string()),
             })
         })
-        .resource_with("aws_s3_bucket", |client: Arc<AwsClient>| BucketResource {
-            client,
-        })
+        .resource_with(|client: Arc<AwsClient>| BucketResource { client })
         .data_source_with("aws_s3_bucket", |client: Arc<AwsClient>| BucketByArn {
             client,
         })

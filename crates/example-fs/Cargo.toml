@@ -22,6 +22,11 @@ facet = { workspace = true }
 facet-json = { workspace = true }
 terraform-provider = { workspace = true }
 terraform-runtime = { workspace = true }
+# A struct-payload attribute (`resource("name")`) expands to code that names the
+# `terraform_attrs` crate by path, so it must be a direct dependency (the same
+# pattern as `search_key`). Unit attributes work through the
+# `terraform_provider::terraform` re-export alone.
+terraform-attrs = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [lints]

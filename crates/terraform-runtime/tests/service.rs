@@ -18,7 +18,7 @@ use terraform_tfplugin6::tfplugin6::{self, provider_server::Provider as _};
 use tonic::{Code, Request};
 
 #[derive(Facet)]
-#[facet(terraform::resource)]
+#[facet(terraform::resource("aws_s3_bucket"))]
 #[allow(dead_code)]
 struct Bucket {
     /// The name of the bucket.
@@ -92,7 +92,7 @@ impl DataSourceList for ServersByCluster {
 
 fn service() -> ProviderService {
     let provider = Provider::builder()
-        .resource("aws_s3_bucket", BucketResource)
+        .resource(BucketResource)
         .data_source("aws_s3_bucket", BucketLookupDataSource)
         .data_source_list("servers", ServersByCluster)
         .build()
@@ -420,7 +420,7 @@ struct AwsClient {
 
 /// A resource that stamps the configured region onto itself.
 #[derive(Facet)]
-#[facet(terraform::resource)]
+#[facet(terraform::resource("region_bucket"))]
 #[allow(dead_code)]
 struct RegionBucket {
     #[facet(terraform::required)]
@@ -452,9 +452,7 @@ fn configured_service() -> ProviderService {
                 region: cfg.region.unwrap_or_else(|| "us-east-1".to_string()),
             })
         })
-        .resource_with("region_bucket", |client: Arc<AwsClient>| RegionResource {
-            client,
-        })
+        .resource_with(|client: Arc<AwsClient>| RegionResource { client })
         .build()
         .expect("configured provider builds");
     ProviderService::new(provider)

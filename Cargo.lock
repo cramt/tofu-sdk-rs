@@ -273,6 +273,7 @@ version = "0.0.0"
 dependencies = [
  "facet",
  "facet-json",
+ "terraform-attrs",
  "terraform-provider",
  "terraform-runtime",
  "tokio",

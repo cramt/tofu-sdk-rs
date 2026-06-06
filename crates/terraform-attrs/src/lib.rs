@@ -54,10 +54,14 @@ facet::define_attr_grammar! {
         /// struct is reflected recursively, so blocks may contain attributes and
         /// further nested blocks.
         Block,
-        /// Marks a struct as a managed resource.
-        Resource,
-        /// Marks a struct as a data source.
-        DataSource,
+        /// Marks a struct as a managed resource. An optional positional name
+        /// overrides the type name the runtime would otherwise infer from the
+        /// struct identifier: `#[facet(terraform::resource("aws_s3_bucket"))]`,
+        /// or bare `#[facet(terraform::resource)]` to infer `snake_case(Ident)`.
+        Resource(Option<&'static str>),
+        /// Marks a struct as a data source, with the same optional name override
+        /// as [`Attr::Resource`].
+        DataSource(Option<&'static str>),
         /// Marks a field as a data source lookup key. The [`SearchKey`] payload
         /// records the cardinality of a match:
         ///
