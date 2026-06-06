@@ -267,3 +267,8 @@ printf 'terraform { required_providers { aws = { source = "example/aws" } } }\n'
 
 The 5-phase MVP is complete and verified against real OpenTofu. See the README
 "Not yet implemented" section for what is intentionally missing.
+
+**What to build next is tracked in [docs/ROADMAP.md](docs/ROADMAP.md)** — a
+tiered backlog with per-feature context (current state, file/symbol anchors,
+design sketch, gotchas, how to verify) written so a fresh session can pick up any
+item cold. Start there before adding a feature.
