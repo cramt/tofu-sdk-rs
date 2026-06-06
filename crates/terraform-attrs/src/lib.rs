@@ -47,6 +47,12 @@ facet::define_attr_grammar! {
         ForceNew,
         /// The value is sensitive and should be redacted.
         Sensitive,
+        /// A default applied during planning when the caller leaves this optional
+        /// attribute unset. The payload is the default written as a string literal
+        /// (`#[facet(terraform::default("us-east-1")]`); `terraform-reflect` parses
+        /// it against the attribute's `cty` type — a number literal for a number
+        /// attribute, `true`/`false` for a bool, otherwise the string verbatim.
+        Default(Option<&'static str>),
         /// Render this field as a nested *block* (HCL `name { … }` syntax) rather
         /// than an attribute. The field's Rust type fixes the nesting mode:
         /// a struct (or `Option<struct>`) is a single block, `Vec<struct>` a

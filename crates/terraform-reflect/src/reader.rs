@@ -5,7 +5,7 @@ use terraform_attrs::Attr as TfAttr;
 use terraform_ir::{
     AttributeSchema, Block, DataSourceSchema, NestedBlock, NestingMode, ResourceSchema,
 };
-use terraform_value::{ObjectAttr, Type};
+use terraform_value::{ObjectAttr, Type, Value};
 
 /// The facet namespace string for our extension attributes.
 const NS: &str = "terraform";
@@ -377,6 +377,8 @@ fn attribute_from_field(field: &'static Field) -> Result<AttributeSchema, Reflec
         }
     }
 
+    let default = field_default(field, &ty);
+
     Ok(AttributeSchema {
         name,
         ty,
@@ -386,7 +388,24 @@ fn attribute_from_field(field: &'static Field) -> Result<AttributeSchema, Reflec
         computed,
         sensitive,
         force_new,
+        default,
     })
+}
+
+/// Read a field's `#[facet(terraform::default("…")]` and parse the literal
+/// against the attribute's `cty` type: a number for [`Type::Number`], `true`/
+/// `false` for [`Type::Bool`], otherwise the string verbatim. An unparseable
+/// numeric/bool literal yields no default (the schema still builds).
+fn field_default(field: &'static Field, ty: &Type) -> Option<Value> {
+    let attr = field.get_attr(Some(NS), "default")?;
+    let TfAttr::Default(Some(literal)) = attr.get_as::<TfAttr>()? else {
+        return None;
+    };
+    match ty {
+        Type::Number => literal.parse::<f64>().ok().map(Value::Number),
+        Type::Bool => literal.parse::<bool>().ok().map(Value::Bool),
+        _ => Some(Value::String(literal.to_string())),
+    }
 }
 
 /// Join a field's doc-comment lines into an optional description.
@@ -531,6 +550,35 @@ mod tests {
         assert_eq!(retention.ty, Type::Number);
         assert!(retention.optional);
         assert!(!retention.required);
+    }
+
+    #[derive(Facet)]
+    #[facet(terraform::resource)]
+    #[allow(dead_code)]
+    struct WithDefaults {
+        #[facet(terraform::required)]
+        name: String,
+        #[facet(terraform::optional)]
+        #[facet(terraform::default("us-east-1"))]
+        region: Option<String>,
+        #[facet(terraform::optional)]
+        #[facet(terraform::default("3"))]
+        retries: Option<i64>,
+        #[facet(terraform::optional)]
+        #[facet(terraform::default("true"))]
+        enabled: Option<bool>,
+    }
+
+    #[test]
+    fn default_literal_parses_against_attribute_type() {
+        let block = reflect_block::<WithDefaults>().expect("WithDefaults reflects");
+        assert_eq!(
+            attr(&block, "region").default,
+            Some(Value::String("us-east-1".into()))
+        );
+        assert_eq!(attr(&block, "retries").default, Some(Value::Number(3.0)));
+        assert_eq!(attr(&block, "enabled").default, Some(Value::Bool(true)));
+        assert_eq!(attr(&block, "name").default, None);
     }
 
     #[derive(Facet)]

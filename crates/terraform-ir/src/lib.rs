@@ -11,11 +11,14 @@
 //!                                                  ->  (future) TS / Ruby / WASM
 //! ```
 
-use terraform_value::{ObjectAttr, Type};
+use terraform_value::{ObjectAttr, Type, Value};
 
 /// The complete schema for a provider: its own configuration plus every resource
 /// and data source it exposes.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// These IR types are `PartialEq` but not `Eq`: an [`AttributeSchema`] can carry
+/// a `default` [`Value`], and `Value` holds `f64` (no total equality).
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ProviderSchema {
     /// Provider-level configuration block (e.g. credentials, region).
     pub provider: Option<Block>,
@@ -26,7 +29,7 @@ pub struct ProviderSchema {
 }
 
 /// A managed resource type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResourceSchema {
     /// Fully-qualified type name, e.g. `aws_s3_bucket`.
     pub name: String,
@@ -39,7 +42,7 @@ pub struct ResourceSchema {
 }
 
 /// A data source type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DataSourceSchema {
     /// Fully-qualified type name, e.g. `aws_s3_bucket`.
     pub name: String,
@@ -51,7 +54,7 @@ pub struct DataSourceSchema {
 ///
 /// Mirrors the Terraform notion of a schema block, but without any protocol
 /// encoding concerns.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Block {
     /// Scalar / collection attributes declared directly on this block.
     pub attributes: Vec<AttributeSchema>,
@@ -96,7 +99,7 @@ impl Block {
 }
 
 /// A single attribute within a [`Block`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AttributeSchema {
     /// Attribute name as written in configuration.
     pub name: String,
@@ -114,6 +117,11 @@ pub struct AttributeSchema {
     pub sensitive: bool,
     /// Changing this attribute forces resource replacement.
     pub force_new: bool,
+    /// A default value applied during planning when the caller leaves an
+    /// optional attribute unset (null). Not emitted into the Terraform schema —
+    /// Terraform has no schema-level default; the provider applies it in the
+    /// planner.
+    pub default: Option<Value>,
 }
 
 impl AttributeSchema {
@@ -128,6 +136,7 @@ impl AttributeSchema {
             computed: false,
             sensitive: false,
             force_new: false,
+            default: None,
         }
     }
 }
@@ -146,7 +155,7 @@ pub enum NestingMode {
 }
 
 /// A nested block within a [`Block`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NestedBlock {
     /// Block type name, e.g. `lifecycle_rule`.
     pub name: String,

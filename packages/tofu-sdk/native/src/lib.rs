@@ -95,6 +95,8 @@ fn block_from_schema_json(json: &str) -> std::result::Result<Block, String> {
             computed: flag("computed"),
             sensitive: flag("sensitive"),
             force_new: flag("forceNew"),
+            // The TS layer applies its own defaults; the Rust seam takes none.
+            default: None,
         });
     }
     Ok(Block {
