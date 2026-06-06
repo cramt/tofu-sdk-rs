@@ -34,6 +34,40 @@ operates on top-level attribute names and decodes the proposed model through the
 zero-value rule (use `TfValue<T>` fields to read unknowns); a no-arg handler ctx
 unifying cancellation + private state is a future refinement.
 
+## Beyond "landed": real-provider readiness gaps
+
+"Landed" makes a *small/medium* provider over a REST/SaaS API shippable today
+(string/bool/list/map/object/nested-block fields; numbers that fit in 53 bits).
+The items below are what a *large or precision-sensitive* provider (think
+`aws`/`google`) hits in practice. None reshape the public API; all are additive.
+Rough priority order, each pointing at its tracked item:
+
+1. **`f64` numbers — silent precision loss (highest priority, correctness).**
+   `Value::Number` is `f64`, so 64-bit IDs, large byte counts, and
+   high-precision decimals lose precision above 2^53 *with no error*. cty is
+   arbitrary-precision (`big.Float`). This can silently corrupt real state — it
+   is the single most important blocker for a serious provider. → **3.3**.
+2. **Success-path warnings.** Warnings only ride alongside a CRUD *error* today;
+   real providers warn on successful applies (deprecations, drift hints). Needs
+   the handler ctx. → **2.2 (deferred)** + ctx work in **3.4**.
+3. **Plan modification depth.** `modify_plan` sees top-level attribute names only
+   and decodes the proposed model via the zero-value rule. Real plan logic
+   (diff suppression, nested computed-by-rule, known-after-apply on nested
+   attributes) needs richer typed access. → new **3.5**.
+4. **Semantic equality / normalization.** No hook to treat
+   differently-encoded-but-equal values (reordered JSON, equivalent set
+   ordering, case-insensitive IDs) as unchanged, so providers surface spurious
+   diffs. → new **3.6**.
+5. **Write-only attributes.** `write_only` is a hardcoded `false` schema flag;
+   real write-only *semantics* (the value is never persisted to state) is more
+   than the flag. → **3.4** (flag) + runtime support.
+6. **Nested-block fidelity.** Required single blocks aren't distinguished from
+   optional (`min_items` always 0), and the data-source projection renders a
+   `block` field as an object attribute. → **3.4** (min_items) + new **3.7**.
+7. **Modern protocol surfaces** — provider-defined functions, ephemeral
+   resources, cross-type state move — are increasingly table-stakes for newer
+   providers. → **3.2** + **Tier 4**.
+
 ## How to verify (the four test layers)
 
 Pick the cheapest layer that proves the feature; add to higher layers when the
@@ -258,10 +292,27 @@ via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`)
 - `moved {}` blocks and cross-resource-type state moves. In `unimplemented_unary!`.
   Add a `Resource::move_state(from_type, from_state) -> Model` hook + dispatch.
 
-### 3.3 Number precision
-- `Value::Number(f64)` is lossy for large ints / high-precision decimals. Consider
-  a decimal/bignum backing (cty uses `big.Float`). Wide blast radius
-  (`terraform-value`, codec, every `as f64`) — scope carefully.
+### 3.3 Number precision — ⚠️ highest-priority correctness gap
+- **Why:** `Value::Number(f64)` silently loses precision above 2^53. Real
+  providers carry 64-bit IDs, large byte counts, and high-precision decimals;
+  cty is arbitrary-precision (`big.Float`). A truncated ID round-tripped through
+  state is a *silent* data-correctness bug (no error, wrong value), which is why
+  this ranks above every other open item for a serious provider.
+- **Current:** `Value::Number(f64)` (`terraform-value/src/value.rs`); the codec
+  and reflection map `cty.Number` ↔ `f64`; `AttributeSchema.default` holding a
+  `Value` is why IR types are `PartialEq` but not `Eq`.
+- **Approach:** back numbers with a decimal/bignum type (e.g. an arbitrary-
+  precision decimal) preserving the msgpack/JSON wire forms. Wide blast radius:
+  `terraform-value`, `terraform-codec` (encode/decode), `terraform-reflect`
+  (integer/float field types), and every `as f64`. Decide the public surface —
+  authors with plain `i64`/`f64`/`u64` fields must keep working; the lossy
+  conversion should live only at the typed-model boundary, not in the `Value`
+  tree.
+- **Verify:** codec round-trip unit test for an integer > 2^53 (e.g.
+  `9_007_199_254_740_993`) that today fails; a `harness/` config writing a large
+  numeric attribute whose `expected/` JSON proves no precision loss.
+- **Done when:** a 64-bit integer attribute round-trips through plan/apply/state
+  without losing precision.
 
 ### 3.4 Misc completeness
 - **Private state to handlers:** `service.rs` round-trips Terraform's per-resource
@@ -272,6 +323,63 @@ via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`)
 - **Schema flags:** `emit_attribute` hardcodes `deprecated: false` /
   `write_only: false`; `emit_nested_block` hardcodes `min_items: 0`/`max_items: 0`.
   Add `deprecated`/`write_only` markers and required-block (`min_items`) support.
+  Note `write_only` is two pieces: the schema flag *and* the runtime semantics
+  (the value is validated/used but never persisted to state).
+
+### 3.5 Plan modification depth
+- **Why:** `Resource::modify_plan` today operates on **top-level attribute
+  names** only (`PlanModifications` holds bare names) and decodes the proposed
+  model through the zero-value rule, so it can't express nested plan logic:
+  diff suppression on a sub-attribute, computed-by-rule inside a block, or
+  known-after-apply on a nested field. Real resources need this.
+- **Current:** `PlanModifications` (`resource.rs`) carries top-level
+  `require_replace`/`unknown` attribute names; `apply_modifications`
+  (`plan.rs`) applies them at the top level; the proposed model is decoded via
+  the zero-value rule unless fields are typed `TfValue<T>`.
+- **Approach:** let plan modifications target `AttributePath`s (not just names),
+  and give `modify_plan` typed access to prior/config/proposed with the
+  known/unknown distinction preserved (the `TfValue<T>` machinery already
+  exists; thread it through the ctx). This is a `DynResource` shape change —
+  keep the method defaulted so the Node binding is unaffected.
+- **Verify:** `plan.rs` unit test marking a nested attribute unknown / forcing
+  replace on a nested-block change; a `harness/` config proving a suppressed
+  nested diff doesn't trip "inconsistent result after apply".
+- **Done when:** a resource can adjust the plan of a nested attribute, not just a
+  top-level one.
+
+### 3.6 Semantic equality / normalization
+- **Why:** Terraform diffs by structural value equality. Providers routinely need
+  to treat differently-encoded-but-equal values as unchanged — reordered JSON in
+  a string attribute, equivalent set ordering, case-insensitive IDs, normalized
+  ARNs/URLs. Without a hook, every such attribute shows a spurious perpetual diff.
+- **Current:** none — `plan.rs` compares `Value`s directly; there is no
+  per-attribute normalize/equate hook.
+- **Approach:** add an optional per-attribute (or per-resource) normalization
+  hook — e.g. a `normalize(attr_path, value) -> Value` called on config/prior
+  before diffing, or a typed `PlanModifications`-style "keep prior value" signal
+  (SDKv2's `DiffSuppressFunc` / Plugin Framework's `PlanModifier` analogue).
+  Likely folded into the 3.5 plan ctx.
+- **Verify:** `plan.rs` unit test where a normalized attribute (e.g. JSON with
+  reordered keys) plans as no-change; a `harness/` config proving no perpetual
+  diff across two applies of equivalent input.
+- **Done when:** an attribute with a normalization hook stops showing a spurious
+  diff for an equivalent-but-differently-encoded value.
+
+### 3.7 Data-source block projection
+- **Why:** a field marked `#[facet(terraform::block)]` reflects as a nested block
+  on the *resource* but the data-source projection (`model_attributes` in
+  `terraform-reflect`) renders it as a plain **object attribute**, so a data
+  source over a model with blocks has a schema that doesn't match the resource's.
+- **Current:** `reflect_data_source`/`reflect_data_source_list`
+  (`terraform-reflect`) ignore the `block` marker (noted in AGENTS.md /
+  README limitations).
+- **Approach:** have the data-source projection honor the `block` marker and emit
+  a `NestedBlock` (computed) the same way the resource path does in
+  `reader.rs::nested_block_from_field`.
+- **Verify:** `terraform-reflect` unit test that a block field projects to a
+  nested block in the data-source schema; `tofu_schema.rs` contract assertion.
+- **Done when:** a data source projected from a model with blocks renders those
+  as blocks, matching the resource.
 
 ---
 
