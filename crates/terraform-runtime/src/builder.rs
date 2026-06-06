@@ -27,8 +27,8 @@ use facet::Facet;
 use terraform_codec::from_value;
 use terraform_ir::{Block, DataSourceSchema, ProviderSchema, ResourceSchema};
 use terraform_reflect::{
-    reflect_block, reflect_data_source, reflect_data_source_list, reflect_resource, resource_name,
-    PluralDataSource, ReflectError,
+    data_source_list_name, data_source_name, reflect_block, reflect_data_source,
+    reflect_data_source_list, reflect_resource, resource_name, PluralDataSource, ReflectError,
 };
 use terraform_value::{Type, Value};
 use tokio::sync::OnceCell;
@@ -299,11 +299,15 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
         self
     }
 
-    /// Register a read-only data source type under `name` with its `handler`.
+    /// Register a read-only (singular) data source with its `handler`.
     /// Use this for data sources that need no provider configuration; for ones
     /// that need the configured meta, use [`ProviderBuilder::data_source_with`].
-    pub fn data_source<D: DataSource>(mut self, name: impl Into<String>, handler: D) -> Self {
-        let name = name.into();
+    ///
+    /// The type name comes from the model: an explicit
+    /// `#[facet(terraform::data_source("name"))]`, or `snake_case` of the struct
+    /// identifier when none is given.
+    pub fn data_source<D: DataSource>(mut self, handler: D) -> Self {
+        let name = data_source_name::<D::Model>();
         match reflect_data_source::<D::Model>(name.clone()) {
             Ok(data_source) => {
                 self.schema.data_sources.push(data_source);
@@ -319,14 +323,15 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
     /// provider meta. `factory` receives the shared `Arc<M>` produced by
     /// [`ProviderBuilder::configure`] and returns the data source handler.
     ///
+    /// The type name comes from the model (see [`ProviderBuilder::data_source`]).
     /// Requires a [`ProviderBuilder::configure`] step (which fixes `M`); building
     /// without one is a [`BuildError::MissingConfigure`].
-    pub fn data_source_with<D, F>(mut self, name: impl Into<String>, factory: F) -> Self
+    pub fn data_source_with<D, F>(mut self, factory: F) -> Self
     where
         D: DataSource,
         F: Fn(Arc<M>) -> D + Send + Sync + 'static,
     {
-        let name = name.into();
+        let name = data_source_name::<D::Model>();
         match reflect_data_source::<D::Model>(name.clone()) {
             Ok(data_source) => {
                 self.schema.data_sources.push(data_source);
@@ -339,16 +344,16 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
         self
     }
 
-    /// Register a **plural** data source under `name` with its `handler`: a
-    /// lookup by `search_key(shared)` fields that resolves to a `results` list.
-    /// Use this for data sources that need no provider configuration; for ones
-    /// that need the configured meta, use [`ProviderBuilder::data_source_list_with`].
-    pub fn data_source_list<D: DataSourceList>(
-        mut self,
-        name: impl Into<String>,
-        handler: D,
-    ) -> Self {
-        let name = name.into();
+    /// Register a **plural** data source with its `handler`: a lookup by
+    /// `search_key(shared)` fields that resolves to a `results` list. Use this for
+    /// data sources that need no provider configuration; for ones that need the
+    /// configured meta, use [`ProviderBuilder::data_source_list_with`].
+    ///
+    /// The type name is the singular data-source name with an `s` appended
+    /// (`aws_s3_bucket` → `aws_s3_buckets`), so one model can back both a singular
+    /// and a plural data source.
+    pub fn data_source_list<D: DataSourceList>(mut self, handler: D) -> Self {
+        let name = data_source_list_name::<D::Model>();
         match reflect_data_source_list::<D::Model>(name.clone()) {
             Ok(PluralDataSource {
                 schema,
@@ -367,14 +372,16 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
     /// configured provider meta. `factory` receives the shared `Arc<M>` produced
     /// by [`ProviderBuilder::configure`] and returns the data source handler.
     ///
-    /// Requires a [`ProviderBuilder::configure`] step (which fixes `M`); building
-    /// without one is a [`BuildError::MissingConfigure`].
-    pub fn data_source_list_with<D, F>(mut self, name: impl Into<String>, factory: F) -> Self
+    /// The type name is the singular name plus `s` (see
+    /// [`ProviderBuilder::data_source_list`]). Requires a
+    /// [`ProviderBuilder::configure`] step (which fixes `M`); building without one
+    /// is a [`BuildError::MissingConfigure`].
+    pub fn data_source_list_with<D, F>(mut self, factory: F) -> Self
     where
         D: DataSourceList,
         F: Fn(Arc<M>) -> D + Send + Sync + 'static,
     {
-        let name = name.into();
+        let name = data_source_list_name::<D::Model>();
         match reflect_data_source_list::<D::Model>(name.clone()) {
             Ok(PluralDataSource {
                 schema,

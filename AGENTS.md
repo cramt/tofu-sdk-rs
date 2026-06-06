@@ -120,9 +120,13 @@ entirely TS-side; it compiles down to the same cty-JSON the addon already takes.
   *struct-payload* attribute (like `search_key`), so any crate that writes the
   named form must depend on `terraform-attrs` directly (bare
   `#[facet(terraform::resource)]` still works through the re-export alone).
-  Data sources keep explicit names on the builder — one model can project to a
-  singular and a (differently-named) plural data source, so the name can't be
-  inferred from the type alone.
+  Data sources work the same way: `data_source` / `data_source_with` resolve the
+  name via `data_source_name` (explicit `#[facet(terraform::data_source("name"))]`
+  or `snake_case`), and the plural `data_source_list` / `_with` append an `s`
+  (`data_source_list_name`) — so one model backs both a singular `aws_s3_bucket`
+  and a plural `aws_s3_buckets`. Irregular plurals aren't handled (the rule is a
+  literal `+ "s"`); name a plural-only model's marker so `+ "s"` lands right
+  (e.g. `data_source("server")` → `servers`).
 - **`reflect` feature**: `terraform-codec` enables facet's `reflect` feature for
   `Peek`/`Partial`.
 - **Decoding a `Def::Map` (`HashMap`) uses `begin_key`/`begin_value`, not

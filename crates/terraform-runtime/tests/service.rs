@@ -42,7 +42,7 @@ impl Resource for BucketResource {
 }
 
 #[derive(Facet)]
-#[facet(terraform::data_source)]
+#[facet(terraform::data_source("aws_s3_bucket"))]
 #[allow(dead_code)]
 struct BucketLookup {
     #[facet(terraform::search_key(exclusive))]
@@ -64,8 +64,10 @@ impl DataSource for BucketLookupDataSource {
 }
 
 /// A plural data source model: looked up by a generic (`shared`) `cluster` key.
+/// The plural builder appends `s`, so `data_source("server")` registers as
+/// `servers`.
 #[derive(Facet)]
-#[facet(terraform::data_source)]
+#[facet(terraform::data_source("server"))]
 #[allow(dead_code)]
 struct ServerLookup {
     #[facet(terraform::search_key(shared))]
@@ -93,8 +95,8 @@ impl DataSourceList for ServersByCluster {
 fn service() -> ProviderService {
     let provider = Provider::builder()
         .resource(BucketResource)
-        .data_source("aws_s3_bucket", BucketLookupDataSource)
-        .data_source_list("servers", ServersByCluster)
+        .data_source(BucketLookupDataSource)
+        .data_source_list(ServersByCluster)
         .build()
         .expect("provider builds");
     ProviderService::new(provider)

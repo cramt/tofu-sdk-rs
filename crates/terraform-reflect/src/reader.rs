@@ -87,10 +87,17 @@ pub fn resource_name<T: Facet<'static>>() -> String {
     container_name(T::SHAPE, "resource")
 }
 
-/// The Terraform type name for a data source model — the explicit name from
-/// `#[facet(terraform::data_source("name"))]`, else `snake_case(Ident)`.
+/// The Terraform type name for a (singular) data source model — the explicit
+/// name from `#[facet(terraform::data_source("name"))]`, else `snake_case(Ident)`.
 pub fn data_source_name<T: Facet<'static>>() -> String {
     container_name(T::SHAPE, "data_source")
+}
+
+/// The Terraform type name for a **plural** data source model: the singular
+/// [`data_source_name`] with an `s` appended (`aws_s3_bucket` → `aws_s3_buckets`),
+/// so the same model can back both a singular and a plural data source.
+pub fn data_source_list_name<T: Facet<'static>>() -> String {
+    format!("{}s", data_source_name::<T>())
 }
 
 /// Resolve a container's Terraform name: the optional string payload of the
@@ -729,6 +736,28 @@ mod tests {
         assert_eq!(to_snake_case("FileModel"), "file_model");
         assert_eq!(to_snake_case("AwsS3Bucket"), "aws_s3_bucket");
         assert_eq!(to_snake_case("HTTPServer"), "http_server");
+    }
+
+    #[derive(Facet)]
+    #[facet(terraform::data_source("aws_s3_bucket"))]
+    #[allow(dead_code)]
+    struct NamedDataSource {
+        #[facet(terraform::search_key(exclusive))]
+        id: String,
+    }
+
+    #[test]
+    fn data_source_name_singular_and_plural() {
+        // The singular name comes from the marker; the plural appends `s`.
+        assert_eq!(data_source_name::<NamedDataSource>(), "aws_s3_bucket");
+        assert_eq!(data_source_list_name::<NamedDataSource>(), "aws_s3_buckets");
+    }
+
+    #[test]
+    fn data_source_name_infers_from_struct() {
+        // No explicit name: snake_case, and the plural appends `s`.
+        assert_eq!(data_source_name::<AwsS3Bucket>(), "aws_s3_bucket");
+        assert_eq!(data_source_list_name::<AwsS3Bucket>(), "aws_s3_buckets");
     }
 
     // --- data source projections (search keys) ------------------------------

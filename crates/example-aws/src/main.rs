@@ -53,7 +53,7 @@ struct AwsClient {
 /// source.
 #[derive(Facet)]
 #[facet(terraform::resource("aws_s3_bucket"))]
-#[facet(terraform::data_source)]
+#[facet(terraform::data_source("aws_s3_bucket"))]
 #[allow(dead_code)]
 struct Bucket {
     /// The globally-unique name of the bucket. A generic data source key:
@@ -180,12 +180,8 @@ async fn main() {
             })
         })
         .resource_with(|client: Arc<AwsClient>| BucketResource { client })
-        .data_source_with("aws_s3_bucket", |client: Arc<AwsClient>| BucketByArn {
-            client,
-        })
-        .data_source_list_with("aws_s3_buckets", |client: Arc<AwsClient>| BucketsByName {
-            client,
-        })
+        .data_source_with(|client: Arc<AwsClient>| BucketByArn { client })
+        .data_source_list_with(|client: Arc<AwsClient>| BucketsByName { client })
         .build()
         .expect("provider definition is valid");
 
