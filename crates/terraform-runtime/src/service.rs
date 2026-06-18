@@ -18,6 +18,7 @@ use tonic::codegen::tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 use crate::builder::Provider;
+use crate::ctx::{with_ctx, Ctx, CtxOutputs};
 use crate::plan::plan;
 use crate::resource::{Diag, Diagnostics, Severity};
 
@@ -57,11 +58,36 @@ impl ProviderService {
         }
     }
 
-    /// Run an erased handler future under the cancellation scope, converting a
-    /// panic into an error diagnostic so a buggy handler yields a clean failure
-    /// instead of unwinding out of the async task and tearing down the plugin
-    /// process. Requires the default `panic = "unwind"`.
-    async fn guard<T>(
+    /// Run an erased handler future under the handler [`Ctx`] (carrying
+    /// `private_in`) and the cancellation scope, converting a panic into an error
+    /// diagnostic so a buggy handler yields a clean failure instead of unwinding
+    /// out of the async task and tearing down the plugin process (requires the
+    /// default `panic = "unwind"`). Returns the handler result together with the
+    /// context's accumulated outputs (success-path warnings, new private state).
+    async fn run<T>(
+        &self,
+        op: &str,
+        private_in: Vec<u8>,
+        fut: impl std::future::Future<Output = Result<T, Diagnostics>>,
+    ) -> (Result<T, Diagnostics>, CtxOutputs) {
+        let ctx = Ctx::new(private_in, self.cancel.clone());
+        with_ctx(ctx, self.catch(op, fut)).await
+    }
+
+    /// Like [`run`](Self::run), for a handler returning bare [`Diagnostics`]
+    /// (validation); there is no private state.
+    async fn run_diags(
+        &self,
+        op: &str,
+        fut: impl std::future::Future<Output = Diagnostics>,
+    ) -> (Diagnostics, CtxOutputs) {
+        let ctx = Ctx::new(Vec::new(), self.cancel.clone());
+        with_ctx(ctx, self.catch_diags(op, fut)).await
+    }
+
+    /// Scope the cancellation token around `fut` and turn a handler panic into an
+    /// error diagnostic.
+    async fn catch<T>(
         &self,
         op: &str,
         fut: impl std::future::Future<Output = Result<T, Diagnostics>>,
@@ -77,9 +103,8 @@ impl ProviderService {
         }
     }
 
-    /// Like [`guard`](Self::guard), for a handler returning bare [`Diagnostics`]
-    /// (validation).
-    async fn guard_diags(
+    /// [`catch`](Self::catch) for a handler returning bare [`Diagnostics`].
+    async fn catch_diags(
         &self,
         op: &str,
         fut: impl std::future::Future<Output = Diagnostics>,
@@ -224,11 +249,11 @@ impl tfplugin6::provider_server::Provider for ProviderService {
                 }))
             }
         };
+        let (diags, outs) = self
+            .run_diags("validate resource config", handler.validate(config))
+            .await;
         Ok(Response::new(Resp {
-            diagnostics: pb_diagnostics(
-                self.guard_diags("validate resource config", handler.validate(config))
-                    .await,
-            ),
+            diagnostics: diags_with_warnings(diags, outs),
         }))
     }
 
@@ -257,11 +282,11 @@ impl tfplugin6::provider_server::Provider for ProviderService {
                 }))
             }
         };
+        let (diags, outs) = self
+            .run_diags("validate data source config", handler.validate(config))
+            .await;
         Ok(Response::new(Resp {
-            diagnostics: pb_diagnostics(
-                self.guard_diags("validate data source config", handler.validate(config))
-                    .await,
-            ),
+            diagnostics: diags_with_warnings(diags, outs),
         }))
     }
 
@@ -308,6 +333,7 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         // Up to date already: the stored state matches the current schema, so it
         // decodes directly. Otherwise hand the untyped prior state to the
         // resource's upgrade migration.
+        let mut warnings: Diagnostics = Vec::new();
         let upgraded = if req.version >= current_version {
             decode_json(&json, &ty).map_err(|e| e.to_string())
         } else {
@@ -326,17 +352,21 @@ impl tfplugin6::provider_server::Provider for ProviderService {
                     }))
                 }
             };
-            match self
-                .guard(
+            let (outcome, outs) = self
+                .run(
                     "upgrade resource state",
+                    Vec::new(),
                     handler.upgrade(req.version, prior),
                 )
-                .await
-            {
-                Ok(v) => Ok(v),
+                .await;
+            match outcome {
+                Ok(v) => {
+                    warnings = outs.warnings;
+                    Ok(v)
+                }
                 Err(diags) => {
                     return Ok(Response::new(Resp {
-                        diagnostics: pb_diagnostics(diags),
+                        diagnostics: diags_with_warnings(diags, outs),
                         ..Default::default()
                     }))
                 }
@@ -346,12 +376,16 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         match upgraded.and_then(|v| encode_dynamic(&v, &ty).map_err(|e| e.to_string())) {
             Ok(dv) => Ok(Response::new(Resp {
                 upgraded_state: Some(dv),
-                ..Default::default()
+                diagnostics: pb_diagnostics(warnings),
             })),
-            Err(e) => Ok(Response::new(Resp {
-                diagnostics: error_diag("failed to upgrade state", e),
-                ..Default::default()
-            })),
+            Err(e) => {
+                let mut diagnostics = pb_diagnostics(warnings);
+                diagnostics.extend(error_diag("failed to upgrade state", e));
+                Ok(Response::new(Resp {
+                    diagnostics,
+                    ..Default::default()
+                }))
+            }
         }
     }
 
@@ -397,18 +431,31 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         // Author plan modification: adjust the mechanical plan (force-replace by
         // rule, mark computed-by-rule unknown). Skipped when no handler is built
         // yet (a meta-backed handler exists only after ConfigureProvider).
+        let mut warnings: Diagnostics = Vec::new();
+        let mut planned_private = req.planned_private;
         if let Some(handler) = self.provider.resource_handler(&req.type_name) {
-            match self
-                .guard(
+            let (outcome, outs) = self
+                .run(
                     "modify_plan",
+                    planned_private.clone(),
                     handler.modify_plan(prior, plan.planned.clone()),
                 )
-                .await
-            {
-                Ok(mods) => crate::plan::apply_modifications(&mut plan, mods),
+                .await;
+            match outcome {
+                Ok(mods) => {
+                    crate::plan::apply_modifications(&mut plan, mods);
+                    let CtxOutputs {
+                        warnings: w,
+                        private_out,
+                    } = outs;
+                    warnings = w;
+                    if let Some(p) = private_out {
+                        planned_private = p;
+                    }
+                }
                 Err(diags) => {
                     return Ok(Response::new(Resp {
-                        diagnostics: pb_diagnostics(diags),
+                        diagnostics: diags_with_warnings(diags, outs),
                         ..Default::default()
                     }))
                 }
@@ -419,13 +466,18 @@ impl tfplugin6::provider_server::Provider for ProviderService {
             Ok(dv) => Ok(Response::new(Resp {
                 planned_state: Some(dv),
                 requires_replace: plan.requires_replace,
-                planned_private: req.planned_private,
+                planned_private,
+                diagnostics: pb_diagnostics(warnings),
                 ..Default::default()
             })),
-            Err(e) => Ok(Response::new(Resp {
-                diagnostics: error_diag("failed to encode planned state", e.to_string()),
-                ..Default::default()
-            })),
+            Err(e) => {
+                let mut diagnostics = pb_diagnostics(warnings);
+                diagnostics.extend(error_diag("failed to encode planned state", e.to_string()));
+                Ok(Response::new(Resp {
+                    diagnostics,
+                    ..Default::default()
+                }))
+            }
         }
     }
 
@@ -457,13 +509,15 @@ impl tfplugin6::provider_server::Provider for ProviderService {
             }
         };
 
-        let outcome = self.guard("read resource", handler.read(current)).await;
+        let (outcome, outs) = self
+            .run("read resource", req.private.clone(), handler.read(current))
+            .await;
         let new_value = match outcome {
             Ok(Some(v)) => v,
             Ok(None) => Value::Null, // resource is gone
             Err(diags) => {
                 return Ok(Response::new(Resp {
-                    diagnostics: pb_diagnostics(diags),
+                    diagnostics: diags_with_warnings(diags, outs),
                     ..Default::default()
                 }))
             }
@@ -473,6 +527,7 @@ impl tfplugin6::provider_server::Provider for ProviderService {
             &new_value,
             &ty,
             req.private,
+            outs,
             |new_state, private, diagnostics| Resp {
                 new_state,
                 private,
@@ -527,15 +582,17 @@ impl tfplugin6::provider_server::Provider for ProviderService {
             "update"
         };
         tracing::debug!(type_name = %req.type_name, action, "ApplyResourceChange");
-        let outcome: Result<Value, Diagnostics> = if planned.is_null() {
-            self.guard("delete", async {
+        let private_in = req.planned_private.clone();
+        let (outcome, outs): (Result<Value, Diagnostics>, CtxOutputs) = if planned.is_null() {
+            self.run("delete", private_in, async {
                 handler.delete(prior.clone()).await.map(|()| Value::Null)
             })
             .await
         } else if prior.is_null() {
-            self.guard("create", handler.create(planned)).await
+            self.run("create", private_in, handler.create(planned))
+                .await
         } else {
-            self.guard("update", handler.update(planned, prior.clone()))
+            self.run("update", private_in, handler.update(planned, prior.clone()))
                 .await
         };
 
@@ -544,6 +601,7 @@ impl tfplugin6::provider_server::Provider for ProviderService {
                 &new_value,
                 &ty,
                 req.planned_private,
+                outs,
                 |new_state, private, diagnostics| Resp {
                     new_state,
                     private,
@@ -555,7 +613,7 @@ impl tfplugin6::provider_server::Provider for ProviderService {
                 // On failure, keep the prior state so Terraform does not record a
                 // partially-applied resource.
                 new_state: encode_dynamic(&prior, &ty).ok(),
-                diagnostics: pb_diagnostics(diags),
+                diagnostics: diags_with_warnings(diags, outs),
                 ..Default::default()
             })),
         }
@@ -589,19 +647,30 @@ impl tfplugin6::provider_server::Provider for ProviderService {
             }
         };
 
-        match self.guard("read data source", handler.read(config)).await {
+        let (outcome, outs) = self
+            .run("read data source", Vec::new(), handler.read(config))
+            .await;
+        match outcome {
             Ok(state) => match encode_dynamic(&state, &ty) {
                 Ok(dv) => Ok(Response::new(Resp {
                     state: Some(dv),
+                    diagnostics: pb_diagnostics(outs.warnings),
                     ..Default::default()
                 })),
-                Err(e) => Ok(Response::new(Resp {
-                    diagnostics: error_diag("failed to encode data source state", e.to_string()),
-                    ..Default::default()
-                })),
+                Err(e) => {
+                    let mut diagnostics = pb_diagnostics(outs.warnings);
+                    diagnostics.extend(error_diag(
+                        "failed to encode data source state",
+                        e.to_string(),
+                    ));
+                    Ok(Response::new(Resp {
+                        diagnostics,
+                        ..Default::default()
+                    }))
+                }
             },
             Err(diags) => Ok(Response::new(Resp {
-                diagnostics: pb_diagnostics(diags),
+                diagnostics: diags_with_warnings(diags, outs),
                 ..Default::default()
             })),
         }
@@ -627,10 +696,10 @@ impl tfplugin6::provider_server::Provider for ProviderService {
 
         // The provider produces the imported state from the ID; Terraform then
         // refreshes it with ReadResource.
-        match self
-            .guard("import resource state", handler.import(req.id))
-            .await
-        {
+        let (outcome, outs) = self
+            .run("import resource state", Vec::new(), handler.import(req.id))
+            .await;
+        match outcome {
             Ok(state) => match encode_dynamic(&state, &ty) {
                 Ok(dv) => Ok(Response::new(Resp {
                     imported_resources: vec![ImportedResource {
@@ -638,15 +707,21 @@ impl tfplugin6::provider_server::Provider for ProviderService {
                         state: Some(dv),
                         ..Default::default()
                     }],
+                    diagnostics: pb_diagnostics(outs.warnings),
                     ..Default::default()
                 })),
-                Err(e) => Ok(Response::new(Resp {
-                    diagnostics: error_diag("failed to encode imported state", e.to_string()),
-                    ..Default::default()
-                })),
+                Err(e) => {
+                    let mut diagnostics = pb_diagnostics(outs.warnings);
+                    diagnostics
+                        .extend(error_diag("failed to encode imported state", e.to_string()));
+                    Ok(Response::new(Resp {
+                        diagnostics,
+                        ..Default::default()
+                    }))
+                }
             },
             Err(diags) => Ok(Response::new(Resp {
-                diagnostics: pb_diagnostics(diags),
+                diagnostics: diags_with_warnings(diags, outs),
                 ..Default::default()
             })),
         }
@@ -763,22 +838,38 @@ fn encode_dynamic(value: &Value, ty: &Type) -> Result<tfplugin6::DynamicValue, C
     })
 }
 
-/// Encode `value` and build a state response via `build`, surfacing encode
-/// errors as diagnostics.
+/// Encode `value` and build a state response via `build`, folding in the
+/// handler's context outputs: success-path warnings ride along as diagnostics,
+/// and any new private state overrides the incoming `private`. Encode errors
+/// surface as diagnostics.
 fn respond_state<R>(
     value: &Value,
     ty: &Type,
     private: Vec<u8>,
+    outs: CtxOutputs,
     build: impl FnOnce(Option<tfplugin6::DynamicValue>, Vec<u8>, Vec<tfplugin6::Diagnostic>) -> R,
 ) -> Result<Response<R>, Status> {
+    let CtxOutputs {
+        warnings,
+        private_out,
+    } = outs;
+    let private = private_out.unwrap_or(private);
+    let mut diagnostics = pb_diagnostics(warnings);
     match encode_dynamic(value, ty) {
-        Ok(dv) => Ok(Response::new(build(Some(dv), private, Vec::new()))),
-        Err(e) => Ok(Response::new(build(
-            None,
-            private,
-            error_diag("failed to encode state", e.to_string()),
-        ))),
+        Ok(dv) => Ok(Response::new(build(Some(dv), private, diagnostics))),
+        Err(e) => {
+            diagnostics.extend(error_diag("failed to encode state", e.to_string()));
+            Ok(Response::new(build(None, private, diagnostics)))
+        }
     }
+}
+
+/// Merge handler error diagnostics with the context's success-path warnings into
+/// protocol diagnostics (used on the failure path, where there is no state).
+fn diags_with_warnings(diags: Diagnostics, outs: CtxOutputs) -> Vec<tfplugin6::Diagnostic> {
+    let mut all = diags;
+    all.extend(outs.warnings);
+    pb_diagnostics(all)
 }
 
 /// Convert SDK diagnostics into protocol diagnostics.

@@ -28,11 +28,17 @@ e2e). Tier 1.2 shipped its three pieces: attribute defaults, `Resource::
 modify_plan`, computed-attr-in-block consistency, and the `TfValue<T>` field
 wrapper (known/unknown/null preserved through decode).
 
-Remaining caveats (additive, not part of the landed cut): CRUD success-path
-warnings (2.2 carries warnings only alongside an *error* today); `modify_plan`
-operates on top-level attribute names and decodes the proposed model through the
-zero-value rule (use `TfValue<T>` fields to read unknowns); a no-arg handler ctx
-unifying cancellation + private state is a future refinement.
+Remaining caveats (additive, not part of the landed cut): `modify_plan` operates
+on top-level attribute names and decodes the proposed model through the
+zero-value rule (use `TfValue<T>` fields to read unknowns).
+
+The **handler `Ctx`** (`terraform-runtime/src/ctx.rs`) now unifies what used to be
+a list of separate gaps: every handler takes `ctx: &mut Ctx`, giving it
+success-path warnings (`ctx.warn`, surfaced on *successful* applies/reads — no
+longer error-only), per-resource private state (`ctx.private` /
+`ctx.set_private`, persisted across operations), and cancellation
+(`ctx.is_cancelled` / `ctx.cancelled`). It is injected ambiently via a task-local
+so the erased `DynResource`/`DynDataSource` seam is unchanged.
 
 ## Beyond "landed": real-provider readiness gaps
 
@@ -46,9 +52,10 @@ Rough priority order, each pointing at its tracked item:
    is now `enum Number { I64, U64, F64 }`, so the full 64-bit integer range
    round-trips losslessly. Truly arbitrary precision (beyond 64-bit) remains
    out of reach, matching the JSON layer's own ceiling. → **3.3**.
-2. **Success-path warnings.** Warnings only ride alongside a CRUD *error* today;
-   real providers warn on successful applies (deprecations, drift hints). Needs
-   the handler ctx. → **2.2 (deferred)** + ctx work in **3.4**.
+2. ~~**Success-path warnings.**~~ ✅ **DONE** — every handler takes `ctx: &mut
+   Ctx`; `ctx.warn(...)` surfaces a warning alongside a *successful* apply/read,
+   and `ctx.private`/`ctx.set_private` carry per-resource private state. The same
+   `Ctx` also exposes cancellation. → **2.2** + the handler-ctx keystone.
 3. **Plan modification depth.** `modify_plan` sees top-level attribute names only
    and decodes the proposed model via the zero-value rule. Real plan logic
    (diff suppression, nested computed-by-rule, known-after-apply on nested
@@ -314,9 +321,11 @@ via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`)
   fine for real configs; lifting it would require changing `facet-value`.
 
 ### 3.4 Misc completeness
-- **Private state to handlers:** `service.rs` round-trips Terraform's per-resource
-  `private` bytes (`planned_private`/`private`) but never exposes them. Surface
-  read/write via handler ctx (needed for timeouts/SDKv2-style bookkeeping).
+- ~~**Private state to handlers.**~~ ✅ **DONE** — exposed via the handler `Ctx`:
+  `ctx.private()` reads the incoming `private`/`planned_private` bytes and
+  `ctx.set_private(...)` persists new ones, threaded through the apply/read/plan
+  responses in `service.rs` (regression: `read_observes_incoming_private_state`,
+  `create_success_carries_warning_and_persists_private_state`).
 - **`timeouts {}`:** the common per-operation timeout block convention. Now
   expressible as a nested block; needs runtime plumbing to read + enforce.
 - **Schema flags:** `emit_attribute` hardcodes `deprecated: false` /

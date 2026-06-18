@@ -11,7 +11,7 @@ use std::sync::Arc;
 use facet::Facet;
 use terraform_attrs as terraform;
 use terraform_runtime::{
-    async_trait, ConfigureError, DataSource, DataSourceError, DataSourceList, Diag,
+    async_trait, ConfigureError, Ctx, DataSource, DataSourceError, DataSourceList, Diag,
     PlanModifications, Provider, ProviderService, Resource, ResourceError,
 };
 use terraform_tfplugin6::tfplugin6::{self, provider_server::Provider as _};
@@ -35,7 +35,7 @@ struct BucketResource;
 impl Resource for BucketResource {
     type Model = Bucket;
 
-    async fn create(&self, planned: Bucket) -> Result<Bucket, ResourceError> {
+    async fn create(&self, _ctx: &mut Ctx, planned: Bucket) -> Result<Bucket, ResourceError> {
         Ok(planned)
     }
 }
@@ -56,7 +56,11 @@ struct BucketLookupDataSource;
 impl DataSource for BucketLookupDataSource {
     type Model = BucketLookup;
 
-    async fn read(&self, mut config: BucketLookup) -> Result<BucketLookup, DataSourceError> {
+    async fn read(
+        &self,
+        _ctx: &mut Ctx,
+        mut config: BucketLookup,
+    ) -> Result<BucketLookup, DataSourceError> {
         config.arn = format!("arn:aws:s3:::{}", config.name);
         Ok(config)
     }
@@ -81,7 +85,11 @@ struct ServersByCluster;
 impl DataSourceList for ServersByCluster {
     type Model = ServerLookup;
 
-    async fn list(&self, query: ServerLookup) -> Result<Vec<ServerLookup>, DataSourceError> {
+    async fn list(
+        &self,
+        _ctx: &mut Ctx,
+        query: ServerLookup,
+    ) -> Result<Vec<ServerLookup>, DataSourceError> {
         Ok((0..2)
             .map(|i| ServerLookup {
                 id: format!("{}-{i}", query.cluster),
@@ -184,12 +192,13 @@ struct PlanModResource;
 impl Resource for PlanModResource {
     type Model = PlanMod;
 
-    async fn create(&self, planned: PlanMod) -> Result<PlanMod, ResourceError> {
+    async fn create(&self, _ctx: &mut Ctx, planned: PlanMod) -> Result<PlanMod, ResourceError> {
         Ok(planned)
     }
 
     async fn modify_plan(
         &self,
+        _ctx: &mut Ctx,
         prior: Option<PlanMod>,
         proposed: PlanMod,
     ) -> Result<PlanModifications, ResourceError> {
@@ -291,9 +300,14 @@ struct CancelProbeResource {
 impl Resource for CancelProbeResource {
     type Model = CancelProbe;
 
-    async fn create(&self, planned: CancelProbe) -> Result<CancelProbe, ResourceError> {
-        let cancelled = terraform_runtime::current_cancellation().map(|t| t.is_cancelled());
-        *self.observed.lock().unwrap() = cancelled;
+    async fn create(
+        &self,
+        ctx: &mut Ctx,
+        planned: CancelProbe,
+    ) -> Result<CancelProbe, ResourceError> {
+        // Observe cancellation through the handler ctx (it carries the same token
+        // `current_cancellation()` exposes ambiently).
+        *self.observed.lock().unwrap() = Some(ctx.is_cancelled());
         Ok(planned)
     }
 }
@@ -631,7 +645,11 @@ struct RegionResource {
 impl Resource for RegionResource {
     type Model = RegionBucket;
 
-    async fn create(&self, mut planned: RegionBucket) -> Result<RegionBucket, ResourceError> {
+    async fn create(
+        &self,
+        _ctx: &mut Ctx,
+        mut planned: RegionBucket,
+    ) -> Result<RegionBucket, ResourceError> {
         planned.region = self.client.region.clone();
         Ok(planned)
     }
@@ -1125,7 +1143,7 @@ struct FailingResource;
 impl Resource for FailingResource {
     type Model = Failing;
 
-    async fn create(&self, _planned: Failing) -> Result<Failing, ResourceError> {
+    async fn create(&self, _ctx: &mut Ctx, _planned: Failing) -> Result<Failing, ResourceError> {
         Err(ResourceError::new("create failed")
             .with_detail("the backend rejected it")
             .at(["name"])
@@ -1379,4 +1397,129 @@ async fn validate_resource_config_surfaces_diagnostics() {
         .expect("validate")
         .into_inner();
     assert!(ok.diagnostics.is_empty());
+}
+
+// --- Handler context: success-path warnings + private state ----------------
+
+/// A model for the ctx probe.
+#[derive(Facet)]
+#[facet(terraform::resource("ctx_probe"))]
+#[allow(dead_code)]
+struct Probe {
+    name: String,
+}
+
+/// Exercises the handler [`Ctx`]: `create` emits a success-path warning and
+/// persists private state; `read` surfaces the incoming private state back
+/// through the model so the test can observe it.
+struct CtxProbeResource;
+
+#[async_trait]
+impl Resource for CtxProbeResource {
+    type Model = Probe;
+
+    async fn create(&self, ctx: &mut Ctx, planned: Probe) -> Result<Probe, ResourceError> {
+        ctx.warn("deprecated", "`name` will be renamed soon");
+        ctx.set_private(b"token-42".to_vec());
+        Ok(planned)
+    }
+
+    async fn read(
+        &self,
+        ctx: &mut Ctx,
+        mut current: Probe,
+    ) -> Result<Option<Probe>, ResourceError> {
+        // Echo the incoming private state into the model so the response reflects
+        // what the handler observed.
+        current.name = String::from_utf8_lossy(ctx.private()).into_owned();
+        Ok(Some(current))
+    }
+}
+
+fn probe_cty() -> terraform_value::Type {
+    terraform_value::Type::Object(vec![terraform_value::ObjectAttr {
+        name: "name".into(),
+        ty: terraform_value::Type::String,
+        optional: false,
+    }])
+}
+
+fn probe_dv(name: &str) -> tfplugin6::DynamicValue {
+    let mut obj = std::collections::BTreeMap::new();
+    obj.insert(
+        "name".to_string(),
+        terraform_value::Value::String(name.into()),
+    );
+    tfplugin6::DynamicValue {
+        msgpack: terraform_codec::encode_msgpack(
+            &terraform_value::Value::Object(obj),
+            &probe_cty(),
+        )
+        .unwrap(),
+        json: vec![],
+    }
+}
+
+#[tokio::test]
+async fn create_success_carries_warning_and_persists_private_state() {
+    let svc = Provider::builder()
+        .resource(CtxProbeResource)
+        .build()
+        .map(ProviderService::new)
+        .expect("provider builds");
+
+    let apply = svc
+        .apply_resource_change(Request::new(tfplugin6::apply_resource_change::Request {
+            type_name: "ctx_probe".into(),
+            prior_state: None,
+            planned_state: Some(probe_dv("x")),
+            ..Default::default()
+        }))
+        .await
+        .expect("apply")
+        .into_inner();
+
+    // The successful create still surfaces the ctx warning...
+    assert_eq!(apply.diagnostics.len(), 1, "{:?}", apply.diagnostics);
+    assert_eq!(
+        apply.diagnostics[0].severity,
+        tfplugin6::diagnostic::Severity::Warning as i32
+    );
+    assert_eq!(apply.diagnostics[0].summary, "deprecated");
+    // ...and persists the private state the handler set.
+    assert_eq!(apply.private.as_slice(), b"token-42");
+}
+
+#[tokio::test]
+async fn read_observes_incoming_private_state() {
+    let svc = Provider::builder()
+        .resource(CtxProbeResource)
+        .build()
+        .map(ProviderService::new)
+        .expect("provider builds");
+
+    let read = svc
+        .read_resource(Request::new(tfplugin6::read_resource::Request {
+            type_name: "ctx_probe".into(),
+            current_state: Some(probe_dv("ignored")),
+            private: b"seen-private".to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .expect("read")
+        .into_inner();
+
+    // The handler read its private state and echoed it into `name`.
+    let state = read.new_state.expect("new state");
+    let value = terraform_codec::decode_msgpack(&state.msgpack, &probe_cty()).unwrap();
+    let terraform_value::Value::Object(fields) = value else {
+        panic!("state should be an object");
+    };
+    assert_eq!(
+        fields["name"],
+        terraform_value::Value::String("seen-private".into())
+    );
+    // The private state round-trips back out unchanged when the handler did not
+    // replace it.
+    assert_eq!(read.private.as_slice(), b"seen-private");
 }

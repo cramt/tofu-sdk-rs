@@ -23,7 +23,7 @@ use std::sync::Arc;
 use facet::Facet;
 use terraform_provider::terraform;
 use terraform_runtime::{
-    async_trait, serve, DataSource, DataSourceError, DataSourceList, Provider, Resource,
+    async_trait, serve, Ctx, DataSource, DataSourceError, DataSourceList, Provider, Resource,
     ResourceError,
 };
 
@@ -103,11 +103,16 @@ impl BucketResource {
 impl Resource for BucketResource {
     type Model = Bucket;
 
-    async fn create(&self, planned: Bucket) -> Result<Bucket, ResourceError> {
+    async fn create(&self, _ctx: &mut Ctx, planned: Bucket) -> Result<Bucket, ResourceError> {
         Ok(self.computed(planned, "created"))
     }
 
-    async fn update(&self, planned: Bucket, _prior: Bucket) -> Result<Bucket, ResourceError> {
+    async fn update(
+        &self,
+        _ctx: &mut Ctx,
+        planned: Bucket,
+        _prior: Bucket,
+    ) -> Result<Bucket, ResourceError> {
         Ok(self.computed(planned, "updated"))
     }
 }
@@ -126,7 +131,7 @@ struct BucketByArn {
 impl DataSource for BucketByArn {
     type Model = Bucket;
 
-    async fn read(&self, mut query: Bucket) -> Result<Bucket, DataSourceError> {
+    async fn read(&self, _ctx: &mut Ctx, mut query: Bucket) -> Result<Bucket, DataSourceError> {
         // The query arrives with `arn` set (the exclusive key); recover the rest.
         query.name = query
             .arn
@@ -151,7 +156,7 @@ struct BucketsByName {
 impl DataSourceList for BucketsByName {
     type Model = Bucket;
 
-    async fn list(&self, query: Bucket) -> Result<Vec<Bucket>, DataSourceError> {
+    async fn list(&self, _ctx: &mut Ctx, query: Bucket) -> Result<Vec<Bucket>, DataSourceError> {
         let region = self.client.region.clone();
         let matches = ["", "-staging"]
             .iter()

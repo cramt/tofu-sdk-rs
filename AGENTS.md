@@ -191,11 +191,23 @@ entirely TS-side; it compiles down to the same cty-JSON the addon already takes.
 ## How a resource works
 
 Authors implement the async `Resource` trait over a `#[derive(Facet)]` `Model`
-(`create` required; `read`/`update`/`delete` have defaults). The runtime wraps
-each handler in an erased `DynResource` (`resource.rs`) that decodes the dynamic
-`Value` into the model, calls the typed method, and encodes the result back. The
-gRPC service (`service.rs`) dispatches by type name and drives the codec; the
-planning engine lives in `plan.rs`.
+(`create` required; `read`/`update`/`delete` have defaults). Every handler takes
+`ctx: &mut Ctx` (`ctx.rs`) — success-path warnings (`ctx.warn`), per-resource
+private state (`ctx.private` / `ctx.set_private`), and cancellation
+(`ctx.is_cancelled` / `ctx.cancelled`). The runtime wraps each handler in an
+erased `DynResource` (`resource.rs`) that decodes the dynamic `Value` into the
+model, calls the typed method, and encodes the result back. The gRPC service
+(`service.rs`) dispatches by type name and drives the codec; the planning engine
+lives in `plan.rs`.
+
+The `Ctx` is **injected ambiently** via a task-local (mirroring the existing
+cancellation scope): the service's `run`/`run_diags` install it around the
+dispatch and read its outputs back afterwards (`with_ctx`), and the adapter pulls
+it with `current_ctx()` to pass to the typed handler. So the **erased
+`DynResource`/`DynDataSource` seam is unchanged** — the Node binding and other
+dynamic-seam frontends need no change; they just don't see a `Ctx`. A handler
+called outside a dispatch (a direct unit test) gets a detached `Ctx` (outputs go
+nowhere, never cancelled, no private state).
 
 Data sources mirror this, and can be **projected from the same `Model` as the
 resource** (mark the struct `#[facet(terraform::resource)]` *and*

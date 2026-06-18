@@ -13,6 +13,8 @@ use facet::Facet;
 use terraform_codec::{from_value, to_value};
 use terraform_value::Value;
 
+use crate::ctx::{current_ctx, Ctx};
+
 /// An error returned by a resource operation, surfaced to Terraform as an error
 /// diagnostic.
 ///
@@ -218,19 +220,29 @@ pub trait Resource: Send + Sync + 'static {
     const SCHEMA_VERSION: i64 = 0;
 
     /// Create the resource from its planned state and return the new state with
-    /// computed attributes filled in.
-    async fn create(&self, planned: Self::Model) -> Result<Self::Model, ResourceError>;
+    /// computed attributes filled in. Use `ctx` to emit success warnings, persist
+    /// private state, or observe cancellation.
+    async fn create(
+        &self,
+        ctx: &mut Ctx,
+        planned: Self::Model,
+    ) -> Result<Self::Model, ResourceError>;
 
     /// Refresh `current` from the real system. Return `None` if it no longer
     /// exists (Terraform will plan to recreate it). Defaults to returning
     /// `current` unchanged.
-    async fn read(&self, current: Self::Model) -> Result<Option<Self::Model>, ResourceError> {
+    async fn read(
+        &self,
+        _ctx: &mut Ctx,
+        current: Self::Model,
+    ) -> Result<Option<Self::Model>, ResourceError> {
         Ok(Some(current))
     }
 
     /// Update an existing resource to its planned state. Defaults to an error.
     async fn update(
         &self,
+        _ctx: &mut Ctx,
         _planned: Self::Model,
         _prior: Self::Model,
     ) -> Result<Self::Model, ResourceError> {
@@ -240,7 +252,7 @@ pub trait Resource: Send + Sync + 'static {
     }
 
     /// Delete the resource. Defaults to a no-op.
-    async fn delete(&self, _prior: Self::Model) -> Result<(), ResourceError> {
+    async fn delete(&self, _ctx: &mut Ctx, _prior: Self::Model) -> Result<(), ResourceError> {
         Ok(())
     }
 
@@ -248,7 +260,7 @@ pub trait Resource: Send + Sync + 'static {
     /// Terraform refreshes it with [`read`](Resource::read) immediately after, so
     /// returning just enough to identify it (e.g. the ID-bearing fields) is fine.
     /// Defaults to an error (import unsupported).
-    async fn import(&self, _id: String) -> Result<Self::Model, ResourceError> {
+    async fn import(&self, _ctx: &mut Ctx, _id: String) -> Result<Self::Model, ResourceError> {
         Err(ResourceError::new("this resource does not support import"))
     }
 
@@ -259,6 +271,7 @@ pub trait Resource: Send + Sync + 'static {
     /// error; implement it whenever you raise `SCHEMA_VERSION`.
     async fn upgrade(
         &self,
+        _ctx: &mut Ctx,
         _from_version: i64,
         _prior: Value,
     ) -> Result<Self::Model, ResourceError> {
@@ -272,7 +285,7 @@ pub trait Resource: Send + Sync + 'static {
     /// Runs early, before planning. Attributes the user did not set — or whose
     /// values are not yet known (references to other resources) — arrive as
     /// their zero value, so guard accordingly. Defaults to no diagnostics.
-    async fn validate(&self, _config: Self::Model) -> Vec<Diag> {
+    async fn validate(&self, _ctx: &mut Ctx, _config: Self::Model) -> Vec<Diag> {
         Vec::new()
     }
 
@@ -287,6 +300,7 @@ pub trait Resource: Send + Sync + 'static {
     /// config-driven fields, not computed ones. Defaults to no modifications.
     async fn modify_plan(
         &self,
+        _ctx: &mut Ctx,
         _prior: Option<Self::Model>,
         _proposed: Self::Model,
     ) -> Result<PlanModifications, ResourceError> {
@@ -339,16 +353,27 @@ pub(crate) fn codec_diag(context: &str, e: impl std::fmt::Display) -> Diagnostic
 #[async_trait]
 impl<R: Resource> DynResource for ResourceAdapter<R> {
     async fn create(&self, planned: Value) -> Result<Value, Diagnostics> {
+        let mut ctx = current_ctx();
         let model: R::Model =
             from_value(&planned).map_err(|e| codec_diag("decode planned state", e))?;
-        let result = self.inner.create(model).await.map_err(Diagnostics::from)?;
+        let result = self
+            .inner
+            .create(&mut ctx, model)
+            .await
+            .map_err(Diagnostics::from)?;
         to_value(&result).map_err(|e| codec_diag("encode new state", e))
     }
 
     async fn read(&self, current: Value) -> Result<Option<Value>, Diagnostics> {
+        let mut ctx = current_ctx();
         let model: R::Model =
             from_value(&current).map_err(|e| codec_diag("decode current state", e))?;
-        match self.inner.read(model).await.map_err(Diagnostics::from)? {
+        match self
+            .inner
+            .read(&mut ctx, model)
+            .await
+            .map_err(Diagnostics::from)?
+        {
             Some(refreshed) => Ok(Some(
                 to_value(&refreshed).map_err(|e| codec_diag("encode refreshed state", e))?,
             )),
@@ -357,41 +382,53 @@ impl<R: Resource> DynResource for ResourceAdapter<R> {
     }
 
     async fn update(&self, planned: Value, prior: Value) -> Result<Value, Diagnostics> {
+        let mut ctx = current_ctx();
         let planned_model: R::Model =
             from_value(&planned).map_err(|e| codec_diag("decode planned state", e))?;
         let prior_model: R::Model =
             from_value(&prior).map_err(|e| codec_diag("decode prior state", e))?;
         let result = self
             .inner
-            .update(planned_model, prior_model)
+            .update(&mut ctx, planned_model, prior_model)
             .await
             .map_err(Diagnostics::from)?;
         to_value(&result).map_err(|e| codec_diag("encode new state", e))
     }
 
     async fn delete(&self, prior: Value) -> Result<(), Diagnostics> {
+        let mut ctx = current_ctx();
         let model: R::Model =
             from_value(&prior).map_err(|e| codec_diag("decode prior state", e))?;
-        self.inner.delete(model).await.map_err(Diagnostics::from)
+        self.inner
+            .delete(&mut ctx, model)
+            .await
+            .map_err(Diagnostics::from)
     }
 
     async fn import(&self, id: String) -> Result<Value, Diagnostics> {
-        let result = self.inner.import(id).await.map_err(Diagnostics::from)?;
+        let mut ctx = current_ctx();
+        let result = self
+            .inner
+            .import(&mut ctx, id)
+            .await
+            .map_err(Diagnostics::from)?;
         to_value(&result).map_err(|e| codec_diag("encode imported state", e))
     }
 
     async fn upgrade(&self, from_version: i64, prior: Value) -> Result<Value, Diagnostics> {
+        let mut ctx = current_ctx();
         let result = self
             .inner
-            .upgrade(from_version, prior)
+            .upgrade(&mut ctx, from_version, prior)
             .await
             .map_err(Diagnostics::from)?;
         to_value(&result).map_err(|e| codec_diag("encode upgraded state", e))
     }
 
     async fn validate(&self, config: Value) -> Diagnostics {
+        let mut ctx = current_ctx();
         match from_value::<R::Model>(&config) {
-            Ok(model) => self.inner.validate(model).await,
+            Ok(model) => self.inner.validate(&mut ctx, model).await,
             Err(e) => codec_diag("decode config for validation", e),
         }
     }
@@ -401,6 +438,7 @@ impl<R: Resource> DynResource for ResourceAdapter<R> {
         prior: Value,
         proposed: Value,
     ) -> Result<PlanModifications, Diagnostics> {
+        let mut ctx = current_ctx();
         let prior_model = match &prior {
             Value::Null => None,
             _ => Some(
@@ -410,7 +448,7 @@ impl<R: Resource> DynResource for ResourceAdapter<R> {
         let proposed_model: R::Model =
             from_value(&proposed).map_err(|e| codec_diag("decode proposed state", e))?;
         self.inner
-            .modify_plan(prior_model, proposed_model)
+            .modify_plan(&mut ctx, prior_model, proposed_model)
             .await
             .map_err(Diagnostics::from)
     }

@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use facet::Facet;
 use terraform_provider::terraform;
-use terraform_runtime::{async_trait, serve, Provider, Resource, ResourceError};
+use terraform_runtime::{async_trait, serve, Ctx, Provider, Resource, ResourceError};
 
 /// Provider-level configuration: where resource JSON files are written.
 #[derive(Facet)]
@@ -113,19 +113,20 @@ impl FileHandler {
 impl Resource for FileHandler {
     type Model = FileModel;
 
-    async fn create(&self, planned: FileModel) -> Result<FileModel, ResourceError> {
+    async fn create(&self, _ctx: &mut Ctx, planned: FileModel) -> Result<FileModel, ResourceError> {
         self.persist(planned, "created")
     }
 
     async fn update(
         &self,
+        _ctx: &mut Ctx,
         planned: FileModel,
         _prior: FileModel,
     ) -> Result<FileModel, ResourceError> {
         self.persist(planned, "updated")
     }
 
-    async fn delete(&self, prior: FileModel) -> Result<(), ResourceError> {
+    async fn delete(&self, _ctx: &mut Ctx, prior: FileModel) -> Result<(), ResourceError> {
         let path = self.file_path(&prior.name);
         // Tolerate an already-absent file so destroy stays idempotent.
         match fs::remove_file(&path) {
@@ -238,19 +239,24 @@ impl DocumentHandler {
 impl Resource for DocumentHandler {
     type Model = DocumentModel;
 
-    async fn create(&self, planned: DocumentModel) -> Result<DocumentModel, ResourceError> {
+    async fn create(
+        &self,
+        _ctx: &mut Ctx,
+        planned: DocumentModel,
+    ) -> Result<DocumentModel, ResourceError> {
         self.persist(planned, "created")
     }
 
     async fn update(
         &self,
+        _ctx: &mut Ctx,
         planned: DocumentModel,
         _prior: DocumentModel,
     ) -> Result<DocumentModel, ResourceError> {
         self.persist(planned, "updated")
     }
 
-    async fn delete(&self, prior: DocumentModel) -> Result<(), ResourceError> {
+    async fn delete(&self, _ctx: &mut Ctx, prior: DocumentModel) -> Result<(), ResourceError> {
         match fs::remove_file(self.file_path(&prior.name)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

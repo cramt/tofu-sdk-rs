@@ -9,6 +9,7 @@
 //! auto-mTLS. Resource CRUD and planning arrive in later phases.
 
 mod builder;
+mod ctx;
 mod data_source;
 pub mod handshake;
 mod log;
@@ -22,6 +23,7 @@ pub use builder::{
     BuildError, ConfigureError, DynConfigure, DynValidateConfig, IntoConfigured, Provider,
     ProviderBuilder,
 };
+pub use ctx::Ctx;
 pub use data_source::{DataSource, DataSourceError, DataSourceList};
 pub use resource::{PlanModifications, Resource, ResourceError};
 pub use serve::{serve, ServeError};

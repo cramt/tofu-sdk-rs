@@ -23,6 +23,7 @@ use facet::Facet;
 use terraform_codec::{from_value, to_value};
 use terraform_value::Value;
 
+use crate::ctx::{current_ctx, Ctx};
 use crate::resource::{codec_diag, Diag, Diagnostics, Severity};
 
 /// An error returned by a data source read, surfaced to Terraform as an error
@@ -87,13 +88,18 @@ pub trait DataSource: Send + Sync + 'static {
     type Model: Facet<'static> + Send + Sync;
 
     /// Read the data source from its configuration and return the state with
-    /// computed attributes filled in.
-    async fn read(&self, config: Self::Model) -> Result<Self::Model, DataSourceError>;
+    /// computed attributes filled in. Use `ctx` to emit success warnings or
+    /// observe cancellation.
+    async fn read(
+        &self,
+        ctx: &mut Ctx,
+        config: Self::Model,
+    ) -> Result<Self::Model, DataSourceError>;
 
     /// Validate the data source configuration, returning any diagnostics. Runs
     /// before reading; unset/unknown attributes arrive as their zero value.
     /// Defaults to no diagnostics.
-    async fn validate(&self, _config: Self::Model) -> Vec<Diag> {
+    async fn validate(&self, _ctx: &mut Ctx, _config: Self::Model) -> Vec<Diag> {
         Vec::new()
     }
 }
@@ -122,11 +128,12 @@ impl<D: DataSource> DataSourceAdapter<D> {
 #[async_trait]
 impl<D: DataSource> DynDataSource for DataSourceAdapter<D> {
     async fn read(&self, config: Value) -> Result<Value, Diagnostics> {
+        let mut ctx = current_ctx();
         let model: D::Model =
             from_value(&config).map_err(|e| codec_diag("decode data source config", e))?;
         let result = self
             .inner
-            .read(model)
+            .read(&mut ctx, model)
             .await
             .map_err(Diag::from)
             .map_err(|d| vec![d])?;
@@ -134,8 +141,9 @@ impl<D: DataSource> DynDataSource for DataSourceAdapter<D> {
     }
 
     async fn validate(&self, config: Value) -> Diagnostics {
+        let mut ctx = current_ctx();
         match from_value::<D::Model>(&config) {
-            Ok(model) => self.inner.validate(model).await,
+            Ok(model) => self.inner.validate(&mut ctx, model).await,
             Err(e) => codec_diag("decode data source config for validation", e),
         }
     }
@@ -154,8 +162,13 @@ pub trait DataSourceList: Send + Sync + 'static {
     /// of each result object).
     type Model: Facet<'static> + Send + Sync;
 
-    /// Return every object matching the populated search keys in `query`.
-    async fn list(&self, query: Self::Model) -> Result<Vec<Self::Model>, DataSourceError>;
+    /// Return every object matching the populated search keys in `query`. Use
+    /// `ctx` to emit success warnings or observe cancellation.
+    async fn list(
+        &self,
+        ctx: &mut Ctx,
+        query: Self::Model,
+    ) -> Result<Vec<Self::Model>, DataSourceError>;
 }
 
 /// Wraps a typed [`DataSourceList`] as an erased [`DynDataSource`]. It decodes
@@ -183,11 +196,12 @@ impl<D: DataSourceList> DynDataSource for DataSourceListAdapter<D> {
     async fn read(&self, config: Value) -> Result<Value, Diagnostics> {
         // The plural config wraps the shared-key inputs (its `results` key, if
         // present, is not a model field and is ignored by the decode).
+        let mut ctx = current_ctx();
         let query: D::Model =
             from_value(&config).map_err(|e| codec_diag("decode data source query", e))?;
         let items = self
             .inner
-            .list(query)
+            .list(&mut ctx, query)
             .await
             .map_err(Diag::from)
             .map_err(|d| vec![d])?;

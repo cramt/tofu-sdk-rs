@@ -24,7 +24,7 @@ other backends later and keeps the dynamic protocol details out of your code.
 ```rust
 use facet::Facet;
 use terraform_provider::terraform;
-use terraform_runtime::{async_trait, serve, Provider, Resource, ResourceError};
+use terraform_runtime::{async_trait, serve, Ctx, Provider, Resource, ResourceError};
 
 /// The resource's schema, reflected from a plain Rust struct. The name comes
 /// from the marker; bare `#[facet(terraform::resource)]` would infer it as
@@ -47,8 +47,10 @@ struct BucketResource;
 impl Resource for BucketResource {
     type Model = Bucket;
 
-    async fn create(&self, mut planned: Bucket) -> Result<Bucket, ResourceError> {
+    async fn create(&self, ctx: &mut Ctx, mut planned: Bucket) -> Result<Bucket, ResourceError> {
         planned.arn = format!("arn:aws:s3:::{}", planned.name);
+        // `ctx` carries success-path warnings, private state, and cancellation.
+        ctx.warn("note", "this is a demo resource with no real backend");
         Ok(planned)
     }
     // read defaults to a passthrough, delete to a no-op.
