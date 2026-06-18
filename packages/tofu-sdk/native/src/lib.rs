@@ -132,7 +132,11 @@ fn nested_block_from_value(value: &facet_value::Value) -> std::result::Result<Ne
         .ok_or("block is missing a string `name`")?
         .as_str()
         .to_string();
-    let nesting = match bo.get("nesting").and_then(|v| v.as_string()).map(|s| s.as_str()) {
+    let nesting = match bo
+        .get("nesting")
+        .and_then(|v| v.as_string())
+        .map(|s| s.as_str())
+    {
         Some("single") => NestingMode::Single,
         Some("set") => NestingMode::Set,
         Some("map") => NestingMode::Map,
@@ -140,7 +144,11 @@ fn nested_block_from_value(value: &facet_value::Value) -> std::result::Result<Ne
         Some("list") | None => NestingMode::List,
         Some(other) => return Err(format!("block `{name}` has unknown nesting `{other}`")),
     };
-    let int = |key: &str| bo.get(key).and_then(|v| v.as_i64());
+    let int = |key: &str| {
+        bo.get(key)
+            .and_then(|v| v.as_number())
+            .and_then(|n| n.to_i64())
+    };
     let inner = bo
         .get("block")
         .ok_or_else(|| format!("block `{name}` is missing a `block` schema"))?;

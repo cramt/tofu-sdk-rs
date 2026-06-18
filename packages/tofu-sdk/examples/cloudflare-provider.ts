@@ -7,6 +7,12 @@
 // backend, this one talks to Cloudflare for real. Applying it will mint (and
 // destroy) actual API tokens on your account, so treat it as a live example.
 //
+// Two things to note in the schema:
+//   * `policy` is a repeatable nested **block** (HCL `policy { … }`), not a
+//     `policies = [{ … }]` attribute — declared via `blocks: ["policy"]`.
+//   * permission groups are given **by name** (`permission_groups = ["DNS Write"]`);
+//     the create/update handlers resolve those names to Cloudflare's group IDs.
+//
 // Run it against tofu/terraform via dev_overrides:
 //
 //   # from packages/tofu-sdk, after `pnpm build` (builds the native addon + dist):
@@ -30,11 +36,11 @@
 //
 //   resource "cloudflare_api_token" "ci" {
 //     name = "ci-deploy"
-//     policies = [{
+//     policy {
 //       effect            = "allow"
 //       resources         = { "com.cloudflare.api.account.zone.*" = "*" }
-//       permission_groups = [{ id = "<permission-group-id>" }]
-//     }]
+//       permission_groups = ["DNS Write", "Zone Read"]
+//     }
 //   }
 //
 //   output "token" {
@@ -52,27 +58,28 @@ import { Provider, type Diagnostic } from "../ts/index";
 // --- the model -------------------------------------------------------------
 
 // One policy = an effect over a set of resources, granted a set of permission
-// groups. This is exactly Cloudflare's token-policy shape, expressed in Zod so
-// the cty schema is derived for us. `effect` is "allow" | "deny" (kept as a
-// plain string so the schema derivation stays a simple cty `string`).
+// groups *by name*. Rendered as a repeatable `policy { … }` block (see
+// `blocks: ["policy"]` below). `effect` is "allow" | "deny" (kept as a plain
+// string so the schema derivation stays a simple cty `string`).
 const Policy = z.object({
   effect: z.string(),
   // e.g. { "com.cloudflare.api.account.zone.*": "*" } — scope glob -> "*".
   resources: z.record(z.string(), z.string()),
-  permissionGroups: z.array(z.object({ id: z.string() })),
+  // Permission-group names, e.g. ["DNS Write", "Zone Read"]; resolved to IDs.
+  permission_groups: z.array(z.string()),
 });
 
 const ApiToken = z.object({
   // Inputs.
   name: z.string(),
-  policies: z.array(Policy),
+  policy: z.array(Policy),
 
   // Computed, filled by Cloudflare on create.
   id: z.string(),
   value: z.string(), // the secret — only ever returned at creation time
   status: z.string(),
-  issuedOn: z.string().optional(),
-  modifiedOn: z.string().optional(),
+  issued_on: z.string().optional(),
+  modified_on: z.string().optional(),
 });
 
 type ApiToken = z.infer<typeof ApiToken>;
@@ -92,12 +99,32 @@ function client(): Cloudflare {
 /** Cloudflare's create-token policy type, borrowed without naming its namespace. */
 type TokenPolicies = Parameters<Cloudflare["user"]["tokens"]["create"]>[0]["policies"];
 
-/** Map our Zod policies onto the SDK's `policies` param shape. */
-function toApiPolicies(policies: ApiToken["policies"]): TokenPolicies {
+// Permission groups are stable per account; fetch the catalog once and cache the
+// name -> id map for the life of the process.
+let permissionGroupIds: Map<string, string> | null = null;
+
+async function permissionGroupCatalog(): Promise<Map<string, string>> {
+  if (permissionGroupIds) return permissionGroupIds;
+  const byName = new Map<string, string>();
+  // Auto-paginates; each group has an `id` and a human-readable `name`.
+  for await (const group of client().user.tokens.permissionGroups.list()) {
+    if (group.name && group.id) byName.set(group.name, group.id);
+  }
+  permissionGroupIds = byName;
+  return byName;
+}
+
+/** Map our by-name Zod policies onto the SDK's `policies` param (groups by id). */
+async function toApiPolicies(policies: ApiToken["policy"]): Promise<TokenPolicies> {
+  const catalog = await permissionGroupCatalog();
   return policies.map((p) => ({
     effect: p.effect as "allow" | "deny",
     resources: p.resources,
-    permission_groups: p.permissionGroups.map((g) => ({ id: g.id })),
+    permission_groups: p.permission_groups.map((name) => {
+      const id = catalog.get(name);
+      if (!id) throw new Error(`unknown permission group: "${name}"`);
+      return { id };
+    }),
   }));
 }
 
@@ -106,9 +133,9 @@ function toApiPolicies(policies: ApiToken["policies"]): TokenPolicies {
 new Provider()
   .config({
     // `api_token` is optional in config; we fall back to CLOUDFLARE_API_TOKEN.
-    schema: z.object({ apiToken: z.string().optional() }),
+    schema: z.object({ api_token: z.string().optional() }),
     async configure(config) {
-      const apiToken = config.apiToken ?? process.env.CLOUDFLARE_API_TOKEN;
+      const apiToken = config.api_token ?? process.env.CLOUDFLARE_API_TOKEN;
       if (!apiToken) {
         throw new Error(
           "set `api_token` in the provider block or CLOUDFLARE_API_TOKEN in the env",
@@ -119,21 +146,23 @@ new Provider()
   })
   .resource("cloudflare_api_token", {
     schema: ApiToken,
+    // `policy` is a repeatable HCL block, not a `policy = [...]` attribute.
+    blocks: ["policy"],
     // The secret value is computed and must never appear in plan output.
-    computed: ["id", "value", "status", "issuedOn", "modifiedOn"],
+    computed: ["id", "value", "status", "issued_on", "modified_on"],
     sensitive: ["value"],
     async create(planned) {
       const created = await client().user.tokens.create({
         name: planned.name,
-        policies: toApiPolicies(planned.policies),
+        policies: await toApiPolicies(planned.policy),
       });
       return {
         ...planned,
         id: created.id ?? "",
         value: created.value ?? "",
         status: created.status ?? "active",
-        issuedOn: created.issued_on,
-        modifiedOn: created.modified_on,
+        issued_on: created.issued_on,
+        modified_on: created.modified_on,
       };
     },
     async read(current) {
@@ -144,13 +173,13 @@ new Provider()
         ...current,
         name: token.name ?? current.name,
         status: token.status ?? current.status,
-        modifiedOn: token.modified_on,
+        modified_on: token.modified_on,
       };
     },
     async update(planned, prior) {
       const token = await client().user.tokens.update(prior.id, {
         name: planned.name,
-        policies: toApiPolicies(planned.policies),
+        policies: await toApiPolicies(planned.policy),
         status: prior.status as "active" | "disabled" | "expired",
       });
       return {
@@ -158,8 +187,8 @@ new Provider()
         id: prior.id,
         value: prior.value, // unchanged; never re-returned
         status: token.status ?? prior.status,
-        issuedOn: prior.issuedOn,
-        modifiedOn: token.modified_on,
+        issued_on: prior.issued_on,
+        modified_on: token.modified_on,
       };
     },
     async delete(prior) {
@@ -168,11 +197,11 @@ new Provider()
     // Reject obviously-broken config before planning.
     validate(config) {
       const diagnostics: Diagnostic[] = [];
-      if (config.policies && config.policies.length === 0) {
+      if (config.policy && config.policy.length === 0) {
         diagnostics.push({
           severity: "error",
           summary: "an API token needs at least one policy",
-          attribute: ["policies"],
+          attribute: ["policy"],
         });
       }
       return diagnostics;

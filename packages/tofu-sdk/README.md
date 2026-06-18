@@ -31,11 +31,18 @@ await new Provider()
 Schemas are [Zod](https://zod.dev) objects: you get runtime validation and
 inferred handler types for free, and the cty schema Terraform needs is derived
 from them. The Terraform-only dispositions Zod can't express — `computed`,
-`forceNew`, `sensitive` — are arrays of field names that are **type-checked
-against the schema** (a typo is a compile error). `create` is required;
-`read` / `update` / `delete` default to sensible no-ops. `forceNew` drives
-replacement in the planning engine; `computed` attributes are filled by your
-handlers and surface as "known after apply".
+`forceNew`, `sensitive`, `blocks` — are arrays of field names that are
+**type-checked against the schema** (a typo is a compile error). `create` is
+required; `read` / `update` / `delete` default to sensible no-ops. `forceNew`
+drives replacement in the planning engine; `computed` attributes are filled by
+your handlers and surface as "known after apply".
+
+`blocks` renders a field as a nested **block** (`name { … }`) instead of an
+object/list attribute (`name = …`): name an object field for a single block, or
+an array-of-objects field for a repeatable one. On the wire a block is just an
+object/list, so your handlers see the field unchanged — see
+[`examples/cloudflare-provider.ts`](examples/cloudflare-provider.ts) for a
+repeatable `policy { … }` block.
 
 ## The provider binary
 

@@ -91,9 +91,14 @@ shell (it shells out to `cargo`, which needs `PROTOC`); `pnpm test` drives a rea
 Schemas in the TS layer (`ts/index.ts`) are **Zod** objects: `z.toJSONSchema` →
 cty (the structural derivation Standard Schema can't provide), `z.infer` gives
 the handler types, and `safeParse` validates handler output. The Terraform-only
-dispositions Zod can't express (`computed`/`forceNew`/`sensitive`) are arrays
-typed as `(keyof z.infer<S>)[]`, so a bad field name is a compile error. This is
-entirely TS-side; it compiles down to the same cty-JSON the addon already takes.
+dispositions Zod can't express (`computed`/`forceNew`/`sensitive`/`blocks`) are
+arrays typed as `(keyof z.infer<S>)[]`, so a bad field name is a compile error.
+This is entirely TS-side; it compiles down to the same cty-JSON the addon takes.
+`blocks` names object/array-of-object fields to emit as nested **blocks** (the
+addon's `block_from_schema_json` now parses a `blocks` array into IR
+`NestedBlock`s; the TS `blockFromField` derives them from the Zod element). So
+the TS frontend gets HCL `name { … }` blocks without the facet `terraform::block`
+marker — see `examples/cloudflare-provider.ts`.
 
 ## Conventions & gotchas (read before changing these)
 
