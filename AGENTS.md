@@ -145,10 +145,16 @@ entirely TS-side; it compiles down to the same cty-JSON the addon already takes.
   codec already handle blocks — a block is just an object/list/set/map on the
   wire — so block support lives entirely in `reader.rs::nested_block_from_field`.
   `plan.rs::mark_computed_unknown` now **recurses into nested blocks**, so a
-  *computed* attribute inside a block is marked unknown correctly. Remaining
-  limitations: required single blocks aren't distinguished (`min_items` is always
-  0); and the data-source projection (`model_attributes`) ignores the marker,
-  rendering a block field as an object attribute.
+  *computed* attribute inside a block is marked unknown correctly. Required-ness
+  of a *single* block is read from the type: a bare struct is a **required**
+  single block (`min_items = 1`), an `Option<struct>` is optional
+  (`min_items = 0`); collection blocks are always `min_items = 0` (a `NestedBlock`
+  now carries `min_items`/`max_items`, emitted by `tfplugin6`). The **singular**
+  data-source projection (`reflect_data_source`) keeps a `block` field as a
+  read-only nested block (every inner attribute computed, `min_items` 0) instead
+  of collapsing it to an object attribute; the **plural** projection still renders
+  it as an object attribute inside the computed `results` `list(object(...))`,
+  since a repeated HCL block can't be a list element.
 - **Decode of `Unknown`/null-on-non-`Option` → the type's zero value.** Plain
   Rust types can't hold "unknown"; resource handlers fill computed fields, so
   this is fine in practice. Use **`TfValue<T>`** (`terraform-value`, re-exported

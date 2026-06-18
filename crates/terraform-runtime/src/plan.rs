@@ -284,6 +284,8 @@ mod tests {
                     ],
                     nested_blocks: Vec::new(),
                 },
+                min_items: 0,
+                max_items: 0,
             }],
         }
     }

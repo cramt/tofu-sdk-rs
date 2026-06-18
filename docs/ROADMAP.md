@@ -67,9 +67,12 @@ Rough priority order, each pointing at its tracked item:
 5. **Write-only attributes.** `write_only` is a hardcoded `false` schema flag;
    real write-only *semantics* (the value is never persisted to state) is more
    than the flag. → **3.4** (flag) + runtime support.
-6. **Nested-block fidelity.** Required single blocks aren't distinguished from
-   optional (`min_items` always 0), and the data-source projection renders a
-   `block` field as an object attribute. → **3.4** (min_items) + new **3.7**.
+6. ~~**Nested-block fidelity.**~~ ✅ **DONE** — a `NestedBlock` carries
+   `min_items`/`max_items`: a bare-struct single block is required
+   (`min_items = 1`), `Option<struct>` optional; collections stay unbounded. The
+   singular data-source projection keeps a `block` field as a read-only nested
+   block instead of an object attribute (the plural `results` list keeps it as an
+   object attribute — unavoidable for a `list(object(...))`). → **3.7**.
 7. **Modern protocol surfaces** — provider-defined functions, ephemeral
    resources, cross-type state move — are increasingly table-stakes for newer
    providers. → **3.2** + **Tier 4**.
@@ -329,10 +332,10 @@ via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`)
 - **`timeouts {}`:** the common per-operation timeout block convention. Now
   expressible as a nested block; needs runtime plumbing to read + enforce.
 - **Schema flags:** `emit_attribute` hardcodes `deprecated: false` /
-  `write_only: false`; `emit_nested_block` hardcodes `min_items: 0`/`max_items: 0`.
-  Add `deprecated`/`write_only` markers and required-block (`min_items`) support.
-  Note `write_only` is two pieces: the schema flag *and* the runtime semantics
-  (the value is validated/used but never persisted to state).
+  `write_only: false`. Add `deprecated`/`write_only` markers. Note `write_only`
+  is two pieces: the schema flag *and* the runtime semantics (the value is
+  validated/used but never persisted to state). (Required-block `min_items` is
+  done — see 3.7 / nested-block fidelity.)
 
 ### 3.5 Plan modification depth
 - **Why:** `Resource::modify_plan` today operates on **top-level attribute
@@ -373,21 +376,17 @@ via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`)
 - **Done when:** an attribute with a normalization hook stops showing a spurious
   diff for an equivalent-but-differently-encoded value.
 
-### 3.7 Data-source block projection
-- **Why:** a field marked `#[facet(terraform::block)]` reflects as a nested block
-  on the *resource* but the data-source projection (`model_attributes` in
-  `terraform-reflect`) renders it as a plain **object attribute**, so a data
-  source over a model with blocks has a schema that doesn't match the resource's.
-- **Current:** `reflect_data_source`/`reflect_data_source_list`
-  (`terraform-reflect`) ignore the `block` marker (noted in AGENTS.md /
-  README limitations).
-- **Approach:** have the data-source projection honor the `block` marker and emit
-  a `NestedBlock` (computed) the same way the resource path does in
-  `reader.rs::nested_block_from_field`.
-- **Verify:** `terraform-reflect` unit test that a block field projects to a
-  nested block in the data-source schema; `tofu_schema.rs` contract assertion.
-- **Done when:** a data source projected from a model with blocks renders those
-  as blocks, matching the resource.
+### 3.7 Data-source block projection — ✅ DONE (singular)
+- **Done:** `reflect_data_source` now honors the `block` marker, projecting a
+  block field as a read-only `NestedBlock` (every inner attribute computed,
+  recursively, `min_items` forced to 0) via `as_computed_block` — matching the
+  resource path instead of collapsing to an object attribute. Regression:
+  `singular_projection_keeps_block_as_computed_nested_block` in
+  `terraform-reflect/src/reader.rs`.
+- **Plural caveat (by design):** the *plural* projection still renders a block
+  field as an object attribute inside the computed `results` `list(object(...))`.
+  A repeated HCL block can't be an element of a computed list, so the structure
+  is carried as typed data — this is correct, not a gap.
 
 ---
 

@@ -163,4 +163,12 @@ pub struct NestedBlock {
     pub nesting: NestingMode,
     /// The nested block's own structure.
     pub block: Block,
+    /// Minimum number of instances. For a [`NestingMode::Single`] block, `1`
+    /// means the block is *required* and `0` means optional. For `List`/`Set`/
+    /// `Map` it is `0` (a required-non-empty collection can't be inferred from a
+    /// Rust `Vec`/`HashSet`/`HashMap` type).
+    pub min_items: i64,
+    /// Maximum number of instances, or `0` for unbounded. A
+    /// [`NestingMode::Single`] block is capped at `1`.
+    pub max_items: i64,
 }

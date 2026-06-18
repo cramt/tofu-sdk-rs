@@ -204,24 +204,53 @@ fn as_input(mut attr: AttributeSchema, required: bool) -> AttributeSchema {
     attr
 }
 
+/// Project a nested block into a read-only output for a data source: every
+/// attribute (recursively, through sub-blocks) becomes computed, and the block
+/// is no longer a required input (`min_items` drops to 0).
+fn as_computed_block(mut nested: NestedBlock) -> NestedBlock {
+    nested.min_items = 0;
+    nested.block = computed_block(nested.block);
+    nested
+}
+
+/// Recursively mark every attribute in `block` (and its sub-blocks) computed.
+fn computed_block(block: Block) -> Block {
+    Block {
+        attributes: block.attributes.into_iter().map(as_computed).collect(),
+        nested_blocks: block
+            .nested_blocks
+            .into_iter()
+            .map(as_computed_block)
+            .collect(),
+    }
+}
+
 /// Reflect a Rust type into a **singular** [`DataSourceSchema`]: the
 /// `search_key(exclusive)` fields become required lookup inputs and every other
 /// field becomes a computed output. The data source resolves to a single object.
 pub fn reflect_data_source<T: Facet<'static>>(
     name: impl Into<String>,
 ) -> Result<DataSourceSchema, ReflectError> {
-    let attributes = model_attributes(T::SHAPE)?
-        .into_iter()
-        .map(|(attr, kind)| match kind {
-            Some(SearchKind::Exclusive) => as_input(attr, true),
-            _ => as_computed(attr),
-        })
-        .collect();
+    let mut attributes = Vec::new();
+    let mut nested_blocks = Vec::new();
+    for field in struct_fields(T::SHAPE)? {
+        if field.has_attr(Some(NS), "block") {
+            // A `block` field stays a nested block (read-only), consistent with
+            // the resource — rather than collapsing into an object attribute.
+            nested_blocks.push(as_computed_block(nested_block_from_field(field)?));
+        } else {
+            let attr = attribute_from_field(field)?;
+            attributes.push(match search_kind(field)? {
+                Some(SearchKind::Exclusive) => as_input(attr, true),
+                _ => as_computed(attr),
+            });
+        }
+    }
     Ok(DataSourceSchema {
         name: name.into(),
         block: Block {
             attributes,
-            nested_blocks: Vec::new(),
+            nested_blocks,
         },
     })
 }
@@ -240,6 +269,11 @@ pub struct PluralDataSource {
 /// fields become optional lookup inputs and the result is a computed `results`
 /// list whose elements are objects of the full model. The data source resolves
 /// to any number of objects.
+///
+/// Unlike the singular projection, a `block` field here renders as an *object
+/// attribute* inside the `results` element rather than a nested block — a
+/// repeated HCL block can't be an element of a computed `list(object(...))`, so
+/// the structure is carried as typed data instead.
 pub fn reflect_data_source_list<T: Facet<'static>>(
     name: impl Into<String>,
 ) -> Result<PluralDataSource, ReflectError> {
@@ -308,10 +342,17 @@ fn block_from_shape(shape: &'static Shape) -> Result<Block, ReflectError> {
 /// [`NestingMode::List`], a set is [`NestingMode::Set`], and a string-keyed map
 /// is [`NestingMode::Map`]. The element struct is reflected recursively, so a
 /// block may itself contain attributes and further nested blocks.
+///
+/// Required-ness is read from the type for *single* blocks: a bare struct is a
+/// **required** single block (`min_items = 1`), while an `Option<struct>` is
+/// optional (`min_items = 0`). Collection blocks (`Vec`/`HashSet`/`HashMap`) are
+/// always `min_items = 0`, since "non-empty" can't be inferred from the type.
 fn nested_block_from_field(field: &'static Field) -> Result<NestedBlock, ReflectError> {
     let name = field.rename.unwrap_or(field.name).to_string();
 
-    // An `Option<…>` block is just an optional block; peel it before classifying.
+    // An `Option<…>` block is just an optional block; peel it before classifying,
+    // but remember it so a single block is marked optional rather than required.
+    let optional = matches!(field.shape().def, Def::Option(_));
     let shape = match &field.shape().def {
         Def::Option(d) => d.t,
         _ => field.shape(),
@@ -335,10 +376,20 @@ fn nested_block_from_field(field: &'static Field) -> Result<NestedBlock, Reflect
         _ => (NestingMode::Single, shape),
     };
 
+    // A single block is capped at one instance; required unless `Option`-wrapped.
+    // Collections are unbounded (`max_items = 0`) and never required.
+    let (min_items, max_items) = match nesting {
+        NestingMode::Single if optional => (0, 1),
+        NestingMode::Single => (1, 1),
+        _ => (0, 0),
+    };
+
     Ok(NestedBlock {
         name,
         nesting,
         block: block_from_shape(element)?,
+        min_items,
+        max_items,
     })
 }
 
@@ -693,9 +744,13 @@ mod tests {
     struct Firewall {
         name: String,
 
-        // Single block (optional).
+        // Single block (optional): `Option<…>` ⇒ min_items 0.
         #[facet(terraform::block)]
         meta: Option<Meta>,
+
+        // Single block (required): a bare struct ⇒ min_items 1.
+        #[facet(terraform::block)]
+        policy: Meta,
 
         // List, set, and map blocks of the same element struct.
         #[facet(terraform::block)]
@@ -718,15 +773,33 @@ mod tests {
     fn block_marker_emits_nested_blocks_with_nesting_modes() {
         let block = reflect_block::<Firewall>().expect("Firewall reflects");
 
-        // `name` stays a plain attribute; the four block fields are nested blocks.
+        // `name` stays a plain attribute; the five block fields are nested blocks.
         assert_eq!(block.attributes.len(), 1);
         assert_eq!(block.attributes[0].name, "name");
-        assert_eq!(block.nested_blocks.len(), 4);
+        assert_eq!(block.nested_blocks.len(), 5);
 
         assert_eq!(nested(&block, "meta").nesting, NestingMode::Single);
+        assert_eq!(nested(&block, "policy").nesting, NestingMode::Single);
         assert_eq!(nested(&block, "ingress").nesting, NestingMode::List);
         assert_eq!(nested(&block, "egress").nesting, NestingMode::Set);
         assert_eq!(nested(&block, "named").nesting, NestingMode::Map);
+    }
+
+    #[test]
+    fn single_block_required_ness_comes_from_the_type() {
+        let block = reflect_block::<Firewall>().expect("Firewall reflects");
+
+        // `Option<Meta>` ⇒ optional single block.
+        let meta = nested(&block, "meta");
+        assert_eq!((meta.min_items, meta.max_items), (0, 1));
+
+        // bare `Meta` ⇒ required single block.
+        let policy = nested(&block, "policy");
+        assert_eq!((policy.min_items, policy.max_items), (1, 1));
+
+        // collections are unbounded and never required.
+        let ingress = nested(&block, "ingress");
+        assert_eq!((ingress.min_items, ingress.max_items), (0, 0));
     }
 
     #[test]
@@ -882,6 +955,48 @@ mod tests {
             "a non-exclusive field is a computed output"
         );
         assert!(attr(&ds.block, "status").computed);
+    }
+
+    #[derive(Facet)]
+    #[allow(dead_code)]
+    struct HostConfig {
+        region: String,
+        zone: Option<String>,
+    }
+
+    #[derive(Facet)]
+    #[facet(terraform::data_source)]
+    #[allow(dead_code)]
+    struct Host {
+        #[facet(terraform::search_key(exclusive))]
+        id: String,
+        #[facet(terraform::computed)]
+        name: String,
+        // A nested block on the model: it must stay a nested block (read-only) in
+        // the data source, not collapse into an object attribute.
+        #[facet(terraform::block)]
+        config: HostConfig,
+    }
+
+    #[test]
+    fn singular_projection_keeps_block_as_computed_nested_block() {
+        let ds = reflect_data_source::<Host>("host").expect("Host reflects");
+
+        // `config` is not flattened into an attribute…
+        assert!(
+            ds.block.attributes.iter().all(|a| a.name != "config"),
+            "a block field must not collapse into an object attribute"
+        );
+        // …it stays a nested block, projected read-only: no longer a required
+        // input (min_items drops to 0) and its inner attributes are computed.
+        let config = nested(&ds.block, "config");
+        assert_eq!(config.nesting, NestingMode::Single);
+        assert_eq!(
+            config.min_items, 0,
+            "an output block is not a required input"
+        );
+        assert!(attr(&config.block, "region").computed);
+        assert!(attr(&config.block, "zone").computed);
     }
 
     #[test]

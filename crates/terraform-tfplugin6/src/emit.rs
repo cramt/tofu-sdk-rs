@@ -141,8 +141,8 @@ fn emit_nested_block(nested: &NestedBlock) -> schema::NestedBlock {
         type_name: nested.name.clone(),
         block: Some(emit_block(&nested.block)),
         nesting: nesting_mode(nested.nesting) as i32,
-        min_items: 0,
-        max_items: 0,
+        min_items: nested.min_items,
+        max_items: nested.max_items,
     }
 }
 
