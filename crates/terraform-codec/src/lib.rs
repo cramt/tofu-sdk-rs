@@ -53,7 +53,7 @@ pub enum CodecError {
 mod tests {
     use std::collections::BTreeMap;
 
-    use terraform_value::{ObjectAttr, Type, Value};
+    use terraform_value::{Number, ObjectAttr, Type, Value};
 
     use super::*;
 
@@ -65,10 +65,33 @@ mod tests {
     }
 
     #[test]
+    fn large_integers_round_trip_without_precision_loss() {
+        // 2^53 + 1 is the smallest integer an f64 cannot represent — the old
+        // `Value::Number(f64)` silently rounded it to 2^53. It must survive both
+        // wire formats exactly now.
+        let big = Value::Number(Number::I64(9_007_199_254_740_993));
+        let beyond_i64 = Value::Number(Number::U64(u64::MAX));
+
+        for v in [&big, &beyond_i64] {
+            // msgpack (schema-directed)
+            let bytes = encode_msgpack(v, &Type::Number).expect("encode msgpack");
+            assert_eq!(&decode_msgpack(&bytes, &Type::Number).unwrap(), v);
+
+            // cty JSON (dynamic, schema-less decode)
+            let json = encode_json(v);
+            assert_eq!(&decode_json_value(&json).unwrap(), v);
+        }
+
+        // Guard the assertion itself: the rounded-down neighbour is NOT equal,
+        // so the round trip above is proving exactness, not numeric mush.
+        assert_ne!(big, Value::Number(Number::I64(9_007_199_254_740_992)));
+    }
+
+    #[test]
     fn primitives_round_trip() {
         round_trip(Value::Bool(true), &Type::Bool);
-        round_trip(Value::Number(42.0), &Type::Number);
-        round_trip(Value::Number(3.5), &Type::Number);
+        round_trip(Value::from(42.0), &Type::Number);
+        round_trip(Value::from(3.5), &Type::Number);
         round_trip(Value::String("hello".into()), &Type::String);
     }
 
@@ -87,7 +110,7 @@ mod tests {
             &Type::list(Type::String),
         );
         round_trip(
-            Value::Set(vec![Value::Number(1.0), Value::Number(2.0)]),
+            Value::Set(vec![Value::from(1.0), Value::from(2.0)]),
             &Type::set(Type::Number),
         );
         let mut m = BTreeMap::new();
@@ -124,7 +147,7 @@ mod tests {
     #[test]
     fn tuple_round_trips() {
         round_trip(
-            Value::Tuple(vec![Value::String("x".into()), Value::Number(1.0)]),
+            Value::Tuple(vec![Value::String("x".into()), Value::from(1.0)]),
             &Type::Tuple(vec![Type::String, Type::Number]),
         );
     }
@@ -164,7 +187,7 @@ mod tests {
         tags.insert("env".to_string(), Value::String("prod".into()));
         let mut obj = BTreeMap::new();
         obj.insert("name".to_string(), Value::String("bucket".into()));
-        obj.insert("count".to_string(), Value::Number(3.0));
+        obj.insert("count".to_string(), Value::from(3.0));
         obj.insert("enabled".to_string(), Value::Bool(true));
         obj.insert("tags".to_string(), Value::Map(tags));
         obj.insert(
@@ -245,7 +268,7 @@ mod tests {
             panic!("expected object")
         };
         assert_eq!(fields["name"], Value::String("bucket".into()));
-        assert_eq!(fields["count"], Value::Number(3.0));
+        assert_eq!(fields["count"], Value::from(3.0));
         let Value::Map(ref tags) = fields["tags"] else {
             panic!("tags map")
         };

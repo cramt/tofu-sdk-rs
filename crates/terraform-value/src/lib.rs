@@ -16,7 +16,7 @@ mod ty;
 mod value;
 
 pub use ty::{ObjectAttr, Type};
-pub use value::Value;
+pub use value::{Number, Value};
 
 /// A Terraform value that may be known, unknown, or null.
 ///

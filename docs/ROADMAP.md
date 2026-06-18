@@ -42,11 +42,10 @@ The items below are what a *large or precision-sensitive* provider (think
 `aws`/`google`) hits in practice. None reshape the public API; all are additive.
 Rough priority order, each pointing at its tracked item:
 
-1. **`f64` numbers — silent precision loss (highest priority, correctness).**
-   `Value::Number` is `f64`, so 64-bit IDs, large byte counts, and
-   high-precision decimals lose precision above 2^53 *with no error*. cty is
-   arbitrary-precision (`big.Float`). This can silently corrupt real state — it
-   is the single most important blocker for a serious provider. → **3.3**.
+1. ~~**`f64` numbers — silent precision loss.**~~ ✅ **DONE** — `Value::Number`
+   is now `enum Number { I64, U64, F64 }`, so the full 64-bit integer range
+   round-trips losslessly. Truly arbitrary precision (beyond 64-bit) remains
+   out of reach, matching the JSON layer's own ceiling. → **3.3**.
 2. **Success-path warnings.** Warnings only ride alongside a CRUD *error* today;
    real providers warn on successful applies (deprecations, drift hints). Needs
    the handler ctx. → **2.2 (deferred)** + ctx work in **3.4**.
@@ -292,27 +291,27 @@ via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`)
 - `moved {}` blocks and cross-resource-type state moves. In `unimplemented_unary!`.
   Add a `Resource::move_state(from_type, from_state) -> Model` hook + dispatch.
 
-### 3.3 Number precision — ⚠️ highest-priority correctness gap
-- **Why:** `Value::Number(f64)` silently loses precision above 2^53. Real
-  providers carry 64-bit IDs, large byte counts, and high-precision decimals;
-  cty is arbitrary-precision (`big.Float`). A truncated ID round-tripped through
-  state is a *silent* data-correctness bug (no error, wrong value), which is why
-  this ranks above every other open item for a serious provider.
-- **Current:** `Value::Number(f64)` (`terraform-value/src/value.rs`); the codec
-  and reflection map `cty.Number` ↔ `f64`; `AttributeSchema.default` holding a
-  `Value` is why IR types are `PartialEq` but not `Eq`.
-- **Approach:** back numbers with a decimal/bignum type (e.g. an arbitrary-
-  precision decimal) preserving the msgpack/JSON wire forms. Wide blast radius:
-  `terraform-value`, `terraform-codec` (encode/decode), `terraform-reflect`
-  (integer/float field types), and every `as f64`. Decide the public surface —
-  authors with plain `i64`/`f64`/`u64` fields must keep working; the lossy
-  conversion should live only at the typed-model boundary, not in the `Value`
-  tree.
-- **Verify:** codec round-trip unit test for an integer > 2^53 (e.g.
-  `9_007_199_254_740_993`) that today fails; a `harness/` config writing a large
-  numeric attribute whose `expected/` JSON proves no precision loss.
-- **Done when:** a 64-bit integer attribute round-trips through plan/apply/state
-  without losing precision.
+### 3.3 Number precision — ✅ DONE
+- **Done:** `Value::Number` now holds `enum Number { I64, U64, F64 }`
+  (`terraform-value/src/value.rs`), mirroring the msgpack int/uint/float forms
+  and the JSON value layer's own number cases. The full signed+unsigned 64-bit
+  integer range round-trips losslessly through both wire formats. The codec
+  keeps integers in their exact case (`number_from_mp`/`number_to_mp` for
+  msgpack, `json_number`/`number_to_json` for cty JSON); the typed-model
+  boundary converts directly per width (`to_i64_lossy`/`to_u64_lossy`/
+  `to_f64_lossy`, plus `wide_int_to_value` narrowing `i128`/`u128`). `Number`
+  equality is by mathematical value across cases, so a 64-bit ID is never
+  conflated with an `f64`-rounded neighbour. Authors keep using plain
+  `i64`/`u64`/`f64` fields; the only lossy step is at the typed boundary when the
+  declared field type genuinely can't hold the value.
+- **Verified:** `large_integers_round_trip_without_precision_loss`
+  (`terraform-codec/src/lib.rs`) round-trips `2^53 + 1` and `u64::MAX` through
+  msgpack and cty JSON; `large_integers_compare_exactly_not_via_f64`
+  (`terraform-value/src/value.rs`) guards the exact-comparison semantics.
+- **Remaining limit (acceptable):** truly arbitrary precision (beyond
+  `i64`/`u64`/`f64`) is still not representable. That matches the ceiling of the
+  JSON value layer (`facet-value`'s `VNumber` is itself `I64`/`U64`/`F64`) and is
+  fine for real configs; lifting it would require changing `facet-value`.
 
 ### 3.4 Misc completeness
 - **Private state to handlers:** `service.rs` round-trips Terraform's per-resource

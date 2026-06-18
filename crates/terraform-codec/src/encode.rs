@@ -2,9 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use facet_value::{VArray, VObject, Value as Json};
+use facet_value::{VArray, VNumber as JsonNumber, VObject, Value as Json};
 use rmpv::{Integer, Utf8String, Value as Mp};
-use terraform_value::{Type, Value};
+use terraform_value::{Number, Type, Value};
 
 use crate::CodecError;
 
@@ -18,7 +18,7 @@ pub fn encode_json(value: &Value) -> Json {
     match value {
         Value::Null | Value::Unknown => Json::NULL,
         Value::Bool(b) => (*b).into(),
-        Value::Number(n) => (*n).into(),
+        Value::Number(n) => number_to_json(*n),
         Value::String(s) => s.clone().into(),
         Value::List(items) | Value::Set(items) | Value::Tuple(items) => {
             let mut arr = VArray::with_capacity(items.len());
@@ -129,12 +129,31 @@ fn encode_dynamic(value: &Value) -> Result<Mp, CodecError> {
     Ok(Mp::Array(vec![Mp::Binary(type_json), inner]))
 }
 
-/// Encode a number as the smallest faithful msgpack form (int if integral).
-fn number_to_mp(n: f64) -> Mp {
-    if n.is_finite() && n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
-        Mp::Integer(Integer::from(n as i64))
-    } else {
-        Mp::F64(n)
+/// Encode a number as the smallest faithful msgpack form. Integers go out as
+/// msgpack int/uint (preserving the full 64-bit range); a float that happens to
+/// be integral and fits `i64` is canonicalised to an int (go-cty's own form),
+/// otherwise it stays a float.
+fn number_to_mp(n: Number) -> Mp {
+    match n {
+        Number::I64(i) => Mp::Integer(Integer::from(i)),
+        Number::U64(u) => Mp::Integer(Integer::from(u)),
+        Number::F64(f) => {
+            if f.is_finite() && f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+                Mp::Integer(Integer::from(f as i64))
+            } else {
+                Mp::F64(f)
+            }
+        }
+    }
+}
+
+/// Encode a number into a `cty` JSON value, preserving the full 64-bit range
+/// (the JSON number layer carries `i64`/`u64`/`f64` distinctly).
+fn number_to_json(n: Number) -> Json {
+    match n {
+        Number::I64(i) => JsonNumber::from_i64(i).into_value(),
+        Number::U64(u) => JsonNumber::from_u64(u).into_value(),
+        Number::F64(f) => f.into(),
     }
 }
 
@@ -154,7 +173,7 @@ fn expect_bool(v: &Value) -> Result<bool, CodecError> {
     }
 }
 
-fn expect_number(v: &Value) -> Result<f64, CodecError> {
+fn expect_number(v: &Value) -> Result<Number, CodecError> {
     match v {
         Value::Number(n) => Ok(*n),
         other => Err(mismatch("number", other)),

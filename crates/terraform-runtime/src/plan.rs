@@ -339,13 +339,13 @@ mod tests {
             attributes: vec![AttributeSchema {
                 optional: true,
                 computed: true,
-                default: Some(Value::Number(5.0)),
+                default: Some(Value::from(5.0)),
                 ..AttributeSchema::new("size", Type::Number)
             }],
             nested_blocks: Vec::new(),
         };
         let p = plan(&Value::Null, obj(&[("size", Value::Null)]), &block);
-        assert_eq!(fields(&p.planned)["size"], Value::Number(5.0));
+        assert_eq!(fields(&p.planned)["size"], Value::from(5.0));
     }
 
     #[test]

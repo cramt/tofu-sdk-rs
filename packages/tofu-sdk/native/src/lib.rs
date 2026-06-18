@@ -241,10 +241,7 @@ impl DynResource for JsResource {
         // is the untyped stored state.
         let input = Value::Object(
             [
-                (
-                    "fromVersion".to_string(),
-                    Value::Number(from_version as f64),
-                ),
+                ("fromVersion".to_string(), Value::from(from_version)),
                 ("priorState".to_string(), prior),
             ]
             .into_iter()
