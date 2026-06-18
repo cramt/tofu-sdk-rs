@@ -19,7 +19,7 @@ Terraform is **not** the source of truth. Your Rust types are. The Terraform
 plugin protocol is a backend the SDK emits *to*, which keeps the door open for
 other backends later and keeps the dynamic protocol details out of your code.
 
-## Example
+## Defining a resource
 
 ```rust
 use facet::Facet;
@@ -71,11 +71,93 @@ Point OpenTofu at the built binary with a `dev_overrides` CLI config and
 the planned/prior state is decoded into `Bucket` and back automatically. No
 schema boilerplate, no stringly-typed field plumbing.
 
+## Data sources from the same model
+
+Mark a struct as **both** a resource and a data source and a lookup key turns it
+into read-only `data` sources — no second schema. An `exclusive` key (unique)
+gives a singular lookup; a `shared` key (generic) gives a plural `…s` lookup with
+a `results` list.
+
+```rust
+use terraform_runtime::{async_trait, Ctx, DataSource, DataSourceError};
+
+#[derive(Facet)]
+#[facet(terraform::resource("aws_s3_bucket"))]
+#[facet(terraform::data_source("aws_s3_bucket"))] // also a data source
+struct Bucket {
+    #[facet(terraform::force_new)]
+    #[facet(terraform::search_key(shared))]      // generic key → plural `aws_s3_buckets`
+    name: String,
+    #[facet(terraform::computed)]
+    #[facet(terraform::search_key(exclusive))]   // unique key → singular `aws_s3_bucket`
+    arn: String,
+}
+
+struct BucketByArn;
+
+#[async_trait]
+impl DataSource for BucketByArn {
+    type Model = Bucket;
+    async fn read(&self, _ctx: &mut Ctx, mut query: Bucket) -> Result<Bucket, DataSourceError> {
+        // `arn` (the exclusive key) arrives set; fill the rest.
+        query.name = query.arn.strip_prefix("arn:aws:s3:::").unwrap_or_default().into();
+        Ok(query)
+    }
+}
+// builder: .data_source(BucketByArn)              // data "aws_s3_bucket", keyed by arn
+//          .data_source_list(BucketsByName)       // data "aws_s3_buckets", keyed by name
+```
+
+## Provider-defined functions
+
+Pure functions callable from HCL as `provider::<name>::<fn>(…)`. Implement
+`Function` over a `Params` struct (its fields are the positional parameters) and
+an `Output` type — the signature is reflected from them.
+
+```rust
+use terraform_runtime::{async_trait, Function, FunctionError, VariadicFunction};
+
+// provider::aws::arn_for("my-bucket")  ->  "arn:aws:s3:::my-bucket"
+#[derive(Facet)]
+struct ArnForArgs { name: String }
+
+struct ArnFor;
+#[async_trait]
+impl Function for ArnFor {
+    type Params = ArnForArgs;
+    type Output = String;
+    async fn call(&self, p: ArnForArgs) -> Result<String, FunctionError> {
+        Ok(format!("arn:aws:s3:::{}", p.name))
+    }
+}
+
+// Variadic: provider::aws::join("-", "a", "b", "c")  ->  "a-b-c"
+// Leading params and the variadic element are separate types, so the const args
+// and the var args can differ — and the type system enforces "exactly one
+// variadic, always last".
+#[derive(Facet)]
+struct JoinArgs { separator: String }
+
+struct Join;
+#[async_trait]
+impl VariadicFunction for Join {
+    type Params = JoinArgs;   // leading params
+    type VarArg = String;     // zero or more trailing args
+    type Output = String;
+    async fn call(&self, p: JoinArgs, parts: Vec<String>) -> Result<String, FunctionError> {
+        Ok(parts.join(&p.separator))
+    }
+}
+// builder: .function("arn_for", ArnFor).function_variadic("join", Join)
+```
+
 ## Status
 
-The original 5-phase MVP is complete: a plain Rust struct plus a `Resource`
-impl is a working provider, exercised end-to-end against **real OpenTofu**
-(`apply` / `plan` / `destroy` / replacement). It is not yet production-hardened.
+The original 5-phase MVP is complete and has grown well past it: a plain Rust
+struct plus a `Resource` impl is a working provider, exercised end-to-end against
+**real OpenTofu** (`apply` / `plan` / `destroy` / replacement). The full lifecycle
+plus data sources, functions, nested blocks, a handler context, and lossless
+64-bit numbers are in (see below). It is not yet battle-tested in production.
 
 - **Phase 1 ✅** — reflection → provider IR → `tfplugin6` schema emission
 - **Phase 2 ✅** — `tfplugin6` gRPC server, go-plugin handshake, auto-mTLS,
@@ -117,7 +199,21 @@ impl is a working provider, exercised end-to-end against **real OpenTofu**
   `Option<struct>` → single, `Vec` → list, set → set, `HashMap<String, _>` →
   map) and the element struct is reflected recursively (blocks may contain
   attributes and further blocks) — verified by a real `tofu apply` over single
-  and list blocks
+  and list blocks. Required-ness of a *single* block is read from the type (a
+  bare struct is required, `min_items = 1`; an `Option<struct>` is optional), and
+  a block field projected into a data source stays a (computed) nested block
+- **Provider-defined functions ✅** — pure functions dispatched on
+  `GetFunctions`/`CallFunction`, callable from HCL as `provider::<name>::<fn>(…)`:
+  implement `Function` (a `Params` struct → positional params, `Output` → return)
+  or `VariadicFunction` (leading params + a `VarArg` element type) — both verified
+  by a real `tofu` calling them over the plugin protocol
+- **Handler context ✅** — every resource/data-source handler takes `&mut Ctx`:
+  success-path warnings (`ctx.warn`, surfaced on a *successful* apply/read),
+  per-resource private state (`ctx.private`/`ctx.set_private`), and cancellation
+  (`ctx.is_cancelled`/`ctx.cancelled`) — verified by direct service tests
+- **Lossless 64-bit numbers ✅** — `Value::Number` is `I64 | U64 | F64`, so the
+  full signed+unsigned 64-bit range (64-bit IDs, large byte counts) round-trips
+  through msgpack and cty JSON without the silent `f64` truncation above 2^53
 - **Production hardening ✅** — a handler `panic!` is caught and returned as an
   error diagnostic instead of crashing the plugin; CRUD errors can point at an
   attribute path and carry warnings (`ResourceError::at`/`with_warning`);
@@ -134,12 +230,12 @@ impl is a working provider, exercised end-to-end against **real OpenTofu**
 
 ### Not yet implemented
 
-Provider-defined functions, ephemeral resources, and cross-type state move.
-Warnings currently ride on a CRUD *error*; success-path warnings await a handler
-ctx. Numbers are held as `f64`. Some nested-block refinements remain: required
-single blocks (`min_items`) are not distinguished from optional, and data-source
-projections render a `block` field as an object attribute rather than a block.
-Not all `cty` corner cases are covered.
+Ephemeral resources and cross-type state move. There is no dedicated
+semantic-equality / normalization hook for suppressing spurious diffs — though
+modeling structured data as structured types (sets as sets, nested blocks as
+blocks) plus `cty`'s native unordered-set semantics avoids most of the need.
+Numbers fit `i64`/`u64`/`f64` (no arbitrary precision beyond 64-bit). Not all
+`cty` corner cases are covered.
 
 ## Workspace layout
 
@@ -163,8 +259,11 @@ Not all `cty` corner cases are covered.
 ## Writing a provider in TypeScript
 
 The Rust core is just one frontend on top of the `terraform-ir` + `Value` seam;
-`@tofu-sdk/core` is another. You describe resources/data sources with a schema
-and async handlers, and the Rust runtime handles the protocol:
+`@tofu-sdk/core` is another. You describe resources and data sources with a
+**Zod** schema and async handlers — Zod gives you validation, inferred handler
+types, *and* the `cty` schema (derived structurally) — and the Rust runtime
+handles the whole plugin protocol. A TS provider is just a `node` script named
+`terraform-provider-<name>`; no compiled binary.
 
 ```ts
 import { z } from "zod";
@@ -174,19 +273,84 @@ const Bucket = z.object({ name: z.string(), arn: z.string() });
 
 await new Provider()
   .resource("aws_s3_bucket", {
-    schema: Bucket,            // Zod -> validation + inferred handler types + cty schema
+    schema: Bucket,            // Zod → validation + inferred handler types + cty schema
     forceNew: ["name"],        // type-checked against the schema's fields
     computed: ["arn"],
     async create(planned) {
       return { ...planned, arn: `arn:aws:s3:::${planned.name}` };
     },
+    // read defaults to passthrough; update/delete/import are optional.
   })
   .serve();
 ```
 
-Schemas are Zod objects (validation + inferred types for free); the cty schema
-is derived from them. See [`packages/tofu-sdk`](packages/tofu-sdk)
-(`pnpm build`, `pnpm test`).
+The Terraform-only dispositions Zod can't express (`computed` / `forceNew` /
+`sensitive`, and which object fields render as HCL **blocks**) are arrays of
+field names — and they're typed `(keyof Schema)[]`, so a typo is a compile error.
+Here's a fuller provider: a `configure` step that builds an API client, a
+repeatable nested `policy { … }` block, a computed+sensitive secret, and a data
+source.
+
+```ts
+import { z } from "zod";
+import { Provider, type Diagnostic } from "@tofu-sdk/core";
+
+const Policy = z.object({
+  effect: z.string(),
+  permission_groups: z.array(z.string()),
+});
+
+const ApiToken = z.object({
+  name: z.string(),
+  policy: z.array(Policy),  // rendered as repeatable `policy { … }` blocks
+  id: z.string(),
+  value: z.string(),        // the secret — computed + sensitive
+});
+
+const TokenLookup = z.object({ id: z.string(), name: z.string() });
+
+let client: ApiClient;
+
+await new Provider()
+  .config({
+    schema: z.object({ api_token: z.string().optional() }),
+    async configure(cfg) {
+      client = new ApiClient(cfg.api_token ?? process.env.API_TOKEN!);
+    },
+  })
+  .resource("example_api_token", {
+    schema: ApiToken,
+    blocks: ["policy"],                    // HCL `policy { … }`, not `policy = [...]`
+    computed: ["id", "value"],
+    sensitive: ["value"],
+    async create(planned) {
+      const created = await client.tokens.create(planned);
+      return { ...planned, id: created.id, value: created.secret };
+    },
+    validate(config): Diagnostic[] {
+      return config.name.length === 0
+        ? [{ severity: "error", summary: "name must not be empty", attribute: ["name"] }]
+        : [];
+    },
+  })
+  .dataSource("example_api_token", {
+    schema: TokenLookup,                   // { id, name }: `id` is the input…
+    computed: ["name"],                    // …`name` is the computed output
+    async read(query) {
+      const token = await client.tokens.get(query.id);
+      return { ...query, name: token.name };
+    },
+  })
+  .serve();
+```
+
+Covered today: resources (full lifecycle + `upgrade`/`import`/`validate`),
+singular and plural data sources (`dataSource` / `dataSourceList`), provider
+config, nested blocks, and sensitive/computed/force-new dispositions. (Provider-
+defined functions are currently Rust-only.) A complete, *real-backend* example —
+a Cloudflare provider talking to the live `cloudflare` SDK — is in
+[`packages/tofu-sdk/examples/cloudflare-provider.ts`](packages/tofu-sdk/examples/cloudflare-provider.ts).
+Build and test with `pnpm build` / `pnpm test` (drives a real `tofu`).
 
 ## Developing
 
