@@ -3,7 +3,8 @@
 use facet::{Def, Facet, Field, PrimitiveType, Shape, Type as FType, UserType};
 use terraform_attrs::Attr as TfAttr;
 use terraform_ir::{
-    AttributeSchema, Block, DataSourceSchema, NestedBlock, NestingMode, ResourceSchema,
+    AttributeSchema, Block, DataSourceSchema, FunctionSignature, NestedBlock, NestingMode,
+    Parameter, ResourceSchema,
 };
 use terraform_value::{Number, ObjectAttr, Type, Value};
 
@@ -263,6 +264,45 @@ pub struct PluralDataSource {
     pub schema: DataSourceSchema,
     /// The `search_key(shared)` field names, in declaration order.
     pub shared_keys: Vec<String>,
+}
+
+/// Reflect a provider-defined function's signature from a parameter struct `P`
+/// and a return type `O`. Each field of `P` (in declaration order) becomes a
+/// positional [`Parameter`] — its name from the field, its type from the field
+/// type, and `allow_null` from whether it is an `Option`/`TfValue` — and `O`
+/// maps to the return type. Variadic parameters are not yet inferred.
+pub fn reflect_function<P: Facet<'static>, O: Facet<'static>>(
+    name: impl Into<String>,
+) -> Result<FunctionSignature, ReflectError> {
+    let parameters = struct_fields(P::SHAPE)?
+        .iter()
+        .map(parameter_from_field)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(FunctionSignature {
+        name: name.into(),
+        parameters,
+        variadic: None,
+        return_type: map_type(O::SHAPE, "return")?,
+        summary: String::new(),
+        description: String::new(),
+    })
+}
+
+/// Lower a parameter-struct field into a function [`Parameter`].
+fn parameter_from_field(field: &'static Field) -> Result<Parameter, ReflectError> {
+    let name = field.rename.unwrap_or(field.name).to_string();
+    let shape = field.shape();
+    let allow_null = matches!(shape.def, Def::Option(_)) || tfvalue_inner(shape).is_some();
+    let ty = map_type(shape, &name)?;
+    Ok(Parameter {
+        name,
+        ty,
+        allow_null,
+        // Terraform defaults to skipping the call on an unknown argument; a
+        // function opting into unknown handling is a future refinement.
+        allow_unknown: false,
+        description: description(field).unwrap_or_default(),
+    })
 }
 
 /// Reflect a Rust type into a **plural** data source: the `search_key(shared)`
@@ -997,6 +1037,34 @@ mod tests {
         );
         assert!(attr(&config.block, "region").computed);
         assert!(attr(&config.block, "zone").computed);
+    }
+
+    // --- functions ----------------------------------------------------------
+
+    #[derive(Facet)]
+    #[allow(dead_code)]
+    struct ConcatArgs {
+        prefix: String,
+        count: i64,
+        suffix: Option<String>,
+    }
+
+    #[test]
+    fn reflect_function_maps_params_in_order_and_return() {
+        let sig = reflect_function::<ConcatArgs, String>("concat").expect("reflects");
+        assert_eq!(sig.name, "concat");
+        assert!(sig.variadic.is_none());
+        assert_eq!(sig.return_type, Type::String);
+
+        assert_eq!(sig.parameters.len(), 3);
+        assert_eq!(sig.parameters[0].name, "prefix");
+        assert_eq!(sig.parameters[0].ty, Type::String);
+        assert!(!sig.parameters[0].allow_null);
+        assert_eq!(sig.parameters[1].name, "count");
+        assert_eq!(sig.parameters[1].ty, Type::Number);
+        // `Option<String>` ⇒ a nullable argument.
+        assert_eq!(sig.parameters[2].name, "suffix");
+        assert!(sig.parameters[2].allow_null);
     }
 
     #[test]

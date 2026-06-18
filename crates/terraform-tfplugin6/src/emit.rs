@@ -8,10 +8,13 @@
 
 use std::collections::HashMap;
 
-use terraform_ir::{AttributeSchema, Block, NestedBlock, NestingMode, ProviderSchema};
+use terraform_ir::{
+    AttributeSchema, Block, FunctionSignature, NestedBlock, NestingMode, Parameter, ProviderSchema,
+};
 
 use crate::tfplugin6::{
-    self, get_metadata, get_provider_schema, schema, ServerCapabilities, StringKind,
+    self, function, get_metadata, get_provider_schema, schema, Function, ServerCapabilities,
+    StringKind,
 };
 
 /// Lower an IR [`Block`] into a complete [`tfplugin6::Schema`] at `version`.
@@ -49,7 +52,7 @@ pub fn emit_provider_schema(schema: &ProviderSchema) -> get_provider_schema::Res
             .iter()
             .map(|d| (d.name.clone(), emit_schema(&d.block, 0)))
             .collect(),
-        functions: HashMap::new(),
+        functions: emit_functions(schema),
         ephemeral_resource_schemas: HashMap::new(),
         list_resource_schemas: HashMap::new(),
         state_store_schemas: HashMap::new(),
@@ -79,11 +82,54 @@ pub fn emit_metadata(schema: &ProviderSchema) -> get_metadata::Response {
                 type_name: r.name.clone(),
             })
             .collect(),
-        functions: Vec::new(),
+        functions: schema
+            .functions
+            .iter()
+            .map(|f| get_metadata::FunctionMetadata {
+                name: f.name.clone(),
+            })
+            .collect(),
         ephemeral_resources: Vec::new(),
         list_resources: Vec::new(),
         state_stores: Vec::new(),
         actions: Vec::new(),
+    }
+}
+
+/// Lower the IR's function signatures into the protocol's `name -> Function` map
+/// (shared by `GetProviderSchema` and `GetFunctions`).
+pub fn emit_functions(schema: &ProviderSchema) -> HashMap<String, Function> {
+    schema
+        .functions
+        .iter()
+        .map(|f| (f.name.clone(), emit_function(f)))
+        .collect()
+}
+
+/// Lower one [`FunctionSignature`] into a protocol [`Function`].
+fn emit_function(sig: &FunctionSignature) -> Function {
+    Function {
+        parameters: sig.parameters.iter().map(emit_parameter).collect(),
+        variadic_parameter: sig.variadic.as_ref().map(emit_parameter),
+        r#return: Some(function::Return {
+            r#type: sig.return_type.to_cty_json_bytes(),
+        }),
+        summary: sig.summary.clone(),
+        description: sig.description.clone(),
+        description_kind: StringKind::Plain as i32,
+        deprecation_message: String::new(),
+    }
+}
+
+/// Lower one IR [`Parameter`] into a protocol function parameter.
+fn emit_parameter(param: &Parameter) -> function::Parameter {
+    function::Parameter {
+        name: param.name.clone(),
+        r#type: param.ty.to_cty_json_bytes(),
+        allow_null_value: param.allow_null,
+        allow_unknown_values: param.allow_unknown,
+        description: param.description.clone(),
+        description_kind: StringKind::Plain as i32,
     }
 }
 

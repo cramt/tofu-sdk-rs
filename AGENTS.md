@@ -238,6 +238,21 @@ struct-payload codegen names the crate by path; unit attrs go through the
   disposition — e.g. a `computed` resource field (an arn) can be the exclusive
   input of its data source.
 
+**Provider-defined functions** (`function.rs`) are pure: an author implements
+`Function` over a `Params` struct (fields = ordered positional parameters) and an
+`Output` type, registered with `ProviderBuilder::function("name", impl)`. They
+need no `configure` (no meta), so they are always eager. `reflect_function`
+(`terraform-reflect`) builds the `FunctionSignature` IR — each field maps to a
+`Parameter` (name + cty type; `allow_null` from `Option`/`TfValue`), `Output` to
+the return type; variadic parameters aren't inferred yet. The `tfplugin6` emitter
+publishes them in both `GetProviderSchema` and `GetFunctions` (`emit_functions`),
+and `service.rs` handles `CallFunction`: it decodes each argument with its
+parameter's cty type, the erased `DynFunction` adapter assembles them into the
+`Params` object (zipping by field name) and calls the typed handler, and the
+result is encoded with the return type. Panics are contained as a
+`FunctionError`. The whole path is exercised end to end by
+`functions.tftest.hcl` (real `tofu` calling the function through an output).
+
 Both shapes erase to `DynDataSource` (`data_source.rs`) and dispatch on
 `ReadDataSource` (`service.rs`). Resources and data sources share a type-name
 namespace per provider — `resource "aws_s3_bucket"` and `data "aws_s3_bucket"`

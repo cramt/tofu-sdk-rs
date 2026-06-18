@@ -16,4 +16,7 @@ pub mod tfplugin6 {
 
 mod emit;
 
-pub use emit::{emit_block, emit_metadata, emit_provider_schema, emit_schema, server_capabilities};
+pub use emit::{
+    emit_block, emit_functions, emit_metadata, emit_provider_schema, emit_schema,
+    server_capabilities,
+};

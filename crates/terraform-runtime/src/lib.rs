@@ -11,6 +11,7 @@
 mod builder;
 mod ctx;
 mod data_source;
+mod function;
 pub mod handshake;
 mod log;
 mod plan;
@@ -25,6 +26,7 @@ pub use builder::{
 };
 pub use ctx::Ctx;
 pub use data_source::{DataSource, DataSourceError, DataSourceList};
+pub use function::{Function, FunctionError};
 pub use resource::{PlanModifications, Resource, ResourceError};
 pub use serve::{serve, ServeError};
 
@@ -33,6 +35,7 @@ pub use serve::{serve, ServeError};
 /// [`ProviderBuilder::dyn_resource`] / [`ProviderBuilder::dyn_data_source`]);
 /// Rust authors use the typed [`Resource`] / [`DataSource`] traits instead.
 pub use data_source::DynDataSource;
+pub use function::DynFunction;
 pub use resource::{Diag, Diagnostics, DynResource, Severity};
 pub use service::{current_cancellation, ProviderService};
 

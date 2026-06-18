@@ -72,4 +72,21 @@ fn real_engine_loads_reflected_schema() {
             .is_some(),
         "provider schema block must be present"
     );
+
+    // The provider-defined function `arn_for(name) -> string`.
+    let func = common::get(provider, &["functions", "arn_for"]);
+    assert_eq!(
+        common::to_json_string(common::get(func, &["return_type"])),
+        r#""string""#,
+        "arn_for returns a string"
+    );
+    let params = common::get(func, &["parameters"])
+        .as_array()
+        .expect("arn_for parameters array");
+    assert_eq!(params.len(), 1, "arn_for takes one parameter");
+    assert_eq!(
+        common::to_json_string(common::get(&params[0], &["type"])),
+        r#""string""#,
+        "the `name` parameter is a string"
+    );
 }

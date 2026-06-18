@@ -26,6 +26,46 @@ pub struct ProviderSchema {
     pub resources: Vec<ResourceSchema>,
     /// Read-only data sources keyed by type name.
     pub data_sources: Vec<DataSourceSchema>,
+    /// Provider-defined functions, callable from HCL as `provider::<p>::<name>`.
+    pub functions: Vec<FunctionSignature>,
+}
+
+/// A provider-defined function's signature: its positional parameters, an
+/// optional trailing variadic parameter, and its return type. Functions are
+/// pure (no provider configuration or state) and run without `ConfigureProvider`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionSignature {
+    /// The function name, called in HCL as `provider::<provider>::<name>(…)`.
+    pub name: String,
+    /// The ordered positional parameters.
+    pub parameters: Vec<Parameter>,
+    /// An optional final parameter accepting zero or more trailing arguments
+    /// (Terraform passes them as a list of the parameter type). `None` for a
+    /// fixed-arity function.
+    pub variadic: Option<Parameter>,
+    /// The function's return type.
+    pub return_type: Type,
+    /// One-line human-readable summary.
+    pub summary: String,
+    /// Longer human-readable documentation.
+    pub description: String,
+}
+
+/// A single function parameter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Parameter {
+    /// Display name for the parameter.
+    pub name: String,
+    /// The parameter's type constraint.
+    pub ty: Type,
+    /// Whether a null argument is accepted (true for an `Option<T>` parameter);
+    /// when false, Terraform rejects a null argument before calling.
+    pub allow_null: bool,
+    /// Whether the function tolerates an unknown argument; when false (the
+    /// default), Terraform skips the call and assumes an unknown result.
+    pub allow_unknown: bool,
+    /// Human-readable documentation for the parameter.
+    pub description: String,
 }
 
 /// A managed resource type.

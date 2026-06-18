@@ -73,9 +73,9 @@ Rough priority order, each pointing at its tracked item:
    singular data-source projection keeps a `block` field as a read-only nested
    block instead of an object attribute (the plural `results` list keeps it as an
    object attribute — unavoidable for a `list(object(...))`). → **3.7**.
-7. **Modern protocol surfaces** — provider-defined functions, ephemeral
-   resources, cross-type state move — are increasingly table-stakes for newer
-   providers. → **3.2** + **Tier 4**.
+7. **Modern protocol surfaces** — ~~provider-defined functions~~ ✅ **DONE**
+   (`GetFunctions`/`CallFunction`, typed `Function` trait); ephemeral resources
+   and cross-type state move remain. → **3.2** + **Tier 4**.
 
 ## How to verify (the four test layers)
 
@@ -394,8 +394,14 @@ via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`)
 
 All are stubbed in `service.rs` (`unimplemented_unary!` or streaming stubs).
 
-- **Provider-defined functions** (`GetFunctions`/`CallFunction`) — self-contained
-  and demoable; a good showcase. Needs a `Function` trait + arg/return codec.
+- ~~**Provider-defined functions** (`GetFunctions`/`CallFunction`).~~ ✅ **DONE** —
+  typed `Function` trait (`Params` struct → positional params, `Output` → return)
+  over an erased `DynFunction` seam; `reflect_function` builds the
+  `FunctionSignature` IR, `emit_functions` publishes it, `service.rs` dispatches
+  `CallFunction`. Registered with `ProviderBuilder::function` / `dyn_function`.
+  Fixed-arity only — variadic parameters are a follow-up. Verified by direct
+  service tests, the schema contract test, and `functions.tftest.hcl` (real
+  `tofu` calling the function). Example: `example-aws`'s `arn_for`.
 - **Ephemeral resources** (`Open/Renew/CloseEphemeralResource`).
 - **List resources** (`ListResource`, streaming).
 - **Resource identity** (`GetResourceIdentitySchemas`/`UpgradeResourceIdentity`).

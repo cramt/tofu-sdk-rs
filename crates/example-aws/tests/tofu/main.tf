@@ -33,3 +33,10 @@ data "aws_s3_bucket" "by_arn" {
 data "aws_s3_buckets" "by_name" {
   name = "team"
 }
+
+# Exercise the provider-defined function `arn_for`: functions.tftest.hcl asserts
+# on this output, which forces OpenTofu to call the function over the plugin
+# protocol (CallFunction).
+output "arn_for_bucket" {
+  value = provider::aws::arn_for(var.bucket_name)
+}

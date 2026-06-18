@@ -136,6 +136,15 @@ interface Dispositions<S extends z.ZodObject<z.ZodRawShape>> {
   forceNew?: FieldName<S>[];
   /** Attributes whose values should be redacted. */
   sensitive?: FieldName<S>[];
+  /**
+   * Fields to render as nested **blocks** (`name { … }`) instead of object/list
+   * attributes (`name = …`). Each named field must be an object (a single block)
+   * or an array of objects (a repeatable block); on the wire a block is just an
+   * object/list, so handlers see the field unchanged. Inner attributes are
+   * derived from the element's shape (required follows the Zod schema; per-field
+   * `computed`/`sensitive` inside a block are not expressible here).
+   */
+  blocks?: FieldName<S>[];
 }
 
 /** A validation diagnostic returned from a `validate` hook. */
@@ -158,7 +167,75 @@ export interface Diagnostic {
  */
 type Validate<C> = (config: C) => Diagnostic[] | void | Promise<Diagnostic[] | void>;
 
-/** Build the `{ attributes: [...] }` schema JSON the native addon consumes. */
+/** One cty attribute in the schema JSON the native addon consumes. */
+interface AttributeJson {
+  name: string;
+  type: CtyType;
+  required: boolean;
+  optional: boolean;
+  computed: boolean;
+  forceNew: boolean;
+  sensitive: boolean;
+}
+
+/** One nested-block descriptor in the schema JSON. */
+interface BlockJson {
+  name: string;
+  nesting: "single" | "list" | "set" | "map";
+  minItems: number;
+  maxItems: number;
+  block: { attributes: AttributeJson[]; blocks: BlockJson[] };
+}
+
+/** Unwrap a nullable JSON Schema node (`anyOf` / `["T","null"]`) to its core. */
+function unwrapNullable(node: JsonSchema): JsonSchema {
+  if (node.anyOf) return node.anyOf.find((s) => s.type !== "null") ?? node.anyOf[0];
+  return node;
+}
+
+/** Derive plain cty attributes from an object node's properties (block contents). */
+function attributesFromObject(node: JsonSchema): AttributeJson[] {
+  const props = node.properties ?? {};
+  const required = new Set(node.required ?? []);
+  return Object.entries(props).map(([name, prop]) => ({
+    name,
+    type: jsonSchemaToCty(prop),
+    required: required.has(name),
+    optional: !required.has(name),
+    computed: false,
+    forceNew: false,
+    sensitive: false,
+  }));
+}
+
+/**
+ * Build a nested-block descriptor for `name` from its Zod-derived schema node.
+ * An array field is a repeatable `list` block; a bare object is a `single` block
+ * (required when the field itself is required).
+ */
+function blockFromField(name: string, prop: JsonSchema, fieldRequired: boolean): BlockJson {
+  const node = unwrapNullable(prop);
+  const type = Array.isArray(node.type) ? node.type.find((t) => t !== "null") : node.type;
+  if (type === "array") {
+    const element = unwrapNullable(node.items ?? {});
+    return {
+      name,
+      nesting: "list",
+      minItems: 0,
+      maxItems: 0,
+      block: { attributes: attributesFromObject(element), blocks: [] },
+    };
+  }
+  return {
+    name,
+    nesting: "single",
+    minItems: fieldRequired ? 1 : 0,
+    maxItems: 1,
+    block: { attributes: attributesFromObject(node), blocks: [] },
+  };
+}
+
+/** Build the `{ attributes, blocks }` schema JSON the native addon consumes. */
 function schemaJson(
   schema: z.ZodObject<z.ZodRawShape>,
   dispositions: Dispositions<z.ZodObject<z.ZodRawShape>> = {},
@@ -168,11 +245,18 @@ function schemaJson(
   const computed = new Set<string>(dispositions.computed ?? []);
   const forceNew = new Set<string>(dispositions.forceNew ?? []);
   const sensitive = new Set<string>(dispositions.sensitive ?? []);
+  const blockNames = new Set<string>(dispositions.blocks ?? []);
 
-  const attributes = Object.entries(json.properties ?? {}).map(([name, prop]) => {
+  const attributes: AttributeJson[] = [];
+  const blocks: BlockJson[] = [];
+  for (const [name, prop] of Object.entries(json.properties ?? {})) {
+    if (blockNames.has(name)) {
+      blocks.push(blockFromField(name, prop, required.has(name)));
+      continue;
+    }
     const isComputed = computed.has(name);
     const isRequired = required.has(name) && !isComputed;
-    return {
+    attributes.push({
       name,
       type: jsonSchemaToCty(prop),
       required: isRequired,
@@ -180,9 +264,9 @@ function schemaJson(
       computed: isComputed,
       forceNew: forceNew.has(name),
       sensitive: sensitive.has(name),
-    };
-  });
-  return JSON.stringify({ attributes });
+    });
+  }
+  return JSON.stringify({ attributes, blocks });
 }
 
 /** Validate a handler's return value against its schema, surfacing failures. */

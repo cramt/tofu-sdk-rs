@@ -1523,3 +1523,81 @@ async fn read_observes_incoming_private_state() {
     // replace it.
     assert_eq!(read.private.as_slice(), b"seen-private");
 }
+
+// --- Provider-defined functions --------------------------------------------
+
+#[derive(Facet)]
+#[allow(dead_code)]
+struct AddArgs {
+    a: i64,
+    b: i64,
+}
+
+struct AddFn;
+
+#[async_trait]
+impl terraform_runtime::Function for AddFn {
+    type Params = AddArgs;
+    type Output = i64;
+
+    async fn call(&self, p: AddArgs) -> Result<i64, terraform_runtime::FunctionError> {
+        Ok(p.a + p.b)
+    }
+}
+
+fn function_service() -> ProviderService {
+    Provider::builder()
+        .function("add", AddFn)
+        .build()
+        .map(ProviderService::new)
+        .expect("provider builds")
+}
+
+#[tokio::test]
+async fn get_functions_lists_the_signature() {
+    let resp = function_service()
+        .get_functions(Request::new(tfplugin6::get_functions::Request {}))
+        .await
+        .expect("GetFunctions")
+        .into_inner();
+    let add = resp.functions.get("add").expect("add function present");
+    assert_eq!(add.parameters.len(), 2);
+    assert!(add.r#return.is_some(), "return type is published");
+}
+
+#[tokio::test]
+async fn call_function_decodes_args_and_encodes_result() {
+    let num_ty = terraform_value::Type::Number;
+    let arg = |n: i64| tfplugin6::DynamicValue {
+        msgpack: terraform_codec::encode_msgpack(&terraform_value::Value::from(n), &num_ty)
+            .unwrap(),
+        json: vec![],
+    };
+    let resp = function_service()
+        .call_function(Request::new(tfplugin6::call_function::Request {
+            name: "add".into(),
+            arguments: vec![arg(2), arg(40)],
+        }))
+        .await
+        .expect("CallFunction")
+        .into_inner();
+
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    let result = resp.result.expect("result present");
+    let value = terraform_codec::decode_msgpack(&result.msgpack, &num_ty).unwrap();
+    assert_eq!(value, terraform_value::Value::from(42_i64));
+}
+
+#[tokio::test]
+async fn call_unknown_function_returns_a_function_error() {
+    let resp = function_service()
+        .call_function(Request::new(tfplugin6::call_function::Request {
+            name: "nope".into(),
+            arguments: vec![],
+        }))
+        .await
+        .expect("CallFunction")
+        .into_inner();
+    assert!(resp.result.is_none());
+    assert!(resp.error.is_some(), "an unknown function is an error");
+}

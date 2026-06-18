@@ -21,7 +21,7 @@ use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
 
 use terraform_codec::{decode_json, encode_json};
-use terraform_ir::{AttributeSchema, Block};
+use terraform_ir::{AttributeSchema, Block, NestedBlock, NestingMode};
 use terraform_runtime::{
     async_trait, serve as serve_provider, Diag, Diagnostics, DynConfigure, DynDataSource,
     DynResource, Provider as RtProvider,
@@ -56,10 +56,18 @@ fn json_to_value(json: &str, ty: &Type) -> std::result::Result<Value, String> {
 
 /// Build a [`Block`] from the JS schema description:
 /// `{ "attributes": [ { "name", "type": <cty-json>, "required"?, "optional"?,
-/// "computed"?, "forceNew"?, "sensitive"?, "description"? }, ... ] }`.
+/// "computed"?, "forceNew"?, "sensitive"?, "description"? }, ... ],
+///   "blocks"?: [ { "name", "nesting"?, "minItems"?, "maxItems"?, "block": <schema> }, ... ] }`.
 fn block_from_schema_json(json: &str) -> std::result::Result<Block, String> {
     let parsed: facet_value::Value =
         facet_json::from_slice(json.as_bytes()).map_err(|e| e.to_string())?;
+    block_from_schema_value(&parsed)
+}
+
+/// Build a [`Block`] from an already-parsed schema object. Factored out of
+/// [`block_from_schema_json`] so nested blocks (whose `block` field is itself a
+/// schema object) can recurse.
+fn block_from_schema_value(parsed: &facet_value::Value) -> std::result::Result<Block, String> {
     let obj = parsed.as_object().ok_or("schema must be a JSON object")?;
     let attrs = obj
         .get("attributes")
@@ -99,9 +107,50 @@ fn block_from_schema_json(json: &str) -> std::result::Result<Block, String> {
             default: None,
         });
     }
+
+    // Nested blocks are optional; absent `blocks` means a leaf block.
+    let mut nested_blocks = Vec::new();
+    if let Some(blocks) = obj.get("blocks").and_then(|v| v.as_array()) {
+        for b in blocks.iter() {
+            nested_blocks.push(nested_block_from_value(b)?);
+        }
+    }
+
     Ok(Block {
         attributes,
-        nested_blocks: Vec::new(),
+        nested_blocks,
+    })
+}
+
+/// Parse one nested-block descriptor:
+/// `{ "name", "nesting"?, "minItems"?, "maxItems"?, "block": <schema> }`.
+fn nested_block_from_value(value: &facet_value::Value) -> std::result::Result<NestedBlock, String> {
+    let bo = value.as_object().ok_or("each block must be an object")?;
+    let name = bo
+        .get("name")
+        .and_then(|v| v.as_string())
+        .ok_or("block is missing a string `name`")?
+        .as_str()
+        .to_string();
+    let nesting = match bo.get("nesting").and_then(|v| v.as_string()).map(|s| s.as_str()) {
+        Some("single") => NestingMode::Single,
+        Some("set") => NestingMode::Set,
+        Some("map") => NestingMode::Map,
+        // The common case (a repeatable `name { … }`) and the default.
+        Some("list") | None => NestingMode::List,
+        Some(other) => return Err(format!("block `{name}` has unknown nesting `{other}`")),
+    };
+    let int = |key: &str| bo.get(key).and_then(|v| v.as_i64());
+    let inner = bo
+        .get("block")
+        .ok_or_else(|| format!("block `{name}` is missing a `block` schema"))?;
+    let block = block_from_schema_value(inner)?;
+    Ok(NestedBlock {
+        name,
+        nesting,
+        block,
+        min_items: int("minItems").unwrap_or(0),
+        max_items: int("maxItems").unwrap_or(0),
     })
 }
 

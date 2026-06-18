@@ -3,15 +3,16 @@
 //! Answers schema discovery (`GetMetadata`, `GetProviderSchema`), the resource
 //! lifecycle (`ConfigureProvider`, validation, `UpgradeResourceState`,
 //! `PlanResourceChange`, `ReadResource`, `ApplyResourceChange`), and data source
-//! reads (`ReadDataSource`), and import (`ImportResourceState`) by dispatching to
-//! the registered handlers through the value codec. RPCs for features the SDK
-//! does not yet support (functions, ephemeral resources, identity, state stores,
-//! actions, move) still return `Unimplemented`.
+//! reads (`ReadDataSource`), import (`ImportResourceState`), and provider-defined
+//! functions (`GetFunctions`/`CallFunction`) by dispatching to the registered
+//! handlers through the value codec. RPCs for features the SDK does not yet
+//! support (ephemeral resources, identity, state stores, actions, move) still
+//! return `Unimplemented`.
 
 use std::pin::Pin;
 
 use terraform_codec::{decode_json, decode_json_value, decode_msgpack, encode_msgpack, CodecError};
-use terraform_tfplugin6::{emit_metadata, emit_provider_schema, tfplugin6};
+use terraform_tfplugin6::{emit_functions, emit_metadata, emit_provider_schema, tfplugin6};
 use terraform_value::{Type, Value};
 use tokio_util::sync::CancellationToken;
 use tonic::codegen::tokio_stream::Stream;
@@ -737,8 +738,6 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         renew_ephemeral_resource => renew_ephemeral_resource,
         close_ephemeral_resource => close_ephemeral_resource,
         validate_list_resource_config => validate_list_resource_config,
-        get_functions => get_functions,
-        call_function => call_function,
         validate_state_store_config => validate_state_store,
         configure_state_store => configure_state_store,
         lock_state => lock_state,
@@ -747,6 +746,104 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         delete_state => delete_state,
         plan_action => plan_action,
         validate_action_config => validate_action_config,
+    }
+
+    // --- Provider-defined functions ----------------------------------------
+
+    async fn get_functions(
+        &self,
+        _request: Request<tfplugin6::get_functions::Request>,
+    ) -> Result<Response<tfplugin6::get_functions::Response>, Status> {
+        tracing::debug!("GetFunctions");
+        Ok(Response::new(tfplugin6::get_functions::Response {
+            functions: emit_functions(self.provider.schema()),
+            diagnostics: Vec::new(),
+        }))
+    }
+
+    async fn call_function(
+        &self,
+        request: Request<tfplugin6::call_function::Request>,
+    ) -> Result<Response<tfplugin6::call_function::Response>, Status> {
+        use futures_util::future::FutureExt;
+        use tfplugin6::call_function::Response as Resp;
+        let req = request.into_inner();
+        tracing::debug!(name = %req.name, "CallFunction");
+
+        // Build a `CallFunction` error response (optionally pointed at an argument).
+        let err = |text: String, argument: Option<i64>| {
+            Ok(Response::new(Resp {
+                result: None,
+                error: Some(tfplugin6::FunctionError {
+                    text,
+                    function_argument: argument,
+                }),
+            }))
+        };
+
+        let Some(signature) = self
+            .provider
+            .schema()
+            .functions
+            .iter()
+            .find(|f| f.name == req.name)
+            .cloned()
+        else {
+            return err(
+                format!("function {:?} is not defined by this provider", req.name),
+                None,
+            );
+        };
+        let Some(handler) = self.provider.function_handler(&req.name) else {
+            return err(format!("function {:?} has no handler", req.name), None);
+        };
+
+        // Decode each positional argument with its parameter's `cty` type.
+        let mut args = Vec::with_capacity(req.arguments.len());
+        for (i, dv) in req.arguments.iter().enumerate() {
+            let Some(param) = signature.parameters.get(i) else {
+                return err(
+                    format!(
+                        "function {:?} received more arguments than parameters",
+                        req.name
+                    ),
+                    Some(i as i64),
+                );
+            };
+            match decode_argument(dv, &param.ty) {
+                Ok(v) => args.push(v),
+                Err(e) => {
+                    return err(
+                        format!("failed to decode argument {i}: {e}"),
+                        Some(i as i64),
+                    )
+                }
+            }
+        }
+
+        // Functions are pure, but still contain a panic as an error rather than
+        // tearing down the plugin process.
+        match std::panic::AssertUnwindSafe(handler.call(args))
+            .catch_unwind()
+            .await
+        {
+            Ok(Ok(result)) => match encode_dynamic(&result, &signature.return_type) {
+                Ok(dv) => Ok(Response::new(Resp {
+                    result: Some(dv),
+                    error: None,
+                })),
+                Err(e) => err(format!("failed to encode result: {e}"), None),
+            },
+            Ok(Err(fe)) => err(fe.text, fe.argument),
+            Err(payload) => err(
+                format!(
+                    "the {:?} function panicked: {}",
+                    req.name,
+                    panic_message(payload)
+                ),
+                None,
+            ),
+        }
     }
 
     async fn stop_provider(
@@ -820,13 +917,21 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// decodes to [`Value::Null`].
 fn decode_dynamic(dv: &Option<tfplugin6::DynamicValue>, ty: &Type) -> Result<Value, CodecError> {
     match dv {
-        Some(d) if !d.msgpack.is_empty() => decode_msgpack(&d.msgpack, ty),
-        Some(d) if !d.json.is_empty() => {
-            let json: facet_value::Value =
-                facet_json::from_slice(&d.json).map_err(|e| CodecError::Decode(e.to_string()))?;
-            decode_json(&json, ty)
-        }
-        _ => Ok(Value::Null),
+        Some(d) => decode_argument(d, ty),
+        None => Ok(Value::Null),
+    }
+}
+
+/// Decode a present `DynamicValue` (msgpack, else cty JSON, else null) under `ty`.
+fn decode_argument(dv: &tfplugin6::DynamicValue, ty: &Type) -> Result<Value, CodecError> {
+    if !dv.msgpack.is_empty() {
+        decode_msgpack(&dv.msgpack, ty)
+    } else if !dv.json.is_empty() {
+        let json: facet_value::Value =
+            facet_json::from_slice(&dv.json).map_err(|e| CodecError::Decode(e.to_string()))?;
+        decode_json(&json, ty)
+    } else {
+        Ok(Value::Null)
     }
 }
 

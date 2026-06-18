@@ -14,7 +14,8 @@ mod reader;
 
 pub use reader::{
     data_source_list_name, data_source_name, reflect_block, reflect_data_source,
-    reflect_data_source_list, reflect_resource, resource_name, PluralDataSource, ReflectError,
+    reflect_data_source_list, reflect_function, reflect_resource, resource_name, PluralDataSource,
+    ReflectError,
 };
 
 #[cfg(test)]

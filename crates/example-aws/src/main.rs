@@ -23,8 +23,8 @@ use std::sync::Arc;
 use facet::Facet;
 use terraform_provider::terraform;
 use terraform_runtime::{
-    async_trait, serve, Ctx, DataSource, DataSourceError, DataSourceList, Provider, Resource,
-    ResourceError,
+    async_trait, serve, Ctx, DataSource, DataSourceError, DataSourceList, Function, FunctionError,
+    Provider, Resource, ResourceError,
 };
 
 /// Provider-level configuration.
@@ -175,6 +175,29 @@ impl DataSourceList for BucketsByName {
     }
 }
 
+/// The positional parameters of the `arn_for` function: a single bucket name.
+#[derive(Facet)]
+#[allow(dead_code)]
+struct ArnForArgs {
+    /// The bucket name to build an ARN for.
+    name: String,
+}
+
+/// A pure provider-defined function `arn_for(name)` that builds a bucket ARN —
+/// callable from HCL as `provider::aws::arn_for("my-bucket")`. Functions take no
+/// provider configuration or state.
+struct ArnFor;
+
+#[async_trait]
+impl Function for ArnFor {
+    type Params = ArnForArgs;
+    type Output = String;
+
+    async fn call(&self, params: ArnForArgs) -> Result<String, FunctionError> {
+        Ok(format!("{ARN_PREFIX}{}", params.name))
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let provider = Provider::builder()
@@ -187,6 +210,7 @@ async fn main() {
         .resource_with(|client: Arc<AwsClient>| BucketResource { client })
         .data_source_with(|client: Arc<AwsClient>| BucketByArn { client })
         .data_source_list_with(|client: Arc<AwsClient>| BucketsByName { client })
+        .function("arn_for", ArnFor)
         .build()
         .expect("provider definition is valid");
 

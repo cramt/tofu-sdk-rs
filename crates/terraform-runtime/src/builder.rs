@@ -26,10 +26,11 @@ use std::sync::Arc;
 
 use facet::Facet;
 use terraform_codec::from_value;
-use terraform_ir::{Block, DataSourceSchema, ProviderSchema, ResourceSchema};
+use terraform_ir::{Block, DataSourceSchema, FunctionSignature, ProviderSchema, ResourceSchema};
 use terraform_reflect::{
     data_source_list_name, data_source_name, reflect_block, reflect_data_source,
-    reflect_data_source_list, reflect_resource, resource_name, PluralDataSource, ReflectError,
+    reflect_data_source_list, reflect_function, reflect_resource, resource_name, PluralDataSource,
+    ReflectError,
 };
 use terraform_value::{Type, Value};
 use tokio::sync::OnceCell;
@@ -39,6 +40,7 @@ use async_trait::async_trait;
 use crate::data_source::{
     DataSource, DataSourceAdapter, DataSourceList, DataSourceListAdapter, DynDataSource,
 };
+use crate::function::{DynFunction, Function, FunctionAdapter};
 use crate::resource::{Diag, Diagnostics, DynResource, Resource, ResourceAdapter};
 
 /// An erased provider-configure callback, the dynamic-seam counterpart to
@@ -161,6 +163,10 @@ type ResourceMap = HashMap<String, Arc<dyn DynResource>>;
 /// The set of data source handlers keyed by type name.
 type DataSourceMap = HashMap<String, Arc<dyn DynDataSource>>;
 
+/// The set of function handlers keyed by name. Functions are pure (no provider
+/// meta), so they are always eager.
+type FunctionMap = HashMap<String, Arc<dyn DynFunction>>;
+
 /// The meta-backed handlers built once `ConfigureProvider` runs.
 #[derive(Default)]
 struct Configured {
@@ -211,6 +217,8 @@ pub struct Provider {
     eager: Arc<ResourceMap>,
     /// Data source handlers that need no provider meta; available immediately.
     eager_data: Arc<DataSourceMap>,
+    /// Function handlers (pure; always available, even before configure).
+    functions: Arc<FunctionMap>,
     /// The `cty` type of the provider config block, for decoding `ConfigureProvider`.
     config_ty: Option<Type>,
     /// Builds the meta and the meta-backed handlers from decoded config. `None`
@@ -257,6 +265,11 @@ impl Provider {
             }
         }
         self.eager_data.get(name).map(Arc::clone)
+    }
+
+    /// The handler for function `name`, if registered.
+    pub(crate) fn function_handler(&self, name: &str) -> Option<Arc<dyn DynFunction>> {
+        self.functions.get(name).map(Arc::clone)
     }
 
     /// The `cty` object type of resource `name`, derived from its schema block.
@@ -334,6 +347,7 @@ pub struct ProviderBuilder<M = ()> {
     schema: ProviderSchema,
     resources: ResourceMap,
     data_sources: DataSourceMap,
+    functions: FunctionMap,
     factories: Vec<(String, ResourceFactory<M>)>,
     data_factories: Vec<(String, DataSourceFactory<M>)>,
     configure: Option<MetaFn<M>>,
@@ -349,6 +363,7 @@ impl<M> Default for ProviderBuilder<M> {
             schema: ProviderSchema::default(),
             resources: HashMap::new(),
             data_sources: HashMap::new(),
+            functions: HashMap::new(),
             factories: Vec::new(),
             data_factories: Vec::new(),
             configure: None,
@@ -610,6 +625,35 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
         self
     }
 
+    /// Register a provider-defined function under `name` with its `handler`.
+    /// Functions are pure (no provider configuration or state), so this needs no
+    /// `configure` step. The signature is reflected from the handler's `Params`
+    /// and `Output` types. Called from HCL as `provider::<provider>::<name>(…)`.
+    pub fn function<F: Function>(mut self, name: impl Into<String>, handler: F) -> Self {
+        let name = name.into();
+        match reflect_function::<F::Params, F::Output>(name.clone()) {
+            Ok(signature) => {
+                self.schema.functions.push(signature);
+                self.functions
+                    .insert(name, FunctionAdapter::erased(handler));
+            }
+            Err(source) => self.record(name, source),
+        }
+        self
+    }
+
+    /// Register a function from a hand-built [`FunctionSignature`] and an erased
+    /// [`DynFunction`] handler, bypassing facet reflection (the dynamic seam).
+    pub fn dyn_function(
+        mut self,
+        signature: FunctionSignature,
+        handler: Arc<dyn DynFunction>,
+    ) -> Self {
+        self.functions.insert(signature.name.clone(), handler);
+        self.schema.functions.push(signature);
+        self
+    }
+
     /// Finish building, returning the first reflection error if any occurred.
     pub fn build(mut self) -> Result<Provider, BuildError> {
         if let Some(err) = self.error.take() {
@@ -656,6 +700,7 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
             schema: Arc::new(self.schema),
             eager: Arc::new(self.resources),
             eager_data: Arc::new(self.data_sources),
+            functions: Arc::new(self.functions),
             config_ty,
             configure,
             configured: Arc::new(OnceCell::new()),
@@ -713,6 +758,7 @@ impl ProviderBuilder<()> {
             schema: self.schema,
             resources: self.resources,
             data_sources: self.data_sources,
+            functions: self.functions,
             factories: Vec::new(),
             data_factories: Vec::new(),
             configure: Some(meta_fn),
