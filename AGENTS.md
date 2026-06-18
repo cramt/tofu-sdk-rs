@@ -169,8 +169,14 @@ entirely TS-side; it compiles down to the same cty-JSON the addon already takes.
   `PlanModifications` (top-level attr names to force-replace / mark unknown). It
   is a defaulted `DynResource` method, so the Node binding and other seam
   implementors need no change.
-- **Numbers are `f64`** in the `Value` tree (lossy for very large/precise
-  numbers; fine for real configs).
+- **Numbers are `Value::Number(Number)` where `Number` is `I64 | U64 | F64`**
+  (`terraform-value`). The full signed+unsigned 64-bit integer range round-trips
+  losslessly through msgpack and cty JSON; only truly arbitrary precision (beyond
+  64-bit, matching `facet-value`'s own `VNumber` ceiling) is out of reach. The
+  codec keeps integers in their exact case; the lossy step is only at the typed
+  boundary when an author's declared field type can't hold the value. `Number`
+  equality is by mathematical value across cases (`I64(3) == F64(3.0)`), so IR
+  types stay `PartialEq` but not `Eq` (a `default` may hold an `F64`).
 - **auto-mTLS is server-auth-only.** tonic's `client_ca_root` is
   go-plugin-incompatible (advertises CA-name hints; the Go client then withholds
   its cert). We terminate TLS ourselves (tokio-rustls), present + advertise a
