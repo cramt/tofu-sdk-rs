@@ -26,7 +26,7 @@ pub use builder::{
 };
 pub use ctx::Ctx;
 pub use data_source::{DataSource, DataSourceError, DataSourceList};
-pub use function::{Function, FunctionError};
+pub use function::{Function, FunctionError, VariadicFunction};
 pub use resource::{PlanModifications, Resource, ResourceError};
 pub use serve::{serve, ServeError};
 

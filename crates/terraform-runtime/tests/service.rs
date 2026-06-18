@@ -1601,3 +1601,84 @@ async fn call_unknown_function_returns_a_function_error() {
     assert!(resp.result.is_none());
     assert!(resp.error.is_some(), "an unknown function is an error");
 }
+
+/// A variadic function with a `String` leading parameter and `i64` trailing
+/// arguments — proving the const and variadic args can be different types.
+#[derive(Facet)]
+#[allow(dead_code)]
+struct LabelArgs {
+    label: String,
+}
+
+struct LabelFn;
+
+#[async_trait]
+impl terraform_runtime::VariadicFunction for LabelFn {
+    type Params = LabelArgs;
+    type VarArg = i64;
+    type Output = String;
+
+    async fn call(
+        &self,
+        p: LabelArgs,
+        nums: Vec<i64>,
+    ) -> Result<String, terraform_runtime::FunctionError> {
+        Ok(format!("{}: {:?}", p.label, nums))
+    }
+}
+
+#[tokio::test]
+async fn variadic_function_splits_heterogeneous_leading_and_trailing_args() {
+    let svc = Provider::builder()
+        .function_variadic("label", LabelFn)
+        .build()
+        .map(ProviderService::new)
+        .expect("provider builds");
+
+    let str_ty = terraform_value::Type::String;
+    let num_ty = terraform_value::Type::Number;
+    let str_arg = |s: &str| tfplugin6::DynamicValue {
+        msgpack: terraform_codec::encode_msgpack(
+            &terraform_value::Value::String(s.into()),
+            &str_ty,
+        )
+        .unwrap(),
+        json: vec![],
+    };
+    let num_arg = |n: i64| tfplugin6::DynamicValue {
+        msgpack: terraform_codec::encode_msgpack(&terraform_value::Value::from(n), &num_ty)
+            .unwrap(),
+        json: vec![],
+    };
+    let call = |args: Vec<tfplugin6::DynamicValue>| {
+        svc.call_function(Request::new(tfplugin6::call_function::Request {
+            name: "label".into(),
+            arguments: args,
+        }))
+    };
+    let decode = |resp: tfplugin6::call_function::Response| {
+        terraform_codec::decode_msgpack(&resp.result.expect("result").msgpack, &str_ty).unwrap()
+    };
+
+    // Leading "xs" (String) + three trailing i64s collected into the Vec.
+    let resp = call(vec![str_arg("xs"), num_arg(1), num_arg(2), num_arg(3)])
+        .await
+        .expect("CallFunction")
+        .into_inner();
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    assert_eq!(
+        decode(resp),
+        terraform_value::Value::String("xs: [1, 2, 3]".into())
+    );
+
+    // Zero trailing arguments is valid (variadic = *zero* or more).
+    let resp = call(vec![str_arg("ys")])
+        .await
+        .expect("CallFunction")
+        .into_inner();
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    assert_eq!(
+        decode(resp),
+        terraform_value::Value::String("ys: []".into())
+    );
+}

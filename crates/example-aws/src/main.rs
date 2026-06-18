@@ -24,7 +24,7 @@ use facet::Facet;
 use terraform_provider::terraform;
 use terraform_runtime::{
     async_trait, serve, Ctx, DataSource, DataSourceError, DataSourceList, Function, FunctionError,
-    Provider, Resource, ResourceError,
+    Provider, Resource, ResourceError, VariadicFunction,
 };
 
 /// Provider-level configuration.
@@ -198,6 +198,30 @@ impl Function for ArnFor {
     }
 }
 
+/// The fixed leading parameters of `join`: the separator.
+#[derive(Facet)]
+#[allow(dead_code)]
+struct JoinArgs {
+    /// The separator placed between the variadic parts.
+    separator: String,
+}
+
+/// A **variadic** function `join(separator, parts…)` — a fixed leading parameter
+/// plus zero or more trailing arguments. Called from HCL as
+/// `provider::aws::join("-", "a", "b", "c")` → `"a-b-c"`.
+struct Join;
+
+#[async_trait]
+impl VariadicFunction for Join {
+    type Params = JoinArgs;
+    type VarArg = String;
+    type Output = String;
+
+    async fn call(&self, params: JoinArgs, parts: Vec<String>) -> Result<String, FunctionError> {
+        Ok(parts.join(&params.separator))
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let provider = Provider::builder()
@@ -211,6 +235,7 @@ async fn main() {
         .data_source_with(|client: Arc<AwsClient>| BucketByArn { client })
         .data_source_list_with(|client: Arc<AwsClient>| BucketsByName { client })
         .function("arn_for", ArnFor)
+        .function_variadic("join", Join)
         .build()
         .expect("provider definition is valid");
 

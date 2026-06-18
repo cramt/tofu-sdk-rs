@@ -40,3 +40,8 @@ data "aws_s3_buckets" "by_name" {
 output "arn_for_bucket" {
   value = provider::aws::arn_for(var.bucket_name)
 }
+
+# Variadic function: a fixed separator plus zero-or-more trailing parts.
+output "joined_parts" {
+  value = provider::aws::join("-", "a", "b", "c")
+}

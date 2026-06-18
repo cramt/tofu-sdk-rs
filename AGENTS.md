@@ -249,7 +249,14 @@ struct-payload codegen names the crate by path; unit attrs go through the
 need no `configure` (no meta), so they are always eager. `reflect_function`
 (`terraform-reflect`) builds the `FunctionSignature` IR — each field maps to a
 `Parameter` (name + cty type; `allow_null` from `Option`/`TfValue`), `Output` to
-the return type; variadic parameters aren't inferred yet. The `tfplugin6` emitter
+the return type. **Variadic** functions use a separate `VariadicFunction` trait
+(`Params` struct for the leading params + a `VarArg` element type +
+`call(params, rest: Vec<VarArg>)`), registered with `function_variadic`; the
+type system enforces "exactly one variadic, always last, uniform type" — no
+marker, the same type-driven spirit as deriving required-ness from `Option`.
+`reflect_variadic_function` emits the `variadic_parameter`, and `CallFunction`
+decodes any args past the fixed params with the variadic type (the adapter splits
+them into the `Vec`). The `tfplugin6` emitter
 publishes them in both `GetProviderSchema` and `GetFunctions` (`emit_functions`),
 and `service.rs` handles `CallFunction`: it decodes each argument with its
 parameter's cty type, the erased `DynFunction` adapter assembles them into the

@@ -11,4 +11,9 @@ run "arn_for_builds_a_bucket_arn" {
     condition     = output.arn_for_bucket == "arn:aws:s3:::my-bucket"
     error_message = "arn_for should build the bucket ARN from the name"
   }
+
+  assert {
+    condition     = output.joined_parts == "a-b-c"
+    error_message = "the variadic join function should join the trailing parts"
+  }
 }

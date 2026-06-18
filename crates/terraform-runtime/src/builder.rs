@@ -29,8 +29,8 @@ use terraform_codec::from_value;
 use terraform_ir::{Block, DataSourceSchema, FunctionSignature, ProviderSchema, ResourceSchema};
 use terraform_reflect::{
     data_source_list_name, data_source_name, reflect_block, reflect_data_source,
-    reflect_data_source_list, reflect_function, reflect_resource, resource_name, PluralDataSource,
-    ReflectError,
+    reflect_data_source_list, reflect_function, reflect_resource, reflect_variadic_function,
+    resource_name, PluralDataSource, ReflectError,
 };
 use terraform_value::{Type, Value};
 use tokio::sync::OnceCell;
@@ -40,7 +40,9 @@ use async_trait::async_trait;
 use crate::data_source::{
     DataSource, DataSourceAdapter, DataSourceList, DataSourceListAdapter, DynDataSource,
 };
-use crate::function::{DynFunction, Function, FunctionAdapter};
+use crate::function::{
+    DynFunction, Function, FunctionAdapter, VariadicFunction, VariadicFunctionAdapter,
+};
 use crate::resource::{Diag, Diagnostics, DynResource, Resource, ResourceAdapter};
 
 /// An erased provider-configure callback, the dynamic-seam counterpart to
@@ -636,6 +638,27 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
                 self.schema.functions.push(signature);
                 self.functions
                     .insert(name, FunctionAdapter::erased(handler));
+            }
+            Err(source) => self.record(name, source),
+        }
+        self
+    }
+
+    /// Register a **variadic** provider-defined function under `name`: fixed
+    /// leading parameters (the handler's `Params`) plus zero or more trailing
+    /// arguments of the handler's `VarArg` type. Pure, like
+    /// [`function`](Self::function).
+    pub fn function_variadic<F: VariadicFunction>(
+        mut self,
+        name: impl Into<String>,
+        handler: F,
+    ) -> Self {
+        let name = name.into();
+        match reflect_variadic_function::<F::Params, F::VarArg, F::Output>(name.clone()) {
+            Ok(signature) => {
+                self.schema.functions.push(signature);
+                self.functions
+                    .insert(name, VariadicFunctionAdapter::erased(handler));
             }
             Err(source) => self.record(name, source),
         }

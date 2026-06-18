@@ -288,6 +288,38 @@ pub fn reflect_function<P: Facet<'static>, O: Facet<'static>>(
     })
 }
 
+/// Reflect a **variadic** function: the leading positional parameters from `P`
+/// (as in [`reflect_function`]) plus a final variadic parameter of element type
+/// `V` (the function accepts zero or more trailing `V` arguments), returning `O`.
+pub fn reflect_variadic_function<P, V, O>(
+    name: impl Into<String>,
+) -> Result<FunctionSignature, ReflectError>
+where
+    P: Facet<'static>,
+    V: Facet<'static>,
+    O: Facet<'static>,
+{
+    let parameters = struct_fields(P::SHAPE)?
+        .iter()
+        .map(parameter_from_field)
+        .collect::<Result<Vec<_>, _>>()?;
+    let variadic = Parameter {
+        name: "varargs".to_string(),
+        ty: map_type(V::SHAPE, "varargs")?,
+        allow_null: matches!(V::SHAPE.def, Def::Option(_)) || tfvalue_inner(V::SHAPE).is_some(),
+        allow_unknown: false,
+        description: String::new(),
+    };
+    Ok(FunctionSignature {
+        name: name.into(),
+        parameters,
+        variadic: Some(variadic),
+        return_type: map_type(O::SHAPE, "return")?,
+        summary: String::new(),
+        description: String::new(),
+    })
+}
+
 /// Lower a parameter-struct field into a function [`Parameter`].
 fn parameter_from_field(field: &'static Field) -> Result<Parameter, ReflectError> {
     let name = field.rename.unwrap_or(field.name).to_string();
@@ -1065,6 +1097,29 @@ mod tests {
         // `Option<String>` ⇒ a nullable argument.
         assert_eq!(sig.parameters[2].name, "suffix");
         assert!(sig.parameters[2].allow_null);
+    }
+
+    #[derive(Facet)]
+    #[allow(dead_code)]
+    struct JoinArgs {
+        separator: String,
+    }
+
+    #[test]
+    fn reflect_variadic_function_separates_leading_and_variadic() {
+        // Leading `separator: String`, variadic element `i64`, returns `String`.
+        let sig = reflect_variadic_function::<JoinArgs, i64, String>("join").expect("reflects");
+        assert_eq!(sig.parameters.len(), 1, "one fixed leading parameter");
+        assert_eq!(sig.parameters[0].name, "separator");
+        assert_eq!(sig.parameters[0].ty, Type::String);
+
+        let variadic = sig.variadic.expect("a variadic parameter");
+        assert_eq!(
+            variadic.ty,
+            Type::Number,
+            "variadic element type is the number"
+        );
+        assert_eq!(sig.return_type, Type::String);
     }
 
     #[test]

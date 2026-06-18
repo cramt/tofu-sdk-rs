@@ -74,8 +74,8 @@ Rough priority order, each pointing at its tracked item:
    block instead of an object attribute (the plural `results` list keeps it as an
    object attribute — unavoidable for a `list(object(...))`). → **3.7**.
 7. **Modern protocol surfaces** — ~~provider-defined functions~~ ✅ **DONE**
-   (`GetFunctions`/`CallFunction`, typed `Function` trait); ephemeral resources
-   and cross-type state move remain. → **3.2** + **Tier 4**.
+   (`GetFunctions`/`CallFunction`, typed `Function` + `VariadicFunction` traits);
+   ephemeral resources and cross-type state move remain. → **3.2** + **Tier 4**.
 
 ## How to verify (the four test layers)
 
@@ -399,9 +399,13 @@ All are stubbed in `service.rs` (`unimplemented_unary!` or streaming stubs).
   over an erased `DynFunction` seam; `reflect_function` builds the
   `FunctionSignature` IR, `emit_functions` publishes it, `service.rs` dispatches
   `CallFunction`. Registered with `ProviderBuilder::function` / `dyn_function`.
-  Fixed-arity only — variadic parameters are a follow-up. Verified by direct
-  service tests, the schema contract test, and `functions.tftest.hcl` (real
-  `tofu` calling the function). Example: `example-aws`'s `arn_for`.
+  **Variadic** functions are supported too via a separate `VariadicFunction`
+  trait (leading `Params` struct + `VarArg` element type), registered with
+  `function_variadic` — the type system enforces one-uniform-trailing-variadic
+  (no marker). Verified by direct service tests (incl. heterogeneous leading +
+  variadic types and zero-arity), the schema contract test, and
+  `functions.tftest.hcl` (real `tofu` calling both `arn_for` and the variadic
+  `join`). Examples: `example-aws`'s `arn_for` and `join`.
 - **Ephemeral resources** (`Open/Renew/CloseEphemeralResource`).
 - **List resources** (`ListResource`, streaming).
 - **Resource identity** (`GetResourceIdentitySchemas`/`UpgradeResourceIdentity`).

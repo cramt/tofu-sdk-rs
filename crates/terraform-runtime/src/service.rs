@@ -798,10 +798,12 @@ impl tfplugin6::provider_server::Provider for ProviderService {
             return err(format!("function {:?} has no handler", req.name), None);
         };
 
-        // Decode each positional argument with its parameter's `cty` type.
+        // Decode each positional argument with its parameter's `cty` type. Any
+        // arguments past the fixed parameters are variadic and share the variadic
+        // parameter's type; without a variadic parameter, extra arguments error.
         let mut args = Vec::with_capacity(req.arguments.len());
         for (i, dv) in req.arguments.iter().enumerate() {
-            let Some(param) = signature.parameters.get(i) else {
+            let Some(param) = signature.parameters.get(i).or(signature.variadic.as_ref()) else {
                 return err(
                     format!(
                         "function {:?} received more arguments than parameters",
