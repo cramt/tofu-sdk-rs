@@ -13,15 +13,16 @@
  * `npx tsdown` then emits a **single** self-contained executable,
  * `terraform-provider-<name>` — the shebang is generated and the file is marked
  * executable. There is no sidecar to ship: the native addon (`*.node`) is
- * base64-inlined into the bundle and, on first launch, written to the OS temp
- * directory and `process.dlopen`ed (cached per addon hash, so it materializes
- * once). All of this — bundling the author's deps, embedding the right platform
- * binary, generating the shebang and the executable bit — lives in here, not in
- * the author's config.
+ * base64-inlined into the bundle and `dlopen`ed at runtime. On Linux it loads
+ * from an anonymous `/dev/shm` (RAM) file so it never touches disk; elsewhere it
+ * falls back to a per-hash file in `$TMPDIR`, written once. All of this —
+ * bundling the author's deps, embedding the platform binary, generating the
+ * shebang and the executable bit — lives in here, not in the author's config.
  *
- * Caveat: the addon is `dlopen`ed from the OS temp directory, so a `noexec` mount
- * on `$TMPDIR` will prevent it from loading (rare, but set `TMPDIR` to an
- * exec-capable path if you hit it).
+ * Caveat: the addon is `dlopen`ed from `/dev/shm` (Linux) or `$TMPDIR`; a
+ * `noexec` mount on both will prevent it from loading (rare — the loader tries
+ * `/dev/shm` then `$TMPDIR`, so set `TMPDIR` to an exec-capable path if you hit
+ * it).
  */
 
 import { createHash } from "node:crypto";
@@ -43,24 +44,45 @@ const SHEBANG = "#!/usr/bin/env node\n";
 const NATIVE_MODULE = "\0tofu-sdk-native-addon";
 
 /**
- * Generate the CommonJS module that inlines the addon `bytes` (as base64) and,
- * at runtime, materializes them to a per-hash temp file and `dlopen`s it.
+ * Generate the CommonJS module that inlines the addon `bytes` (as base64) and, at
+ * runtime, materializes them so they can be `dlopen`ed.
+ *
+ * On Linux it loads from an **anonymous** `/dev/shm` (tmpfs) file via
+ * `/proc/self/fd` — the addon lives in RAM, never touches disk, and vanishes with
+ * the process. Anywhere else (or if that path fails — e.g. `/dev/shm` is absent or
+ * `noexec`) it falls back to a per-hash file in `$TMPDIR`, written once.
  */
 function inlineAddonModule(bytes: Buffer): string {
   const b64 = bytes.toString("base64");
   const hash = createHash("sha256").update(bytes).digest("hex").slice(0, 16);
   return [
-    `const { existsSync, mkdtempSync, writeFileSync, renameSync } = require("node:fs");`,
-    `const { join } = require("node:path");`,
-    `const { tmpdir } = require("node:os");`,
-    `const target = join(tmpdir(), "tofu-sdk-addon-${hash}.node");`,
-    `if (!existsSync(target)) {`,
-    `  const scratch = join(mkdtempSync(join(tmpdir(), "tofu-sdk-addon-")), "addon.node");`,
-    `  writeFileSync(scratch, Buffer.from(${JSON.stringify(b64)}, "base64"));`,
-    `  try { renameSync(scratch, target); } catch { /* lost the race; another process wrote it */ }`,
-    `}`,
+    `const fs = require("node:fs");`,
+    `const buf = Buffer.from(${JSON.stringify(b64)}, "base64");`,
     `const mod = { exports: {} };`,
-    `process.dlopen(mod, target);`,
+    `function writeAll(fd) { let off = 0; while (off < buf.length) off += fs.writeSync(fd, buf, off, buf.length - off); }`,
+    // Linux: an anonymous tmpfs file (RAM-backed), dlopen'd via /proc/self/fd.
+    `function loadViaShm() {`,
+    `  const path = "/dev/shm/tofu-sdk-addon-" + process.pid + "-" + process.hrtime.bigint();`,
+    `  const fd = fs.openSync(path, "w+");`,
+    `  try {`,
+    `    fs.unlinkSync(path);`, // now anonymous: no on-disk name, freed when the fd closes
+    `    writeAll(fd);`,
+    `    process.dlopen(mod, "/proc/self/fd/" + fd);`, // fd stays open for the process's life
+    `  } catch (e) { fs.closeSync(fd); throw e; }`,
+    `}`,
+    // Portable fallback: a per-hash file in $TMPDIR, materialized once.
+    `function loadViaTemp() {`,
+    `  const { join } = require("node:path");`,
+    `  const { tmpdir } = require("node:os");`,
+    `  const target = join(tmpdir(), "tofu-sdk-addon-${hash}.node");`,
+    `  if (!fs.existsSync(target)) {`,
+    `    const scratch = join(fs.mkdtempSync(join(tmpdir(), "tofu-sdk-addon-")), "addon.node");`,
+    `    fs.writeFileSync(scratch, buf);`,
+    `    try { fs.renameSync(scratch, target); } catch { /* lost the race; another process wrote it */ }`,
+    `  }`,
+    `  process.dlopen(mod, target);`,
+    `}`,
+    `if (process.platform === "linux") { try { loadViaShm(); } catch { loadViaTemp(); } } else { loadViaTemp(); }`,
     `module.exports = mod.exports;`,
   ].join("\n");
 }
