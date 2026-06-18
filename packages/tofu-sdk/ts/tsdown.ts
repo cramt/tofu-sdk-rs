@@ -135,22 +135,43 @@ function providerBundlePlugin() {
 
 /**
  * Build the tsdown config for a Terraform/OpenTofu provider. Use the result as
- * the default export of your `tsdown.config.ts`.
+ * the default export of your `tsdown.config.ts`:
+ *
+ * ```ts
+ * export default defineProviderBundle({ entry: "src/provider.ts", name: "acme" });
+ * ```
+ *
+ * Everything here is a default you can override via the second argument — it is
+ * shallow-merged over these defaults, with `deps`/`outputOptions` deep-merged and
+ * your `plugins` appended after the native-addon handling (which always stays):
+ *
+ * ```ts
+ * export default defineProviderBundle(
+ *   { entry: "src/provider.ts", name: "acme" },
+ *   { minify: false, define: { __DEV__: "true" } },
+ * );
+ * ```
  */
-export function defineProviderBundle(options: ProviderBundleOptions) {
+export function defineProviderBundle(
+  options: ProviderBundleOptions,
+  overrides: Record<string, any> = {},
+) {
   const { entry, name, outDir = "dist" } = options;
-  return {
+  const defaults = {
     entry: [entry],
     format: "cjs" as const,
     platform: "node" as const,
     outDir,
     dts: false,
+    // No reason not to: shrink the JS (the inlined addon stays base64, but
+    // everything else minifies).
+    minify: true,
     // A provider ships as a single self-contained file: bundle every dependency
     // (zod, your cloud SDK, …); only Node built-ins stay external. `onlyBundle:
     // false` silences tsdown's "you bundled a dependency" hint — that's the point.
     deps: {
       alwaysBundle: (id: string) => (id.startsWith("node:") ? undefined : true),
-      onlyBundle: false,
+      onlyBundle: false as const,
     },
     // We name and chmod the executable ourselves; don't let tsdown touch the
     // project's package.json `bin` field.
@@ -158,5 +179,13 @@ export function defineProviderBundle(options: ProviderBundleOptions) {
     // Name the output exactly as Terraform expects to `exec` it.
     outputOptions: { entryFileNames: `terraform-provider-${name}` },
     plugins: [providerBundlePlugin()],
+  };
+  return {
+    ...defaults,
+    ...overrides,
+    // Keep the native-addon essentials even when callers override these keys.
+    deps: { ...defaults.deps, ...(overrides.deps ?? {}) },
+    outputOptions: { ...defaults.outputOptions, ...(overrides.outputOptions ?? {}) },
+    plugins: [...defaults.plugins, ...(overrides.plugins ?? [])],
   };
 }
