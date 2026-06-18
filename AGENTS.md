@@ -100,6 +100,18 @@ addon's `block_from_schema_json` now parses a `blocks` array into IR
 the TS frontend gets HCL `name { … }` blocks without the facet `terraform::block`
 marker — see `examples/cloudflare-provider.ts`.
 
+**Packaging is a single self-contained file.** A provider needs to be an
+executable named `terraform-provider-<name>`; for Node that's a shebang'd JS file
+(no compiled binary), and `.serve()` does the whole go-plugin handshake in Rust.
+Authors use the `@tofu-sdk/core/tsdown` preset (`ts/tsdown.ts`,
+`defineProviderBundle`): `npx tsdown` bundles the provider + all deps **and** the
+native addon into one executable — the `*.node` is base64-inlined and `dlopen`ed
+from `$TMPDIR` on first launch (no sidecar), the shebang is generated, and +x is
+set. This requires the dist loader to be a **static** `require("../binding/index.js")`
+(not the old dynamic `createRequire(join(__dirname, …))`) so a bundler can follow
+it; keep it static. The preset is exposed via the package.json `exports` subpath
+`./tsdown`. See README "Shipping the provider" and `examples/tsdown.config.mjs`.
+
 ## Conventions & gotchas (read before changing these)
 
 - **facet comes from crates.io** (`facet = "0.46"`, resolving to 0.46.5).

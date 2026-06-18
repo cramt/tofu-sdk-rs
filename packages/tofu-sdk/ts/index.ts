@@ -26,9 +26,6 @@
  * ```
  */
 
-import { createRequire } from "node:module";
-import { join } from "node:path";
-
 import { z } from "zod";
 
 // The native addon's generated loader, loaded at runtime and hand-typed (its
@@ -57,9 +54,12 @@ interface RawBinding {
   Provider: new () => RawProvider;
 }
 
-const native = createRequire(__filename)(
-  join(__dirname, "..", "binding", "index.js"),
-) as RawBinding;
+// The native addon's generated loader (CommonJS). A *static* `require` keeps the
+// binding analyzable by bundlers: rolldown/esbuild inline `binding/index.js` and
+// only the platform `*.node` stays external (mark `/\.node$/` external and copy
+// it next to the bundle). Un-bundled, this resolves to `<pkg>/binding/index.js`
+// relative to this compiled file, exactly as before.
+const native = require("../binding/index.js") as RawBinding;
 
 // --- schema derivation (Zod -> cty) -----------------------------------------
 

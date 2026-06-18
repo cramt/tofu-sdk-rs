@@ -44,22 +44,48 @@ object/list, so your handlers see the field unchanged — see
 [`examples/cloudflare-provider.ts`](examples/cloudflare-provider.ts) for a
 repeatable `policy { … }` block.
 
-## The provider binary
+## Shipping the provider — one command, one file
 
-Terraform launches a provider as an executable named `terraform-provider-<name>`.
-Make your entrypoint that executable — a Node script with a shebang works:
+Terraform/OpenTofu launches a provider by `exec`ing an executable named
+`terraform-provider-<name>` and speaking the go-plugin protocol over its stdio.
+That executable does **not** have to be a compiled binary — for Node it's just an
+executable JavaScript file with a `#!/usr/bin/env node` shebang. The Rust core
+does all the protocol work: `.serve()` runs the entire **go-plugin handshake**
+(magic-cookie check, protocol negotiation, auto-mTLS, the unix socket, the
+handshake line on stdout) and then serves gRPC until Terraform stops the process.
+You only build the schema and handlers.
 
-```js
-#!/usr/bin/env node
-const { Provider } = require("@tofu-sdk/core");
-new Provider().resource(/* … */).serve().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+You don't assemble any of that by hand. Write plain TypeScript — no shebang, no
+build wiring — and use the SDK's [tsdown](https://tsdown.dev) preset:
+
+```ts
+// tsdown.config.ts
+import { defineProviderBundle } from "@tofu-sdk/core/tsdown";
+
+export default defineProviderBundle({ entry: "src/provider.ts", name: "acme" });
 ```
 
-Point Terraform/OpenTofu at it during development with a `dev_overrides` CLI
-config (see the repo's `AGENTS.md`).
+```bash
+npm i -D tsdown
+npx tsdown
+# -> dist/terraform-provider-acme
+```
+
+That single file is the whole provider: your code, every dependency (zod, your
+cloud SDK), **and** the native addon are bundled in — the `.node` is base64-inlined
+and `dlopen`ed from a temp file on first launch, so there's no sidecar to carry.
+The shebang is generated and the executable bit is set for you. Drop the file
+wherever Terraform expects it (or symlink it) and point a local Terraform at it
+with a `dev_overrides` CLI config (see the repo's `AGENTS.md`).
+
+`examples/cloudflare-provider.ts` + `examples/tsdown.config.mjs` are a complete
+worked example; the whole flow is verified end-to-end against real OpenTofu.
+
+> Prefer the preset over hand-rolled tooling. A plain `#!/usr/bin/env node`
+> JavaScript file (or a `tsc`-built one — `tsc` preserves a shebang) also works if
+> you want zero bundling, but then you ship the addon and `node_modules` alongside.
+> Avoid a `#!/usr/bin/env -S npx tsx` entrypoint: `npx` can hit the network to
+> resolve `tsx` at launch and stall the handshake.
 
 ## Build
 
@@ -78,8 +104,9 @@ are available for the Rust build.
 
 Early but functional. Resources (CRUD + `force_new` replacement + `import` +
 `version`/`upgrade` state migrations + a `validate` config hook), provider
-configuration (`config`), and both singular (`dataSource`) and plural
-(`dataSourceList`) data sources work end-to-end against real OpenTofu — see
-`test/e2e.test.mjs`. Not yet wired up: prebuilt multi-platform binaries, HCL
-block syntax, and a generated `terraform-provider-*` launcher (you write the
-shebang entry yourself for now).
+configuration (`config`), both singular (`dataSource`) and plural
+(`dataSourceList`) data sources, HCL nested **blocks** (the `blocks` disposition),
+and single-file packaging (the `@tofu-sdk/core/tsdown` preset) all work end-to-end
+against real OpenTofu — see `test/e2e.test.mjs`. Not yet wired up: prebuilt
+multi-platform addons (the preset inlines the addon for the platform you build
+on, so cross-compiling a provider for other OSes/arches isn't covered yet).

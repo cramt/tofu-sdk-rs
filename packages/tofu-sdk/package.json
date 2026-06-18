@@ -6,6 +6,16 @@
   "type": "commonjs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./tsdown": {
+      "types": "./dist/tsdown.d.ts",
+      "default": "./dist/tsdown.js"
+    }
+  },
   "files": [
     "dist",
     "binding"
@@ -25,7 +35,17 @@
   "devDependencies": {
     "@napi-rs/cli": "^3",
     "@types/node": "^22",
+    "cloudflare": "^6.4.0",
+    "tsdown": "^0.22.3",
     "typescript": "^5"
+  },
+  "peerDependencies": {
+    "tsdown": "^0.22"
+  },
+  "peerDependenciesMeta": {
+    "tsdown": {
+      "optional": true
+    }
   },
   "dependencies": {
     "zod": "^4.4.3"

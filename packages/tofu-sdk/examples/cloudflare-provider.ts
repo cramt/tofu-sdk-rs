@@ -1,4 +1,3 @@
-#!/usr/bin/env -S npx tsx
 // A pet example: a Cloudflare provider authored with @tofu-sdk/core that manages
 // a single resource — `cloudflare_api_token` — by making *real* calls to the
 // official `cloudflare` TypeScript SDK (`cf.user.tokens.{create,get,update,delete}`).
@@ -13,14 +12,18 @@
 //   * permission groups are given **by name** (`permission_groups = ["DNS Write"]`);
 //     the create/update handlers resolve those names to Cloudflare's group IDs.
 //
-// Run it against tofu/terraform via dev_overrides:
+// This is plain TypeScript — no shebang, no build wiring. Bundle it into a single
+// self-contained `terraform-provider-cloudflare` executable with the SDK's tsdown
+// preset (see examples/tsdown.config.mjs and the README's "Shipping the provider"):
 //
-//   # from packages/tofu-sdk, after `pnpm build` (builds the native addon + dist):
-//   pnpm add cloudflare tsx
+//   # from packages/tofu-sdk, after `pnpm build` (native addon + dist):
+//   npx tsdown --config examples/tsdown.config.mjs
+//   # -> examples/dist/terraform-provider-cloudflare  (one file, native addon inlined)
+//
 //   export CLOUDFLARE_API_TOKEN=<a token with "User API Tokens: Edit" permission>
-//
 //   DIR=$(mktemp -d)
-//   ln -s "$PWD/examples/cloudflare-provider.ts" "$DIR/terraform-provider-cloudflare"
+//   ln -s "$PWD/examples/dist/terraform-provider-cloudflare" \
+//         "$DIR/terraform-provider-cloudflare"
 //   cat > "$DIR/tofurc" <<EOF
 //   provider_installation {
 //     dev_overrides { "example/cloudflare" = "$DIR" }
@@ -59,10 +62,11 @@ import { Provider, type Diagnostic } from "../ts/index";
 
 // One policy = an effect over a set of resources, granted a set of permission
 // groups *by name*. Rendered as a repeatable `policy { … }` block (see
-// `blocks: ["policy"]` below). `effect` is "allow" | "deny" (kept as a plain
-// string so the schema derivation stays a simple cty `string`).
+// `blocks: ["policy"]` below). `z.enum` derives to a cty `string` (a JSON-Schema
+// `{ type: "string", enum: [...] }`) and gives the handlers the literal union for
+// free — so no casts when calling the Cloudflare SDK.
 const Policy = z.object({
-  effect: z.string(),
+  effect: z.enum(["allow", "deny"]),
   // e.g. { "com.cloudflare.api.account.zone.*": "*" } — scope glob -> "*".
   resources: z.record(z.string(), z.string()),
   // Permission-group names, e.g. ["DNS Write", "Zone Read"]; resolved to IDs.
@@ -77,7 +81,7 @@ const ApiToken = z.object({
   // Computed, filled by Cloudflare on create.
   id: z.string(),
   value: z.string(), // the secret — only ever returned at creation time
-  status: z.string(),
+  status: z.enum(["active", "disabled", "expired"]),
   issued_on: z.string().optional(),
   modified_on: z.string().optional(),
 });
@@ -118,7 +122,7 @@ async function permissionGroupCatalog(): Promise<Map<string, string>> {
 async function toApiPolicies(policies: ApiToken["policy"]): Promise<TokenPolicies> {
   const catalog = await permissionGroupCatalog();
   return policies.map((p) => ({
-    effect: p.effect as "allow" | "deny",
+    effect: p.effect,
     resources: p.resources,
     permission_groups: p.permission_groups.map((name) => {
       const id = catalog.get(name);
@@ -180,7 +184,7 @@ new Provider()
       const token = await client().user.tokens.update(prior.id, {
         name: planned.name,
         policies: await toApiPolicies(planned.policy),
-        status: prior.status as "active" | "disabled" | "expired",
+        status: prior.status,
       });
       return {
         ...planned,
@@ -207,6 +211,10 @@ new Provider()
       return diagnostics;
     },
   })
+  // Hand off to the Rust core: `.serve()` performs the go-plugin handshake
+  // (magic-cookie check, protocol negotiation, auto-mTLS, the handshake line on
+  // stdout) and then runs the gRPC server until Terraform stops the process.
+  // Nothing protocol-related lives in this file.
   .serve()
   .catch((err) => {
     console.error("provider failed:", err);
