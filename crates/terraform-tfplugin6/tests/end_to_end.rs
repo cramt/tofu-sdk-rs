@@ -20,7 +20,6 @@ use terraform_tfplugin6::{emit_schema, tfplugin6};
 #[allow(dead_code)]
 struct Bucket {
     /// The name of the bucket.
-    #[facet(terraform::required)]
     #[facet(terraform::force_new)]
     name: String,
 

@@ -33,7 +33,6 @@ use terraform_runtime::{async_trait, serve, Provider, Resource, ResourceError};
 struct FsConfig {
     /// Absolute path to the directory resource files are written under. The
     /// harness points this at a fresh temp dir per configuration.
-    #[facet(terraform::required)]
     output_dir: String,
 }
 
@@ -51,7 +50,6 @@ struct FsClient {
 #[facet(terraform::resource("fs_file"))]
 struct FileModel {
     /// The file stem under `output_dir` (`<name>.json`). Renaming forces replace.
-    #[facet(terraform::required)]
     #[facet(terraform::force_new)]
     name: String,
 
@@ -151,7 +149,6 @@ impl Resource for FileHandler {
 #[derive(Facet, Clone)]
 struct Meta {
     /// Who authored the document.
-    #[facet(terraform::required)]
     author: String,
     /// An optional free-form note.
     note: Option<String>,
@@ -161,7 +158,6 @@ struct Meta {
 #[derive(Facet, Clone)]
 struct Section {
     /// The section heading.
-    #[facet(terraform::required)]
     heading: String,
     /// Optional section body text.
     body: Option<String>,
@@ -172,7 +168,6 @@ struct Section {
 #[facet(terraform::resource("fs_document"))]
 struct DocumentModel {
     /// The file stem under `output_dir` (`<name>.doc.json`). Renaming replaces.
-    #[facet(terraform::required)]
     #[facet(terraform::force_new)]
     name: String,
 

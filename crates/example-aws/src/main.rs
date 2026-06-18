@@ -32,7 +32,7 @@ use terraform_runtime::{
 #[allow(dead_code)]
 struct AwsConfig {
     /// The region buckets are created in. Defaults to `us-east-1` when unset.
-    #[facet(terraform::optional)]
+    /// An `Option<T>` field is inferred optional — no disposition marker needed.
     region: Option<String>,
 }
 
@@ -57,8 +57,8 @@ struct AwsClient {
 #[allow(dead_code)]
 struct Bucket {
     /// The globally-unique name of the bucket. A generic data source key:
-    /// looking up by name may match any number of buckets.
-    #[facet(terraform::required)]
+    /// looking up by name may match any number of buckets. A non-`Option` field
+    /// is inferred required — no `required` marker needed.
     #[facet(terraform::force_new)]
     #[facet(terraform::search_key(shared))]
     name: String,

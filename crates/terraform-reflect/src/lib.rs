@@ -31,7 +31,6 @@ mod spike_tests {
     #[facet(terraform::resource)]
     #[allow(dead_code)]
     struct Bucket {
-        #[facet(terraform::required)]
         #[facet(terraform::force_new)]
         name: String,
 
@@ -63,10 +62,6 @@ mod spike_tests {
         let fields = fields();
 
         let name = fields.iter().find(|f| f.name == "name").unwrap();
-        assert!(
-            name.has_attr(Some("terraform"), "required"),
-            "name should be terraform::required"
-        );
         assert!(
             name.has_attr(Some("terraform"), "force_new"),
             "name should be terraform::force_new"

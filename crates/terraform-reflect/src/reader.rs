@@ -375,17 +375,18 @@ fn attribute_from_field(field: &'static Field) -> Result<AttributeSchema, Reflec
     let is_option = matches!(shape.def, Def::Option(_)) || tfvalue_inner(shape).is_some();
     let ty = map_type(shape, &name)?;
 
-    // Explicit `#[facet(terraform::...)]` flags take precedence.
-    let mut required = field.has_attr(Some(NS), "required");
+    // Explicit `#[facet(terraform::...)]` flags. There is no `required` flag:
+    // required is always *derived*, never declared.
     let mut optional = field.has_attr(Some(NS), "optional");
     let computed = field.has_attr(Some(NS), "computed");
     let force_new = field.has_attr(Some(NS), "force_new");
     let sensitive = field.is_sensitive() || field.has_attr(Some(NS), "sensitive");
 
-    // If the author specified no disposition, infer one: an `Option<T>` field is
-    // optional; anything else is required. (A purely computed attribute is left
-    // as computed-only.)
-    if !required && !optional && !computed {
+    // Derive `required`: a field that is neither optional nor computed is
+    // required — unless it is a nullable wrapper (`Option<T>`/`TfValue<T>`),
+    // which is inferred optional instead.
+    let mut required = false;
+    if !optional && !computed {
         if is_option {
             optional = true;
         } else {
@@ -527,7 +528,6 @@ mod tests {
     #[allow(dead_code)]
     struct Bucket {
         /// The name of the bucket.
-        #[facet(terraform::required)]
         #[facet(terraform::force_new)]
         name: String,
 
@@ -580,7 +580,6 @@ mod tests {
     #[facet(terraform::resource)]
     #[allow(dead_code)]
     struct WithDefaults {
-        #[facet(terraform::required)]
         name: String,
         #[facet(terraform::optional)]
         #[facet(terraform::default("us-east-1"))]
@@ -609,7 +608,6 @@ mod tests {
     #[facet(terraform::resource)]
     #[allow(dead_code)]
     struct WithTfValue {
-        #[facet(terraform::required)]
         name: String,
         // A `TfValue<T>` field reflects to T's cty type and is nullable
         // (optional), like an `Option`.
@@ -679,14 +677,12 @@ mod tests {
     #[derive(Facet, Hash, PartialEq, Eq)]
     #[allow(dead_code)]
     struct Rule {
-        #[facet(terraform::required)]
         port: String,
     }
 
     #[derive(Facet)]
     #[allow(dead_code)]
     struct Meta {
-        #[facet(terraform::required)]
         author: String,
         note: Option<String>,
     }
@@ -695,7 +691,6 @@ mod tests {
     #[facet(terraform::resource)]
     #[allow(dead_code)]
     struct Firewall {
-        #[facet(terraform::required)]
         name: String,
 
         // Single block (optional).
@@ -751,14 +746,12 @@ mod tests {
     #[derive(Facet)]
     #[allow(dead_code)]
     struct Level2 {
-        #[facet(terraform::required)]
         value: String,
     }
 
     #[derive(Facet)]
     #[allow(dead_code)]
     struct Level1 {
-        #[facet(terraform::required)]
         label: String,
         #[facet(terraform::block)]
         deep: Vec<Level2>,
@@ -768,7 +761,6 @@ mod tests {
     #[facet(terraform::resource)]
     #[allow(dead_code)]
     struct Nested {
-        #[facet(terraform::required)]
         name: String,
         #[facet(terraform::block)]
         level1: Vec<Level1>,
@@ -804,7 +796,6 @@ mod tests {
     #[facet(terraform::resource("aws_s3_bucket"))]
     #[allow(dead_code)]
     struct NamedResource {
-        #[facet(terraform::required)]
         id: String,
     }
 
@@ -812,7 +803,6 @@ mod tests {
     #[facet(terraform::resource)]
     #[allow(dead_code)]
     struct AwsS3Bucket {
-        #[facet(terraform::required)]
         id: String,
     }
 
@@ -865,7 +855,6 @@ mod tests {
     #[facet(terraform::data_source)]
     #[allow(dead_code)]
     struct Server {
-        #[facet(terraform::required)]
         #[facet(terraform::search_key(shared))]
         name: String,
 

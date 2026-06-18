@@ -22,7 +22,6 @@ use tonic::{Code, Request};
 #[allow(dead_code)]
 struct Bucket {
     /// The name of the bucket.
-    #[facet(terraform::required)]
     #[facet(terraform::force_new)]
     name: String,
     #[facet(terraform::computed)]
@@ -174,7 +173,6 @@ async fn unimplemented_rpc_returns_unimplemented() {
 #[facet(terraform::resource("planmod"))]
 #[allow(dead_code)]
 struct PlanMod {
-    #[facet(terraform::required)]
     name: String,
     #[facet(terraform::optional)]
     tier: Option<String>,
@@ -282,7 +280,6 @@ async fn modify_plan_can_force_replacement() {
 #[facet(terraform::resource("cancel_probe"))]
 #[allow(dead_code)]
 struct CancelProbe {
-    #[facet(terraform::required)]
     name: String,
 }
 
@@ -621,7 +618,6 @@ struct AwsClient {
 #[facet(terraform::resource("region_bucket"))]
 #[allow(dead_code)]
 struct RegionBucket {
-    #[facet(terraform::required)]
     name: String,
     #[facet(terraform::computed)]
     region: String,
@@ -1120,7 +1116,6 @@ async fn dyn_resource_serves_from_hand_built_schema() {
 #[facet(terraform::resource("failing"))]
 #[allow(dead_code)]
 struct Failing {
-    #[facet(terraform::required)]
     name: String,
 }
 

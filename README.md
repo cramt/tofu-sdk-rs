@@ -32,7 +32,7 @@ use terraform_runtime::{async_trait, serve, Provider, Resource, ResourceError};
 #[derive(Facet)]
 #[facet(terraform::resource("aws_s3_bucket"))]
 struct Bucket {
-    #[facet(terraform::required)]
+    // non-`Option` ⇒ inferred required
     #[facet(terraform::force_new)]
     name: String,
 

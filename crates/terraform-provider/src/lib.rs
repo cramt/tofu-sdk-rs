@@ -12,7 +12,7 @@
 //! #[derive(Facet)]
 //! #[facet(terraform::resource)]
 //! struct Bucket {
-//!     #[facet(terraform::required)]
+//!     // non-`Option` ⇒ inferred required; no `required` marker needed
 //!     #[facet(terraform::force_new)]
 //!     name: String,
 //!     #[facet(terraform::computed)]
@@ -30,7 +30,7 @@ pub use facet::Facet;
 /// The `#[facet(terraform::...)]` attribute namespace.
 ///
 /// Authors bring this into scope as `terraform` (the facet convention) so they
-/// can write `#[facet(terraform::required)]`:
+/// can write `#[facet(terraform::computed)]`:
 ///
 /// ```ignore
 /// use terraform_provider::terraform;

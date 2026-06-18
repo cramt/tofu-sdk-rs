@@ -11,7 +11,7 @@
 //! #[derive(Facet)]
 //! #[facet(terraform::resource)]
 //! struct Bucket {
-//!     #[facet(terraform::required)]
+//!     // non-`Option` ⇒ inferred required
 //!     #[facet(terraform::force_new)]
 //!     name: String,
 //!     #[facet(terraform::computed)]
@@ -37,9 +37,11 @@ facet::define_attr_grammar! {
     /// Variant names map to snake_case attribute keys: `ForceNew` becomes
     /// `#[facet(terraform::force_new)]`.
     pub enum Attr {
-        /// The caller must set this attribute.
-        Required,
-        /// The caller may set this attribute.
+        /// The caller may set this attribute. There is deliberately no `Required`
+        /// marker: required is *inferred* for any field that is neither optional
+        /// nor computed nor a nullable wrapper (`Option<T>`/`TfValue<T>`). This
+        /// marker only exists for the unusual case of a non-`Option` field that
+        /// should nonetheless be optional. See `terraform-reflect`.
         Optional,
         /// The provider computes this attribute; it may be unknown at plan time.
         Computed,
