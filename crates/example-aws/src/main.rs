@@ -142,6 +142,11 @@ struct Locker {
     /// itself is null in state.
     #[facet(terraform::computed)]
     has_secret: bool,
+
+    /// A superseded alias for `name`, kept only to demonstrate the `deprecated`
+    /// schema flag (the engine surfaces it as a deprecation warning).
+    #[facet(terraform::deprecated("use `name` instead"))]
+    legacy_name: Option<String>,
 }
 
 /// The handler for `aws_locker`. It records *whether* a secret was supplied (so a

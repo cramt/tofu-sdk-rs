@@ -560,6 +560,7 @@ fn attribute_from_field(field: &'static Field) -> Result<AttributeSchema, Reflec
     }
 
     let default = field_default(field, &ty);
+    let deprecated = field_deprecated(field);
 
     Ok(AttributeSchema {
         name,
@@ -571,8 +572,20 @@ fn attribute_from_field(field: &'static Field) -> Result<AttributeSchema, Reflec
         sensitive,
         write_only,
         force_new,
+        deprecated,
         default,
     })
+}
+
+/// Read a field's `#[facet(terraform::deprecated)]` / `deprecated("msg")` marker.
+/// Returns `Some(message)` (the message may be empty for the bare form) when
+/// present, else `None`.
+fn field_deprecated(field: &'static Field) -> Option<String> {
+    let attr = field.get_attr(Some(NS), "deprecated")?;
+    match attr.get_as::<TfAttr>()? {
+        TfAttr::Deprecated(message) => Some(message.unwrap_or_default().to_string()),
+        _ => None,
+    }
 }
 
 /// Read a field's `#[facet(terraform::default("…")]` and parse the literal
@@ -1269,6 +1282,37 @@ mod tests {
         let err =
             reflect_block::<WoComputedModel>().expect_err("must reject write_only + computed");
         assert!(matches!(err, ReflectError::WriteOnlyComputed { .. }));
+    }
+
+    #[derive(Facet)]
+    #[facet(terraform::resource)]
+    #[allow(dead_code)]
+    struct DeprecatedModel {
+        name: String,
+        #[facet(terraform::deprecated("use `name` instead"))]
+        legacy_name: Option<String>,
+        #[facet(terraform::deprecated)]
+        old_flag: Option<bool>,
+    }
+
+    #[test]
+    fn deprecated_marker_carries_optional_message() {
+        let block = reflect_block::<DeprecatedModel>().expect("reflects");
+        assert_eq!(
+            attr(&block, "legacy_name").deprecated.as_deref(),
+            Some("use `name` instead"),
+            "deprecated with a message"
+        );
+        assert_eq!(
+            attr(&block, "old_flag").deprecated.as_deref(),
+            Some(""),
+            "bare deprecated carries an empty message"
+        );
+        assert_eq!(
+            attr(&block, "name").deprecated,
+            None,
+            "unmarked attribute is not deprecated"
+        );
     }
 
     #[test]

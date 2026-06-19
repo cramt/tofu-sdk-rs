@@ -54,6 +54,10 @@ facet::define_attr_grammar! {
         /// returned state, so a handler reads the real value only from the
         /// apply-time config. Cannot be combined with `computed`.
         WriteOnly,
+        /// Marks the attribute as deprecated. The optional payload is the message
+        /// shown to users: `#[facet(terraform::deprecated("use `foo` instead"))]`,
+        /// or bare `#[facet(terraform::deprecated)]` for no message.
+        Deprecated(Option<&'static str>),
         /// A default applied during planning when the caller leaves this optional
         /// attribute unset. The payload is the default written as a string literal
         /// (`#[facet(terraform::default("us-east-1")]`); `terraform-reflect` parses

@@ -353,9 +353,15 @@ via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`)
   (`write_only_value_reaches_handler_but_not_state`), the schema contract test
   (`aws_locker.secret` → `write_only: true`), and a real `tofu test`
   (`write_only.tftest.hcl`: handler sees the secret, state nulls it).
-- **`deprecated` flag:** `emit_attribute` still hardcodes `deprecated: false`.
-  Add a `deprecated` marker (trivial, schema-only). (Required-block `min_items`
-  is done — see 3.7 / nested-block fidelity.)
+- ~~**`deprecated` flag.**~~ ✅ **DONE** — `AttributeSchema.deprecated:
+  Option<String>` (the message; `None` = not deprecated), reflected from
+  `#[facet(terraform::deprecated)]` / `deprecated("msg")` (`field_deprecated` in
+  `terraform-reflect`), emitted as `deprecated` + `deprecation_message`
+  (`emit_attribute`), and exposed in the TS frontend as a `deprecated`
+  disposition + the addon's `deprecated` JSON flag. Verified by a reflect unit
+  test (`deprecated_marker_carries_optional_message`) and the schema contract
+  test (`aws_locker.legacy_name` → `deprecated: true`). (Required-block
+  `min_items` is done — see 3.7 / nested-block fidelity.)
 
 ### 3.5 Plan modification depth — ✅ DONE
 - **Done:** `PlanModifications` (`resource.rs`) now targets attribute **`Path`s**

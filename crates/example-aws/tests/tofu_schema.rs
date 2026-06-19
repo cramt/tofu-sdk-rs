@@ -87,6 +87,11 @@ fn real_engine_loads_reflected_schema() {
         Some(true),
         "has_secret is a computed witness"
     );
+    assert_eq!(
+        common::get(locker, &["legacy_name", "deprecated"]).as_bool(),
+        Some(true),
+        "legacy_name is advertised as deprecated"
+    );
 
     assert!(
         common::path(provider, &["provider", "block"])

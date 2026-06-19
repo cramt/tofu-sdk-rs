@@ -179,6 +179,9 @@ pub struct AttributeSchema {
     pub write_only: bool,
     /// Changing this attribute forces resource replacement.
     pub force_new: bool,
+    /// If set, the attribute is deprecated; the string is the message shown to
+    /// users (may be empty). `None` means not deprecated.
+    pub deprecated: Option<String>,
     /// A default value applied during planning when the caller leaves an
     /// optional attribute unset (null). Not emitted into the Terraform schema —
     /// Terraform has no schema-level default; the provider applies it in the
@@ -199,6 +202,7 @@ impl AttributeSchema {
             sensitive: false,
             write_only: false,
             force_new: false,
+            deprecated: None,
             default: None,
         }
     }

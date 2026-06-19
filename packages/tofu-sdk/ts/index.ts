@@ -151,6 +151,8 @@ interface Dispositions<S extends z.ZodObject<z.ZodRawShape>> {
    * combined with `computed`.
    */
   writeOnly?: FieldName<S>[];
+  /** Attributes marked deprecated (a boolean notice; no message from here). */
+  deprecated?: FieldName<S>[];
   /**
    * Fields to render as nested **blocks** (`name { … }`) instead of object/list
    * attributes (`name = …`). Each named field must be an object (a single block)
@@ -192,6 +194,7 @@ interface AttributeJson {
   forceNew: boolean;
   sensitive: boolean;
   writeOnly: boolean;
+  deprecated: boolean;
 }
 
 /** One nested-block descriptor in the schema JSON. */
@@ -222,6 +225,7 @@ function attributesFromObject(node: JsonSchema): AttributeJson[] {
     forceNew: false,
     sensitive: false,
     writeOnly: false,
+    deprecated: false,
   }));
 }
 
@@ -263,6 +267,7 @@ function schemaJson(
   const forceNew = new Set<string>(dispositions.forceNew ?? []);
   const sensitive = new Set<string>(dispositions.sensitive ?? []);
   const writeOnly = new Set<string>(dispositions.writeOnly ?? []);
+  const deprecated = new Set<string>(dispositions.deprecated ?? []);
   const blockNames = new Set<string>(dispositions.blocks ?? []);
 
   const attributes: AttributeJson[] = [];
@@ -283,6 +288,7 @@ function schemaJson(
       forceNew: forceNew.has(name),
       sensitive: sensitive.has(name),
       writeOnly: writeOnly.has(name),
+      deprecated: deprecated.has(name),
     });
   }
   return JSON.stringify({ attributes, blocks });
@@ -530,6 +536,7 @@ export class Provider {
       forceNew: false,
       sensitive: false,
       writeOnly: false,
+      deprecated: false,
     }));
     attributes.push({
       name: "results",
@@ -540,6 +547,7 @@ export class Provider {
       forceNew: false,
       sensitive: false,
       writeOnly: false,
+      deprecated: false,
     });
 
     const read: RawHandler = async (err, input) => {
