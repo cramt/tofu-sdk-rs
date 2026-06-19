@@ -159,6 +159,16 @@ it; keep it static. The preset is exposed via the package.json `exports` subpath
 - **`force_new` is a plan behavior, not a schema property** — it is reflected
   but emitted as `requires_replace` during `PlanResourceChange`, never into the
   schema.
+- **`write_only` is a schema flag *and* runtime behavior.**
+  `#[facet(terraform::write_only)]` sets `AttributeSchema.write_only` (emitted to
+  the schema; rejected alongside `computed`). The real value never persists:
+  `terraform-runtime/src/write_only.rs` `strip`s it to null from the planned
+  state (`plan.rs`) and every returned state (apply/read in `service.rs`), and
+  `merge_from_config` pulls it from the apply-time **config** into the planned
+  value so a `create`/`update` handler still sees it. All of this is gated on
+  `block_has` (no overhead when a resource has none) and lives below the typed
+  trait, so the dynamic seam / Node binding (which forwards a `writeOnly` JSON
+  flag) is unaffected.
 - **Nested blocks come only from `#[facet(terraform::block)]`.** A field without
   it that happens to be a struct/`Vec<struct>` stays an *object/list attribute*
   (assigned with `=`); the marker is what makes `terraform-reflect` emit a

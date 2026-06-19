@@ -39,6 +39,12 @@ pub enum ReflectError {
         /// The offending field's name.
         field: String,
     },
+    /// A field is marked both `write_only` and `computed`, which Terraform
+    /// rejects — a write-only value is an input the provider never computes.
+    WriteOnlyComputed {
+        /// The offending field's name.
+        field: String,
+    },
 }
 
 impl core::fmt::Display for ReflectError {
@@ -58,6 +64,10 @@ impl core::fmt::Display for ReflectError {
                 f,
                 "field `{field}` must use exactly one of \
                  `search_key(exclusive)` or `search_key(shared)`"
+            ),
+            ReflectError::WriteOnlyComputed { field } => write!(
+                f,
+                "field `{field}` cannot be both `write_only` and `computed`"
             ),
         }
     }
@@ -199,6 +209,9 @@ fn as_computed(mut attr: AttributeSchema) -> AttributeSchema {
     attr.optional = false;
     attr.computed = true;
     attr.force_new = false;
+    // Write-only is a managed-resource-only disposition; a data-source output is
+    // a plain computed value.
+    attr.write_only = false;
     attr
 }
 
@@ -208,6 +221,7 @@ fn as_input(mut attr: AttributeSchema, required: bool) -> AttributeSchema {
     attr.optional = !required;
     attr.computed = false;
     attr.force_new = false;
+    attr.write_only = false;
     attr
 }
 
@@ -525,6 +539,13 @@ fn attribute_from_field(field: &'static Field) -> Result<AttributeSchema, Reflec
     let computed = field.has_attr(Some(NS), "computed");
     let force_new = field.has_attr(Some(NS), "force_new");
     let sensitive = field.is_sensitive() || field.has_attr(Some(NS), "sensitive");
+    let write_only = field.has_attr(Some(NS), "write_only");
+
+    // A write-only value is an apply-time input the provider never computes;
+    // Terraform rejects the combination outright.
+    if write_only && computed {
+        return Err(ReflectError::WriteOnlyComputed { field: name });
+    }
 
     // Derive `required`: a field that is neither optional nor computed is
     // required — unless it is a nullable wrapper (`Option<T>`/`TfValue<T>`),
@@ -548,6 +569,7 @@ fn attribute_from_field(field: &'static Field) -> Result<AttributeSchema, Reflec
         optional,
         computed,
         sensitive,
+        write_only,
         force_new,
         default,
     })
@@ -1208,6 +1230,45 @@ mod tests {
         #[facet(terraform::computed)]
         #[facet(terraform::sensitive)]
         token: String,
+    }
+
+    // --- write-only attributes ---------------------------------------------
+
+    #[derive(Facet)]
+    #[facet(terraform::resource)]
+    #[allow(dead_code)]
+    struct WoModel {
+        name: String,
+        #[facet(terraform::write_only)]
+        password: Option<String>,
+    }
+
+    #[test]
+    fn write_only_flag_is_reflected_as_optional_input() {
+        let block = reflect_block::<WoModel>().expect("reflects");
+        let password = attr(&block, "password");
+        assert!(password.write_only, "field is marked write-only");
+        assert!(
+            password.optional && !password.required && !password.computed,
+            "a write-only input is optional, never computed"
+        );
+    }
+
+    #[derive(Facet)]
+    #[facet(terraform::resource)]
+    #[allow(dead_code)]
+    struct WoComputedModel {
+        name: String,
+        #[facet(terraform::write_only)]
+        #[facet(terraform::computed)]
+        bad: String,
+    }
+
+    #[test]
+    fn write_only_with_computed_is_rejected() {
+        let err =
+            reflect_block::<WoComputedModel>().expect_err("must reject write_only + computed");
+        assert!(matches!(err, ReflectError::WriteOnlyComputed { .. }));
     }
 
     #[test]

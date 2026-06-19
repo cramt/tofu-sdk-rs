@@ -172,6 +172,11 @@ pub struct AttributeSchema {
     pub computed: bool,
     /// The value is sensitive and should be redacted in UI/logs.
     pub sensitive: bool,
+    /// The value is supplied at apply time but is never persisted to state — a
+    /// write-only input (e.g. a secret). The runtime nulls it out of every
+    /// returned state and the planned state; the real value reaches a handler
+    /// only through the apply-time config. Mutually exclusive with `computed`.
+    pub write_only: bool,
     /// Changing this attribute forces resource replacement.
     pub force_new: bool,
     /// A default value applied during planning when the caller leaves an
@@ -192,6 +197,7 @@ impl AttributeSchema {
             optional: false,
             computed: false,
             sensitive: false,
+            write_only: false,
             force_new: false,
             default: None,
         }

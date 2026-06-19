@@ -49,6 +49,11 @@ facet::define_attr_grammar! {
         ForceNew,
         /// The value is sensitive and should be redacted.
         Sensitive,
+        /// A write-only input: supplied at apply time but never persisted to
+        /// state (e.g. a secret/password). The runtime nulls it out of every
+        /// returned state, so a handler reads the real value only from the
+        /// apply-time config. Cannot be combined with `computed`.
+        WriteOnly,
         /// A default applied during planning when the caller leaves this optional
         /// attribute unset. The payload is the default written as a string literal
         /// (`#[facet(terraform::default("us-east-1")]`); `terraform-reflect` parses

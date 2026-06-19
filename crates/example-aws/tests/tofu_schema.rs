@@ -66,6 +66,28 @@ fn real_engine_loads_reflected_schema() {
         "tags should be map(string)"
     );
 
+    // The write-only resource `aws_locker`: its `secret` attribute must carry
+    // `write_only: true` in the schema the engine reports.
+    let locker = common::get(
+        provider,
+        &["resource_schemas", "aws_locker", "block", "attributes"],
+    );
+    assert_eq!(
+        common::get(locker, &["secret", "write_only"]).as_bool(),
+        Some(true),
+        "secret must be advertised as write-only"
+    );
+    assert_eq!(
+        common::get(locker, &["secret", "optional"]).as_bool(),
+        Some(true),
+        "the write-only secret is an optional input"
+    );
+    assert_eq!(
+        common::get(locker, &["has_secret", "computed"]).as_bool(),
+        Some(true),
+        "has_secret is a computed witness"
+    );
+
     assert!(
         common::path(provider, &["provider", "block"])
             .and_then(Json::as_object)

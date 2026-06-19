@@ -492,8 +492,9 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         let req = request.into_inner();
         tracing::debug!(type_name = %req.type_name, "ReadResource");
 
-        let (Some(ty), Some(handler)) = (
+        let (Some(ty), Some(block), Some(handler)) = (
             self.provider.resource_cty(&req.type_name),
+            self.provider.resource_block(&req.type_name),
             self.provider.resource_handler(&req.type_name),
         ) else {
             return Ok(Response::new(Resp {
@@ -515,7 +516,7 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         let (outcome, outs) = self
             .run("read resource", req.private.clone(), handler.read(current))
             .await;
-        let new_value = match outcome {
+        let mut new_value = match outcome {
             Ok(Some(v)) => v,
             Ok(None) => Value::Null, // resource is gone
             Err(diags) => {
@@ -525,6 +526,9 @@ impl tfplugin6::provider_server::Provider for ProviderService {
                 }))
             }
         };
+        // Write-only inputs are never persisted: keep them null in refreshed
+        // state even if a handler re-populated them.
+        crate::write_only::strip(&mut new_value, block);
 
         respond_state(
             &new_value,
@@ -547,8 +551,9 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         use tfplugin6::apply_resource_change::Response as Resp;
         let req = request.into_inner();
 
-        let (Some(ty), Some(handler)) = (
+        let (Some(ty), Some(block), Some(handler)) = (
             self.provider.resource_cty(&req.type_name),
+            self.provider.resource_block(&req.type_name),
             self.provider.resource_handler(&req.type_name),
         ) else {
             return Ok(Response::new(Resp {
@@ -566,7 +571,7 @@ impl tfplugin6::provider_server::Provider for ProviderService {
                 }))
             }
         };
-        let planned = match decode_dynamic(&req.planned_state, &ty) {
+        let mut planned = match decode_dynamic(&req.planned_state, &ty) {
             Ok(v) => v,
             Err(e) => {
                 return Ok(Response::new(Resp {
@@ -575,6 +580,23 @@ impl tfplugin6::provider_server::Provider for ProviderService {
                 }))
             }
         };
+
+        // Write-only inputs are null in the planned state; their real value
+        // arrives in the apply-time config. Merge it into the planned value so a
+        // create/update handler sees it (it is stripped back out of the result
+        // before the new state is persisted).
+        if crate::write_only::block_has(block) && !planned.is_null() {
+            let config = match decode_dynamic(&req.config, &ty) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(Response::new(Resp {
+                        diagnostics: error_diag("failed to decode config", e.to_string()),
+                        ..Default::default()
+                    }))
+                }
+            };
+            crate::write_only::merge_from_config(&mut planned, &config, block);
+        }
 
         // null planned => destroy; null prior => create; otherwise update.
         let action = if planned.is_null() {
@@ -600,18 +622,22 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         };
 
         match outcome {
-            Ok(new_value) => respond_state(
-                &new_value,
-                &ty,
-                req.planned_private,
-                outs,
-                |new_state, private, diagnostics| Resp {
-                    new_state,
-                    private,
-                    diagnostics,
-                    ..Default::default()
-                },
-            ),
+            Ok(mut new_value) => {
+                // Never persist write-only inputs to state.
+                crate::write_only::strip(&mut new_value, block);
+                respond_state(
+                    &new_value,
+                    &ty,
+                    req.planned_private,
+                    outs,
+                    |new_state, private, diagnostics| Resp {
+                        new_state,
+                        private,
+                        diagnostics,
+                        ..Default::default()
+                    },
+                )
+            }
             Err(diags) => Ok(Response::new(Resp {
                 // On failure, keep the prior state so Terraform does not record a
                 // partially-applied resource.

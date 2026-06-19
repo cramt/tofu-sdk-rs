@@ -284,6 +284,106 @@ async fn modify_plan_can_force_replacement() {
     );
 }
 
+/// A resource with a write-only `password` input. `create` records the value it
+/// received so the test can prove the handler saw the real (apply-time config)
+/// secret, while the returned state must null it out.
+#[derive(Facet)]
+#[facet(terraform::resource("wo_secret"))]
+#[allow(dead_code)]
+struct WoSecret {
+    name: String,
+    #[facet(terraform::write_only)]
+    password: Option<String>,
+}
+
+struct WoResource {
+    seen: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+#[async_trait]
+impl Resource for WoResource {
+    type Model = WoSecret;
+
+    async fn create(&self, _ctx: &mut Ctx, planned: WoSecret) -> Result<WoSecret, ResourceError> {
+        *self.seen.lock().unwrap() = planned.password.clone();
+        Ok(planned)
+    }
+}
+
+#[tokio::test]
+async fn write_only_value_reaches_handler_but_not_state() {
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let svc = Provider::builder()
+        .resource(WoResource { seen: seen.clone() })
+        .build()
+        .map(ProviderService::new)
+        .expect("provider builds");
+
+    let ty = terraform_value::Type::Object(vec![
+        terraform_value::ObjectAttr {
+            name: "name".into(),
+            ty: terraform_value::Type::String,
+            optional: false,
+        },
+        terraform_value::ObjectAttr {
+            name: "password".into(),
+            ty: terraform_value::Type::String,
+            optional: true,
+        },
+    ]);
+    let state = |name: &str, password: terraform_value::Value| {
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(
+            "name".to_string(),
+            terraform_value::Value::String(name.into()),
+        );
+        obj.insert("password".to_string(), password);
+        tfplugin6::DynamicValue {
+            msgpack: terraform_codec::encode_msgpack(&terraform_value::Value::Object(obj), &ty)
+                .unwrap(),
+            json: vec![],
+        }
+    };
+
+    // Create: planned state nulls the write-only password; config carries it.
+    let resp = svc
+        .apply_resource_change(Request::new(tfplugin6::apply_resource_change::Request {
+            type_name: "wo_secret".into(),
+            prior_state: None,
+            planned_state: Some(state("db", terraform_value::Value::Null)),
+            config: Some(state(
+                "db",
+                terraform_value::Value::String("hunter2".into()),
+            )),
+            ..Default::default()
+        }))
+        .await
+        .expect("apply")
+        .into_inner();
+    assert!(resp.diagnostics.is_empty(), "{:?}", resp.diagnostics);
+
+    // The handler observed the real secret from config...
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some("hunter2".to_string()),
+        "create should receive the write-only value merged from config"
+    );
+
+    // ...but it must never be written to state.
+    let new_state = resp.new_state.expect("new state");
+    let new_state =
+        terraform_codec::decode_msgpack(&new_state.msgpack, &ty).expect("decode new state");
+    let terraform_value::Value::Object(fields) = new_state else {
+        panic!("new state should be an object");
+    };
+    assert_eq!(fields["name"], terraform_value::Value::String("db".into()));
+    assert!(
+        fields["password"].is_null(),
+        "write-only password must be null in persisted state, got {:?}",
+        fields["password"]
+    );
+}
+
 /// A resource with a `settings` list block carrying a computed `id`, whose
 /// `modify_plan` marks the *nested* `settings[0].id` unknown by path — proving a
 /// plan modification can reach inside a block, not just a top-level attribute,

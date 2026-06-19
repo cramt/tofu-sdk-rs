@@ -20,6 +20,7 @@ mod resource;
 mod serve;
 mod service;
 mod tls;
+mod write_only;
 
 pub use builder::{
     BuildError, ConfigureError, DynConfigure, DynValidateConfig, IntoConfigured, Provider,

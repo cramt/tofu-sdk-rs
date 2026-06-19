@@ -186,7 +186,7 @@ fn emit_attribute(attr: &AttributeSchema) -> schema::Attribute {
         sensitive: attr.sensitive,
         description_kind: StringKind::Plain as i32,
         deprecated: false,
-        write_only: false,
+        write_only: attr.write_only,
         deprecation_message: String::new(),
     }
 }

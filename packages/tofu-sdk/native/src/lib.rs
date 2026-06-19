@@ -58,7 +58,7 @@ fn json_to_value(json: &str, ty: &Type) -> std::result::Result<Value, String> {
 
 /// Build a [`Block`] from the JS schema description:
 /// `{ "attributes": [ { "name", "type": <cty-json>, "required"?, "optional"?,
-/// "computed"?, "forceNew"?, "sensitive"?, "description"? }, ... ],
+/// "computed"?, "forceNew"?, "sensitive"?, "writeOnly"?, "description"? }, ... ],
 ///   "blocks"?: [ { "name", "nesting"?, "minItems"?, "maxItems"?, "block": <schema> }, ... ] }`.
 fn block_from_schema_json(json: &str) -> std::result::Result<Block, String> {
     let parsed: facet_value::Value =
@@ -104,6 +104,7 @@ fn block_from_schema_value(parsed: &facet_value::Value) -> std::result::Result<B
             optional: flag("optional"),
             computed: flag("computed"),
             sensitive: flag("sensitive"),
+            write_only: flag("writeOnly"),
             force_new: flag("forceNew"),
             // The TS layer applies its own defaults; the Rust seam takes none.
             default: None,

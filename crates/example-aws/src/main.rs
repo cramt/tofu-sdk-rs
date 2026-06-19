@@ -123,6 +123,51 @@ impl Resource for BucketResource {
     }
 }
 
+/// A resource with a **write-only** input, demonstrating that a secret supplied
+/// at apply time is used by the handler but never persisted to state.
+#[derive(Facet)]
+#[facet(terraform::resource("aws_locker"))]
+#[allow(dead_code)]
+struct Locker {
+    #[facet(terraform::force_new)]
+    name: String,
+
+    /// The secret to store. Write-only: it reaches the handler through the
+    /// apply-time config, but the runtime nulls it out of every persisted state.
+    #[facet(terraform::write_only)]
+    secret: Option<String>,
+
+    /// Whether `create` observed a non-empty secret. A computed witness that the
+    /// write-only value genuinely reached the handler — even though `secret`
+    /// itself is null in state.
+    #[facet(terraform::computed)]
+    has_secret: bool,
+}
+
+/// The handler for `aws_locker`. It records *whether* a secret was supplied (so a
+/// test can prove the handler saw it) without ever echoing the secret back.
+struct LockerResource;
+
+#[async_trait]
+impl Resource for LockerResource {
+    type Model = Locker;
+
+    async fn create(&self, _ctx: &mut Ctx, mut planned: Locker) -> Result<Locker, ResourceError> {
+        planned.has_secret = planned.secret.as_deref().is_some_and(|s| !s.is_empty());
+        Ok(planned)
+    }
+
+    async fn update(
+        &self,
+        _ctx: &mut Ctx,
+        mut planned: Locker,
+        _prior: Locker,
+    ) -> Result<Locker, ResourceError> {
+        planned.has_secret = planned.secret.as_deref().is_some_and(|s| !s.is_empty());
+        Ok(planned)
+    }
+}
+
 /// The strip-prefix used to derive a bucket name from its ARN, and vice versa.
 const ARN_PREFIX: &str = "arn:aws:s3:::";
 
@@ -300,6 +345,7 @@ async fn main() {
             })
         })
         .resource_with(|client: Arc<AwsClient>| BucketResource { client })
+        .resource(LockerResource)
         .data_source_with(|client: Arc<AwsClient>| BucketByArn { client })
         .data_source_list_with(|client: Arc<AwsClient>| BucketsByName { client })
         .ephemeral_with(|client: Arc<AwsClient>| SessionTokenEphemeral { client })

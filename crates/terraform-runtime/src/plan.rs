@@ -44,7 +44,11 @@ pub fn plan(prior: &Value, proposed: Value, block: &Block) -> Plan {
 
     let requires_replace = requires_replace(prior, &proposed, block);
     let replacing = !requires_replace.is_empty();
-    let planned = mark_computed_unknown(proposed, block, replacing);
+    let mut planned = mark_computed_unknown(proposed, block, replacing);
+
+    // Write-only inputs are never persisted: the planned state nulls them out
+    // (their real value reaches a handler only through the apply-time config).
+    crate::write_only::strip(&mut planned, block);
 
     Plan {
         planned,

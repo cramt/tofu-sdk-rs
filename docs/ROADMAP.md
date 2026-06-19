@@ -66,9 +66,10 @@ Rough priority order, each pointing at its tracked item:
    differently-encoded-but-equal values (reordered JSON, equivalent set
    ordering, case-insensitive IDs) as unchanged, so providers surface spurious
    diffs. → new **3.6**.
-5. **Write-only attributes.** `write_only` is a hardcoded `false` schema flag;
-   real write-only *semantics* (the value is never persisted to state) is more
-   than the flag. → **3.4** (flag) + runtime support.
+5. ~~**Write-only attributes.**~~ ✅ **DONE** — the schema flag
+   (`#[facet(terraform::write_only)]` → IR/emit/TS) *and* the runtime semantics:
+   the value is nulled out of the planned and every returned state but merged
+   from the apply-time config into the handler's input. → **3.4**.
 6. ~~**Nested-block fidelity.**~~ ✅ **DONE** — a `NestedBlock` carries
    `min_items`/`max_items`: a bare-struct single block is required
    (`min_items = 1`), `Option<struct>` optional; collections stay unbounded. The
@@ -335,11 +336,26 @@ via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`)
   `create_success_carries_warning_and_persists_private_state`).
 - **`timeouts {}`:** the common per-operation timeout block convention. Now
   expressible as a nested block; needs runtime plumbing to read + enforce.
-- **Schema flags:** `emit_attribute` hardcodes `deprecated: false` /
-  `write_only: false`. Add `deprecated`/`write_only` markers. Note `write_only`
-  is two pieces: the schema flag *and* the runtime semantics (the value is
-  validated/used but never persisted to state). (Required-block `min_items` is
-  done — see 3.7 / nested-block fidelity.)
+- ~~**Write-only attributes.**~~ ✅ **DONE** — both pieces. *Schema flag:*
+  `AttributeSchema.write_only` (`terraform-ir`), reflected from
+  `#[facet(terraform::write_only)]` (`terraform-reflect`; rejects
+  `write_only`+`computed` via `ReflectError::WriteOnlyComputed`, and the
+  data-source projections clear it), emitted by `emit_attribute`
+  (`terraform-tfplugin6`), and exposed in the TS frontend as a `writeOnly`
+  disposition + the addon's `writeOnly` JSON flag. *Runtime semantics*
+  (`terraform-runtime/src/write_only.rs`): the planned state and every returned
+  state have write-only attributes nulled (`strip`, recursing into nested
+  blocks), while `apply` merges the real value from the apply-time **config**
+  into the planned value (`merge_from_config`) so a `create`/`update` handler
+  still receives it. Wired into `plan.rs` and `service.rs` (apply + read), gated
+  on `block_has` so no-write-only resources are untouched. Verified by unit tests
+  (`write_only.rs`, `reader.rs`), an end-to-end service test
+  (`write_only_value_reaches_handler_but_not_state`), the schema contract test
+  (`aws_locker.secret` → `write_only: true`), and a real `tofu test`
+  (`write_only.tftest.hcl`: handler sees the secret, state nulls it).
+- **`deprecated` flag:** `emit_attribute` still hardcodes `deprecated: false`.
+  Add a `deprecated` marker (trivial, schema-only). (Required-block `min_items`
+  is done — see 3.7 / nested-block fidelity.)
 
 ### 3.5 Plan modification depth — ✅ DONE
 - **Done:** `PlanModifications` (`resource.rs`) now targets attribute **`Path`s**

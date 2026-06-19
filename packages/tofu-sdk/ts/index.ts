@@ -145,6 +145,13 @@ interface Dispositions<S extends z.ZodObject<z.ZodRawShape>> {
   /** Attributes whose values should be redacted. */
   sensitive?: FieldName<S>[];
   /**
+   * Write-only attributes: supplied at apply time but never persisted to state
+   * (e.g. secrets). The provider runtime nulls them out of every returned state,
+   * so a handler reads the real value only from the apply-time config. Cannot be
+   * combined with `computed`.
+   */
+  writeOnly?: FieldName<S>[];
+  /**
    * Fields to render as nested **blocks** (`name { … }`) instead of object/list
    * attributes (`name = …`). Each named field must be an object (a single block)
    * or an array of objects (a repeatable block); on the wire a block is just an
@@ -184,6 +191,7 @@ interface AttributeJson {
   computed: boolean;
   forceNew: boolean;
   sensitive: boolean;
+  writeOnly: boolean;
 }
 
 /** One nested-block descriptor in the schema JSON. */
@@ -213,6 +221,7 @@ function attributesFromObject(node: JsonSchema): AttributeJson[] {
     computed: false,
     forceNew: false,
     sensitive: false,
+    writeOnly: false,
   }));
 }
 
@@ -253,6 +262,7 @@ function schemaJson(
   const computed = new Set<string>(dispositions.computed ?? []);
   const forceNew = new Set<string>(dispositions.forceNew ?? []);
   const sensitive = new Set<string>(dispositions.sensitive ?? []);
+  const writeOnly = new Set<string>(dispositions.writeOnly ?? []);
   const blockNames = new Set<string>(dispositions.blocks ?? []);
 
   const attributes: AttributeJson[] = [];
@@ -272,6 +282,7 @@ function schemaJson(
       computed: isComputed,
       forceNew: forceNew.has(name),
       sensitive: sensitive.has(name),
+      writeOnly: writeOnly.has(name),
     });
   }
   return JSON.stringify({ attributes, blocks });
@@ -518,6 +529,7 @@ export class Provider {
       computed: false,
       forceNew: false,
       sensitive: false,
+      writeOnly: false,
     }));
     attributes.push({
       name: "results",
@@ -527,6 +539,7 @@ export class Provider {
       computed: true,
       forceNew: false,
       sensitive: false,
+      writeOnly: false,
     });
 
     const read: RawHandler = async (err, input) => {

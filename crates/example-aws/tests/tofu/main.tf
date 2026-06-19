@@ -20,6 +20,20 @@ resource "aws_s3_bucket" "test" {
   name = var.bucket_name
 }
 
+# Write-only input: `secret` is supplied here but the provider must null it out
+# of state. `has_secret` is a computed witness that the handler still saw it.
+# Exercised by write_only.tftest.hcl.
+variable "locker_secret" {
+  type      = string
+  default   = "hunter2"
+  sensitive = true
+}
+
+resource "aws_locker" "test" {
+  name   = "vault"
+  secret = var.locker_secret
+}
+
 # Read-only lookups, exercised by data_source.tftest.hcl. Independent of the
 # managed bucket above (their own addresses), so they do not affect the resource
 # lifecycle assertions in the other test files.
