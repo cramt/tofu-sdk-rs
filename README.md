@@ -241,7 +241,7 @@ plus data sources, functions, nested blocks, a handler context, and lossless
 
 ### Not yet implemented
 
-Cross-type state move. There is no dedicated
+There is no dedicated
 semantic-equality / normalization hook for suppressing spurious diffs — though
 modeling structured data as structured types (sets as sets, nested blocks as
 blocks) plus `cty`'s native unordered-set semantics avoids most of the need.

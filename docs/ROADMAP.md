@@ -80,7 +80,8 @@ Rough priority order, each pointing at its tracked item:
    (`GetFunctions`/`CallFunction`, typed `Function` + `VariadicFunction` traits);
    ~~ephemeral resources~~ ✅ **DONE** (`Open`/`Renew`/`Close`, typed `Ephemeral`
    trait + `EphemeralFromResource` adapter, dynamic seam via `dyn_ephemeral`);
-   cross-type state move remains. → **3.2** + **Tier 4**.
+   ~~cross-type state move~~ ✅ **DONE** (`MoveResourceState`, typed
+   `Resource::move_state`). → **3.2** + **Tier 4**.
 
 ## How to verify (the four test layers)
 
@@ -302,9 +303,23 @@ via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`)
 - **Done when:** `StopProvider` no longer errors and in-flight handlers can
   observe cancellation.
 
-### 3.2 `MoveResourceState`
-- `moved {}` blocks and cross-resource-type state moves. In `unimplemented_unary!`.
-  Add a `Resource::move_state(from_type, from_state) -> Model` hook + dispatch.
+### 3.2 `MoveResourceState` — ✅ DONE
+- **Done:** `moved {}` cross-resource-type state moves. New defaulted
+  `Resource::move_state(ctx, source_type_name, source_state: Value) -> Model`
+  hook (typed); `source_state` is the source resource's raw stored state decoded
+  **untyped** (via `decode_json_value`, as `upgrade` does — the source schema may
+  be foreign), so a handler typically matches on `source_type_name` and maps the
+  dynamic value onto its target model. The default errors ("unsupported"). Erased
+  as a defaulted `DynResource::move_state` (Node binding unaffected);
+  `service.rs::move_resource_state` decodes the source `RawState` JSON, dispatches
+  through the `run` helper (so warnings/private/cancellation work), and encodes
+  the target model into `target_state` (echoing `source_private` unless the
+  handler rewrites it).
+- **Verified:** direct service tests (`move_resource_state_migrates_across_types`
+  maps a foreign `legacy_widget`'s `label` onto `widget.name`;
+  `move_resource_state_unsupported_yields_diagnostic` checks the default errors).
+  Engine-level (`tofu test` with a real `moved {}`) is deferred — it needs a
+  two-type multi-step state scenario better suited to the TS harness.
 
 ### 3.3 Number precision — ✅ DONE
 - **Done:** `Value::Number` now holds `enum Number { I64, U64, F64 }`

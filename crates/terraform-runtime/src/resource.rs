@@ -372,6 +372,24 @@ pub trait Resource: Send + Sync + 'static {
     ) -> Result<PlanModifications, ResourceError> {
         Ok(PlanModifications::default())
     }
+
+    /// Migrate state from a *different* resource type into this one — the
+    /// provider side of a `moved {}` block that crosses resource types.
+    /// `source_type_name` names the source resource and `source_state` is its raw
+    /// stored state as an untyped dynamic [`Value`] (the source schema may be
+    /// foreign, so it is not decoded into a model). Return the migrated target
+    /// model. Defaults to an error (cross-type moves unsupported); implement it to
+    /// opt in, typically matching on `source_type_name`.
+    async fn move_state(
+        &self,
+        _ctx: &mut Ctx,
+        _source_type_name: String,
+        _source_state: Value,
+    ) -> Result<Self::Model, ResourceError> {
+        Err(ResourceError::new(
+            "this resource does not support moving state from another resource type",
+        ))
+    }
 }
 
 /// Object-safe, value-oriented form of [`Resource`] that the service dispatches
@@ -396,6 +414,21 @@ pub trait DynResource: Send + Sync {
         _proposed: Value,
     ) -> Result<PlanModifications, Diagnostics> {
         Ok(PlanModifications::default())
+    }
+
+    /// Migrate state from another resource type (a cross-type `moved {}`).
+    /// `source_state` is the untyped source state; returns the target state.
+    /// Defaults to an "unsupported" error, so dynamic-seam implementors (e.g. the
+    /// Node binding) need not implement it.
+    async fn move_state(
+        &self,
+        _source_type_name: String,
+        _source_state: Value,
+    ) -> Result<Value, Diagnostics> {
+        Err(vec![Diag::error(
+            "unsupported state move",
+            "this resource does not support moving state from another resource type",
+        )])
     }
 }
 
@@ -517,5 +550,19 @@ impl<R: Resource> DynResource for ResourceAdapter<R> {
             .modify_plan(&mut ctx, prior_model, proposed_model)
             .await
             .map_err(Diagnostics::from)
+    }
+
+    async fn move_state(
+        &self,
+        source_type_name: String,
+        source_state: Value,
+    ) -> Result<Value, Diagnostics> {
+        let mut ctx = current_ctx();
+        let result = self
+            .inner
+            .move_state(&mut ctx, source_type_name, source_state)
+            .await
+            .map_err(Diagnostics::from)?;
+        to_value(&result).map_err(|e| codec_diag("encode moved state", e))
     }
 }

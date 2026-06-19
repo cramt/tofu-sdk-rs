@@ -914,10 +914,91 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         }
     }
 
+    async fn move_resource_state(
+        &self,
+        request: Request<tfplugin6::move_resource_state::Request>,
+    ) -> Result<Response<tfplugin6::move_resource_state::Response>, Status> {
+        use tfplugin6::move_resource_state::Response as Resp;
+        let req = request.into_inner();
+        tracing::debug!(
+            source = %req.source_type_name,
+            target = %req.target_type_name,
+            "MoveResourceState"
+        );
+
+        let (Some(ty), Some(handler)) = (
+            self.provider.resource_cty(&req.target_type_name),
+            self.provider.resource_handler(&req.target_type_name),
+        ) else {
+            return Ok(Response::new(Resp {
+                diagnostics: unknown_resource(&req.target_type_name),
+                ..Default::default()
+            }));
+        };
+
+        // The source state is the *source* resource's raw stored state as cty
+        // JSON; its schema may be foreign, so decode it untyped (as upgrade does).
+        let raw = match req.source_state.as_ref() {
+            Some(raw) if !raw.json.is_empty() => raw.json.as_slice(),
+            _ => {
+                return Ok(Response::new(Resp {
+                    diagnostics: error_diag(
+                        "missing source state",
+                        "MoveResourceState requires JSON source state",
+                    ),
+                    ..Default::default()
+                }))
+            }
+        };
+        let json: facet_value::Value = match facet_json::from_slice(raw) {
+            Ok(j) => j,
+            Err(e) => {
+                return Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to parse source state", e.to_string()),
+                    ..Default::default()
+                }))
+            }
+        };
+        let source_state = match decode_json_value(&json) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to read source state", e.to_string()),
+                    ..Default::default()
+                }))
+            }
+        };
+
+        let (outcome, outs) = self
+            .run(
+                "move resource state",
+                req.source_private.clone(),
+                handler.move_state(req.source_type_name.clone(), source_state),
+            )
+            .await;
+        match outcome {
+            Ok(target) => match encode_dynamic(&target, &ty) {
+                Ok(dv) => Ok(Response::new(Resp {
+                    target_state: Some(dv),
+                    target_private: outs.private_out.unwrap_or(req.source_private),
+                    diagnostics: pb_diagnostics(outs.warnings),
+                    ..Default::default()
+                })),
+                Err(e) => Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to encode moved state", e.to_string()),
+                    ..Default::default()
+                })),
+            },
+            Err(diags) => Ok(Response::new(Resp {
+                diagnostics: diags_with_warnings(diags, outs),
+                ..Default::default()
+            })),
+        }
+    }
+
     unimplemented_unary! {
         get_resource_identity_schemas => get_resource_identity_schemas,
         upgrade_resource_identity => upgrade_resource_identity,
-        move_resource_state => move_resource_state,
         generate_resource_config => generate_resource_config,
         validate_list_resource_config => validate_list_resource_config,
         validate_state_store_config => validate_state_store,

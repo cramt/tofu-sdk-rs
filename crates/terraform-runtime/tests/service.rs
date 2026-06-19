@@ -165,13 +165,13 @@ async fn get_metadata_lists_type_names() {
 #[tokio::test]
 async fn unimplemented_rpc_returns_unimplemented() {
     let svc = service();
-    // Move is not implemented yet.
+    // Resource identity is not implemented yet (a still-stubbed RPC).
     let status = svc
-        .move_resource_state(Request::new(
-            tfplugin6::move_resource_state::Request::default(),
+        .get_resource_identity_schemas(Request::new(
+            tfplugin6::get_resource_identity_schemas::Request::default(),
         ))
         .await
-        .expect_err("move_resource_state is not implemented yet");
+        .expect_err("get_resource_identity_schemas is not implemented yet");
     assert_eq!(status.code(), Code::Unimplemented);
 }
 
@@ -2227,4 +2227,121 @@ async fn ephemeral_from_resource_runs_create_on_open_and_delete_on_close() {
             "delete rule-10.0.0.0/8".to_string()
         ]
     );
+}
+
+/// A resource that accepts cross-type state moves from `legacy_widget`, mapping
+/// the source's untyped `label` onto its own `name`. Proves the
+/// `MoveResourceState` RPC decodes foreign source state and runs `move_state`.
+#[derive(Facet)]
+#[facet(terraform::resource("widget"))]
+#[allow(dead_code)]
+struct Widget {
+    name: String,
+}
+
+struct WidgetResource;
+
+#[async_trait]
+impl Resource for WidgetResource {
+    type Model = Widget;
+
+    async fn create(&self, _ctx: &mut Ctx, planned: Widget) -> Result<Widget, ResourceError> {
+        Ok(planned)
+    }
+
+    async fn move_state(
+        &self,
+        _ctx: &mut Ctx,
+        source_type_name: String,
+        source_state: terraform_value::Value,
+    ) -> Result<Widget, ResourceError> {
+        if source_type_name != "legacy_widget" {
+            return Err(ResourceError::new(format!(
+                "cannot move from `{source_type_name}`"
+            )));
+        }
+        // The source state is untyped (its schema is foreign): pull `label` out.
+        let terraform_value::Value::Object(fields) = &source_state else {
+            return Err(ResourceError::new("source state is not an object"));
+        };
+        let Some(terraform_value::Value::String(label)) = fields.get("label") else {
+            return Err(ResourceError::new("source state is missing `label`"));
+        };
+        Ok(Widget {
+            name: label.clone(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn move_resource_state_migrates_across_types() {
+    let svc = Provider::builder()
+        .resource(WidgetResource)
+        .build()
+        .map(ProviderService::new)
+        .expect("provider builds");
+
+    let ty = terraform_value::Type::Object(vec![terraform_value::ObjectAttr {
+        name: "name".into(),
+        ty: terraform_value::Type::String,
+        optional: false,
+    }]);
+
+    let resp = svc
+        .move_resource_state(Request::new(tfplugin6::move_resource_state::Request {
+            source_type_name: "legacy_widget".into(),
+            target_type_name: "widget".into(),
+            source_state: Some(tfplugin6::RawState {
+                json: br#"{"label":"hello"}"#.to_vec(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("move")
+        .into_inner();
+
+    assert!(resp.diagnostics.is_empty(), "{:?}", resp.diagnostics);
+    let target = resp.target_state.expect("target state");
+    let target = terraform_codec::decode_msgpack(&target.msgpack, &ty).expect("decode target");
+    let terraform_value::Value::Object(fields) = target else {
+        panic!("target should be an object");
+    };
+    assert_eq!(
+        fields["name"],
+        terraform_value::Value::String("hello".into()),
+        "the source `label` should migrate into the target `name`"
+    );
+}
+
+#[tokio::test]
+async fn move_resource_state_unsupported_yields_diagnostic() {
+    // `WoResource` does not implement `move_state`, so the defaulted hook errors.
+    let svc = Provider::builder()
+        .resource(WoResource {
+            seen: Arc::new(std::sync::Mutex::new(None)),
+        })
+        .build()
+        .map(ProviderService::new)
+        .expect("provider builds");
+
+    let resp = svc
+        .move_resource_state(Request::new(tfplugin6::move_resource_state::Request {
+            source_type_name: "legacy".into(),
+            target_type_name: "wo_secret".into(),
+            source_state: Some(tfplugin6::RawState {
+                json: br#"{"name":"a"}"#.to_vec(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("move")
+        .into_inner();
+
+    assert!(
+        !resp.diagnostics.is_empty(),
+        "an unsupported move must surface a diagnostic"
+    );
+    assert!(resp.target_state.is_none());
 }

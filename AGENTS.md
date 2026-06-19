@@ -211,6 +211,12 @@ it; keep it static. The preset is exposed via the package.json `exports` subpath
   signature still passes `Value`s, so it stays a defaulted seam method — the Node
   binding and other seam implementors need no change. (Read the known/unknown/null
   distinction inside `modify_plan` by typing the field `TfValue<T>`.)
+- **`Resource::move_state`** backs `MoveResourceState` (cross-type `moved {}`). The
+  `source_state` is the *source* resource's raw stored state decoded **untyped**
+  (`decode_json_value`, like `upgrade`) — its schema may be foreign — so the
+  handler matches on `source_type_name` and maps the dynamic value onto its model.
+  Defaulted to an "unsupported" error; defaulted `DynResource::move_state` keeps
+  the Node binding unaffected.
 - **Numbers are `Value::Number(Number)` where `Number` is `I64 | U64 | F64`**
   (`terraform-value`). The full signed+unsigned 64-bit integer range round-trips
   losslessly through msgpack and cty JSON; only truly arbitrary precision (beyond
