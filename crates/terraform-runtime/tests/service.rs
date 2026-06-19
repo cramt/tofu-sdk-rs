@@ -165,13 +165,11 @@ async fn get_metadata_lists_type_names() {
 #[tokio::test]
 async fn unimplemented_rpc_returns_unimplemented() {
     let svc = service();
-    // Resource identity is not implemented yet (a still-stubbed RPC).
+    // Actions are not implemented yet (a still-stubbed RPC).
     let status = svc
-        .get_resource_identity_schemas(Request::new(
-            tfplugin6::get_resource_identity_schemas::Request::default(),
-        ))
+        .plan_action(Request::new(tfplugin6::plan_action::Request::default()))
         .await
-        .expect_err("get_resource_identity_schemas is not implemented yet");
+        .expect_err("plan_action is not implemented yet");
     assert_eq!(status.code(), Code::Unimplemented);
 }
 
@@ -2367,10 +2365,132 @@ impl Resource for IdentWidgetResource {
     async fn create(
         &self,
         _ctx: &mut Ctx,
-        planned: IdentWidget,
+        mut planned: IdentWidget,
     ) -> Result<IdentWidget, ResourceError> {
+        // Fill the computed identity key.
+        planned.id = format!("widget-{}", planned.name);
         Ok(planned)
     }
+}
+
+/// The `cty` object type of `IdentWidget` (`{ name, id }`).
+fn ident_widget_ty() -> terraform_value::Type {
+    terraform_value::Type::Object(vec![
+        terraform_value::ObjectAttr {
+            name: "name".into(),
+            ty: terraform_value::Type::String,
+            optional: false,
+        },
+        terraform_value::ObjectAttr {
+            name: "id".into(),
+            ty: terraform_value::Type::String,
+            optional: false,
+        },
+    ])
+}
+
+/// Decode the `id` out of a `ResourceIdentityData` (identity is `{ id }`).
+fn identity_id(data: &tfplugin6::ResourceIdentityData) -> String {
+    let identity_ty = terraform_value::Type::Object(vec![terraform_value::ObjectAttr {
+        name: "id".into(),
+        ty: terraform_value::Type::String,
+        optional: false,
+    }]);
+    let dv = data.identity_data.as_ref().expect("identity_data present");
+    let value =
+        terraform_codec::decode_msgpack(&dv.msgpack, &identity_ty).expect("decode identity");
+    let terraform_value::Value::Object(fields) = value else {
+        panic!("identity should be an object");
+    };
+    match &fields["id"] {
+        terraform_value::Value::String(s) => s.clone(),
+        other => panic!("id should be a string, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn apply_returns_resource_identity() {
+    let svc = Provider::builder()
+        .resource(IdentWidgetResource)
+        .build()
+        .map(ProviderService::new)
+        .expect("provider builds");
+    let ty = ident_widget_ty();
+
+    let state = |name: &str, id: terraform_value::Value| {
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(
+            "name".to_string(),
+            terraform_value::Value::String(name.into()),
+        );
+        obj.insert("id".to_string(), id);
+        tfplugin6::DynamicValue {
+            msgpack: terraform_codec::encode_msgpack(&terraform_value::Value::Object(obj), &ty)
+                .unwrap(),
+            json: vec![],
+        }
+    };
+
+    let resp = svc
+        .apply_resource_change(Request::new(tfplugin6::apply_resource_change::Request {
+            type_name: "ident_widget".into(),
+            prior_state: None,
+            planned_state: Some(state("a", terraform_value::Value::Unknown)),
+            config: Some(state("a", terraform_value::Value::Unknown)),
+            ..Default::default()
+        }))
+        .await
+        .expect("apply")
+        .into_inner();
+    assert!(resp.diagnostics.is_empty(), "{:?}", resp.diagnostics);
+
+    let identity = resp
+        .new_identity
+        .expect("apply returns the resource identity");
+    assert_eq!(
+        identity_id(&identity),
+        "widget-a",
+        "the computed identity key should be returned after apply"
+    );
+}
+
+#[tokio::test]
+async fn plan_omits_identity_while_key_is_unknown() {
+    let svc = Provider::builder()
+        .resource(IdentWidgetResource)
+        .build()
+        .map(ProviderService::new)
+        .expect("provider builds");
+    let ty = ident_widget_ty();
+
+    let proposed = {
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert(
+            "name".to_string(),
+            terraform_value::Value::String("a".into()),
+        );
+        obj.insert("id".to_string(), terraform_value::Value::Null);
+        tfplugin6::DynamicValue {
+            msgpack: terraform_codec::encode_msgpack(&terraform_value::Value::Object(obj), &ty)
+                .unwrap(),
+            json: vec![],
+        }
+    };
+
+    let resp = svc
+        .plan_resource_change(Request::new(tfplugin6::plan_resource_change::Request {
+            type_name: "ident_widget".into(),
+            prior_state: None,
+            proposed_new_state: Some(proposed),
+            ..Default::default()
+        }))
+        .await
+        .expect("plan")
+        .into_inner();
+    assert!(
+        resp.planned_identity.is_none(),
+        "planned identity is omitted while the computed key is still unknown"
+    );
 }
 
 #[tokio::test]

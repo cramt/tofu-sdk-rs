@@ -471,6 +471,18 @@ All are stubbed in `service.rs` (`unimplemented_unary!` or streaming stubs).
   private round-trip, the wrapper) and the schema contract test. Example:
   `example-aws`'s `aws_session_token`.
 - **List resources** (`ListResource`, streaming).
-- **Resource identity** (`GetResourceIdentitySchemas`/`UpgradeResourceIdentity`).
+- ~~**Resource identity**~~ ✅ **DONE** (`GetResourceIdentitySchemas` /
+  `UpgradeResourceIdentity`). Type-driven: a model marks identity fields with
+  `#[facet(terraform::identity)]` and `reflect_resource` projects them into an
+  `IdentitySchema` (IR) → `emit_identity_schemas` (tfplugin6). The runtime returns
+  the identity (`known_identity_data`, omitted while any key is unknown — e.g.
+  plan-on-create) on `plan` (`planned_identity`), `apply`/`read` (`new_identity`),
+  and `import` (`ImportedResource.identity`); `UpgradeResourceIdentity` is a
+  decode→re-encode passthrough (identity stays version 0, no author migration
+  hook). Opt-in; resources without identity-marked fields are unaffected.
+  Verified by reflect unit tests, direct service tests (schema, apply identity,
+  plan-omits-while-unknown), and the real `tofu test` suite (`aws_locker` now
+  declares `name` as its identity and applies/destroys cleanly, so OpenTofu
+  validates the planned/new identity consistency).
 - **State store** (`ReadStateBytes`/`WriteStateBytes`/`Lock`/`Unlock`/…, streaming).
 - **Actions** (`PlanAction`/`InvokeAction`/`ValidateActionConfig`).

@@ -321,6 +321,15 @@ impl Provider {
             .map(|r| r.version)
     }
 
+    /// The identity schema of resource `name`, if it declares one.
+    pub(crate) fn resource_identity(&self, name: &str) -> Option<&terraform_ir::IdentitySchema> {
+        self.schema
+            .resources
+            .iter()
+            .find(|r| r.name == name)
+            .and_then(|r| r.identity.as_ref())
+    }
+
     /// The `cty` object type of data source `name`, derived from its schema block.
     pub(crate) fn data_source_cty(&self, name: &str) -> Option<Type> {
         self.schema

@@ -129,7 +129,11 @@ impl Resource for BucketResource {
 #[facet(terraform::resource("aws_locker"))]
 #[allow(dead_code)]
 struct Locker {
+    // The name is also the resource's stable identity (used for import-by-identity
+    // and identity tracking). It is known from config, so the identity is stable
+    // across plan and apply.
     #[facet(terraform::force_new)]
+    #[facet(terraform::identity)]
     name: String,
 
     /// The secret to store. Write-only: it reaches the handler through the

@@ -211,6 +211,15 @@ it; keep it static. The preset is exposed via the package.json `exports` subpath
   signature still passes `Value`s, so it stays a defaulted seam method — the Node
   binding and other seam implementors need no change. (Read the known/unknown/null
   distinction inside `modify_plan` by typing the field `TfValue<T>`.)
+- **Resource identity** is a type-driven projection: `#[facet(terraform::identity)]`
+  on a field (it keeps its normal disposition) adds it to the resource's
+  `IdentitySchema` (`reflect_resource` → `emit_identity_schemas`). The runtime
+  returns identity data via `known_identity_data` on plan/apply/read/import, but
+  **only when every identity key is known** — an unknown computed key (e.g.
+  plan-on-create) omits the identity, just like a computed attribute. Opt-in (no
+  marker → no identity → unaffected). `UpgradeResourceIdentity` is a passthrough
+  (identity stays version 0). Identity is reflection-only; `dyn_resource` carries
+  `identity: None`.
 - **`Resource::move_state`** backs `MoveResourceState` (cross-type `moved {}`). The
   `source_state` is the *source* resource's raw stored state decoded **untyped**
   (`decode_json_value`, like `upgrade`) — its schema may be foreign — so the

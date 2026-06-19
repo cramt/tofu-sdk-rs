@@ -467,12 +467,18 @@ impl tfplugin6::provider_server::Provider for ProviderService {
             }
         }
 
+        let planned_identity = self
+            .provider
+            .resource_identity(&req.type_name)
+            .and_then(|identity| known_identity_data(&plan.planned, identity));
+
         match encode_dynamic(&plan.planned, &ty) {
             Ok(dv) => Ok(Response::new(Resp {
                 planned_state: Some(dv),
                 requires_replace: plan.requires_replace,
                 planned_private,
                 diagnostics: pb_diagnostics(warnings),
+                planned_identity,
                 ..Default::default()
             })),
             Err(e) => {
@@ -531,6 +537,10 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         // Write-only inputs are never persisted: keep them null in refreshed
         // state even if a handler re-populated them.
         crate::write_only::strip(&mut new_value, block);
+        let new_identity = self
+            .provider
+            .resource_identity(&req.type_name)
+            .and_then(|identity| known_identity_data(&new_value, identity));
 
         respond_state(
             &new_value,
@@ -541,6 +551,7 @@ impl tfplugin6::provider_server::Provider for ProviderService {
                 new_state,
                 private,
                 diagnostics,
+                new_identity,
                 ..Default::default()
             },
         )
@@ -627,6 +638,10 @@ impl tfplugin6::provider_server::Provider for ProviderService {
             Ok(mut new_value) => {
                 // Never persist write-only inputs to state.
                 crate::write_only::strip(&mut new_value, block);
+                let new_identity = self
+                    .provider
+                    .resource_identity(&req.type_name)
+                    .and_then(|identity| known_identity_data(&new_value, identity));
                 respond_state(
                     &new_value,
                     &ty,
@@ -636,6 +651,7 @@ impl tfplugin6::provider_server::Provider for ProviderService {
                         new_state,
                         private,
                         diagnostics,
+                        new_identity,
                         ..Default::default()
                     },
                 )
@@ -890,15 +906,22 @@ impl tfplugin6::provider_server::Provider for ProviderService {
             .await;
         match outcome {
             Ok(state) => match encode_dynamic(&state, &ty) {
-                Ok(dv) => Ok(Response::new(Resp {
-                    imported_resources: vec![ImportedResource {
-                        type_name: req.type_name,
-                        state: Some(dv),
+                Ok(dv) => {
+                    let identity = self
+                        .provider
+                        .resource_identity(&req.type_name)
+                        .and_then(|identity| known_identity_data(&state, identity));
+                    Ok(Response::new(Resp {
+                        imported_resources: vec![ImportedResource {
+                            type_name: req.type_name,
+                            state: Some(dv),
+                            identity,
+                            ..Default::default()
+                        }],
+                        diagnostics: pb_diagnostics(outs.warnings),
                         ..Default::default()
-                    }],
-                    diagnostics: pb_diagnostics(outs.warnings),
-                    ..Default::default()
-                })),
+                    }))
+                }
                 Err(e) => {
                     let mut diagnostics = pb_diagnostics(outs.warnings);
                     diagnostics
@@ -1006,8 +1029,72 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         Ok(Response::new(emit_identity_schemas(self.provider.schema())))
     }
 
+    async fn upgrade_resource_identity(
+        &self,
+        request: Request<tfplugin6::upgrade_resource_identity::Request>,
+    ) -> Result<Response<tfplugin6::upgrade_resource_identity::Response>, Status> {
+        use tfplugin6::upgrade_resource_identity::Response as Resp;
+        let req = request.into_inner();
+        tracing::debug!(type_name = %req.type_name, "UpgradeResourceIdentity");
+
+        let Some(identity) = self.provider.resource_identity(&req.type_name) else {
+            return Ok(Response::new(Resp {
+                diagnostics: unknown_resource(&req.type_name),
+                ..Default::default()
+            }));
+        };
+
+        // Stored identity arrives as raw JSON. There is no author migration hook
+        // (identity stays at version 0), so this is a passthrough: decode the
+        // stored identity untyped and re-encode it under the current identity
+        // type.
+        let raw = match req.raw_identity.as_ref() {
+            Some(raw) if !raw.json.is_empty() => raw.json.as_slice(),
+            _ => {
+                return Ok(Response::new(Resp {
+                    diagnostics: error_diag(
+                        "missing identity",
+                        "UpgradeResourceIdentity requires JSON identity",
+                    ),
+                    ..Default::default()
+                }))
+            }
+        };
+        let json: facet_value::Value = match facet_json::from_slice(raw) {
+            Ok(j) => j,
+            Err(e) => {
+                return Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to parse stored identity", e.to_string()),
+                    ..Default::default()
+                }))
+            }
+        };
+        let value = match decode_json_value(&json) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to read stored identity", e.to_string()),
+                    ..Default::default()
+                }))
+            }
+        };
+
+        match known_identity_data(&value, identity) {
+            Some(data) => Ok(Response::new(Resp {
+                upgraded_identity: Some(data),
+                diagnostics: Vec::new(),
+            })),
+            None => Ok(Response::new(Resp {
+                diagnostics: error_diag(
+                    "invalid stored identity",
+                    "the stored identity is missing one or more attributes",
+                ),
+                ..Default::default()
+            })),
+        }
+    }
+
     unimplemented_unary! {
-        upgrade_resource_identity => upgrade_resource_identity,
         generate_resource_config => generate_resource_config,
         validate_list_resource_config => validate_list_resource_config,
         validate_state_store_config => validate_state_store,
@@ -1242,6 +1329,38 @@ fn respond_state<R>(
             Ok(Response::new(build(None, private, diagnostics)))
         }
     }
+}
+
+/// Project a resource's identity out of its state, encoded as
+/// [`ResourceIdentityData`](tfplugin6::ResourceIdentityData). Returns `None`
+/// unless **every** identity attribute is present and fully known — an unknown or
+/// null identity value (e.g. a computed key during plan-on-create) is left
+/// unset, mirroring how computed attributes are omitted until apply.
+fn known_identity_data(
+    state: &Value,
+    identity: &terraform_ir::IdentitySchema,
+) -> Option<tfplugin6::ResourceIdentityData> {
+    let Value::Object(fields) = state else {
+        return None;
+    };
+    let mut data = std::collections::BTreeMap::new();
+    let mut attrs = Vec::new();
+    for attr in &identity.attributes {
+        let value = fields.get(&attr.name)?;
+        if value.is_unknown() || value.is_null() {
+            return None;
+        }
+        data.insert(attr.name.clone(), value.clone());
+        attrs.push(terraform_value::ObjectAttr {
+            name: attr.name.clone(),
+            ty: attr.ty.clone(),
+            optional: false,
+        });
+    }
+    let dv = encode_dynamic(&Value::Object(data), &Type::Object(attrs)).ok()?;
+    Some(tfplugin6::ResourceIdentityData {
+        identity_data: Some(dv),
+    })
 }
 
 /// Merge handler error diagnostics with the context's success-path warnings into
