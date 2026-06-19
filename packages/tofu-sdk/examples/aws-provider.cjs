@@ -84,6 +84,29 @@ new Provider()
       });
     },
   })
+  // An ephemeral resource: a short-lived session token, never written to state.
+  // `open` mints it and stashes the role as the private handle so `renew`/`close`
+  // (which receive only that handle) can act on it; `renewAt` asks the engine to
+  // renew before the pretend TTL.
+  .ephemeral("aws_session_token", {
+    schema: z.object({ role: z.string(), token: z.string() }),
+    computed: ["token"],
+    sensitive: ["token"],
+    async open(config) {
+      return {
+        result: { role: config.role, token: `tok-${config.role}-${region}` },
+        private: config.role,
+        renewAt: Date.now() + 5 * 60 * 1000,
+      };
+    },
+    async renew(role) {
+      // The handle is the role we stashed; re-arm the renewal window.
+      return { renewAt: Date.now() + 5 * 60 * 1000, private: role };
+    },
+    async close(_role) {
+      // A real provider would revoke the token here.
+    },
+  })
   .serve()
   .catch((err) => {
     console.error("provider failed:", err);

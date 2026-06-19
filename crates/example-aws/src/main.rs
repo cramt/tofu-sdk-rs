@@ -11,20 +11,26 @@
 //! (the *meta*) handed to every handler, which stamps the region onto every
 //! bucket it creates.
 //!
-//! Finally it demonstrates **data sources projected from the same model**: the
-//! `Bucket` struct carries both `terraform::resource` and `terraform::data_source`
+//! It demonstrates **data sources projected from the same model**: the `Bucket`
+//! struct carries both `terraform::resource` and `terraform::data_source`
 //! markers, and its `search_key` fields drive two read-only lookups — a singular
 //! `data "aws_s3_bucket"` keyed by the unique `arn` (one object) and a plural
 //! `data "aws_s3_buckets"` keyed by the generic `name` (a `results` list).
+//!
+//! Finally it demonstrates an **ephemeral resource** `aws_session_token`: a
+//! short-lived credential minted for the duration of a run and never written to
+//! state, exercising the full `Open`/`Renew`/`Close` lifecycle.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use facet::Facet;
 use terraform_provider::terraform;
 use terraform_runtime::{
-    async_trait, serve, Ctx, DataSource, DataSourceError, DataSourceList, Function, FunctionError,
-    Provider, Resource, ResourceError, VariadicFunction,
+    async_trait, serve, Ctx, DataSource, DataSourceError, DataSourceList, Ephemeral,
+    EphemeralError, Function, FunctionError, Provider, Resource, ResourceError, VariadicFunction,
 };
 
 /// Provider-level configuration.
@@ -222,6 +228,68 @@ impl VariadicFunction for Join {
     }
 }
 
+/// An **ephemeral resource** `aws_session_token`: a short-lived credential minted
+/// for the duration of a single Terraform run and *never written to state*.
+///
+/// It demonstrates the full `Open` → `Renew` → `Close` lifecycle: `open` mints a
+/// token and asks Terraform to renew before its TTL, `renew` re-arms the window,
+/// and `close` revokes it. The role is stashed in private state on `open` because
+/// `renew`/`close` receive only those bytes — not the config or the result.
+#[derive(Facet)]
+#[facet(terraform::ephemeral("aws_session_token"))]
+#[allow(dead_code)]
+struct SessionToken {
+    /// The role to mint a session token for. A required config input.
+    role: String,
+
+    /// The minted, short-lived token. Computed by `open`, never persisted to
+    /// state, and marked sensitive so it is redacted in logs.
+    #[facet(terraform::computed)]
+    #[facet(terraform::sensitive)]
+    token: String,
+}
+
+/// The handler for the `aws_session_token` ephemeral resource, holding the
+/// configured client (so the minted token reflects the provider's region).
+struct SessionTokenEphemeral {
+    client: Arc<AwsClient>,
+}
+
+/// Pretend lease TTL; we ask Terraform to renew at half of it.
+const TOKEN_TTL: Duration = Duration::from_secs(10 * 60);
+
+#[async_trait]
+impl Ephemeral for SessionTokenEphemeral {
+    type Model = SessionToken;
+
+    async fn open(
+        &self,
+        ctx: &mut Ctx,
+        mut config: SessionToken,
+    ) -> Result<SessionToken, EphemeralError> {
+        // A real provider would call STS; synthesize a token to stay
+        // deterministic and self-contained.
+        config.token = format!("tok-{}-{}", config.role, self.client.region);
+        // `close`/`renew` get only the private bytes — stash what they need.
+        ctx.set_private(config.role.clone().into_bytes());
+        ctx.renew_after(TOKEN_TTL / 2);
+        Ok(config)
+    }
+
+    async fn renew(&self, ctx: &mut Ctx) -> Result<(), EphemeralError> {
+        // The handle is the role stashed on open; re-arm the renewal window.
+        let _role = String::from_utf8_lossy(ctx.private());
+        ctx.renew_after(TOKEN_TTL / 2);
+        Ok(())
+    }
+
+    async fn close(&self, ctx: &mut Ctx) -> Result<(), EphemeralError> {
+        // Revoke the token for the stashed role (a no-op in this example).
+        let _role = String::from_utf8_lossy(ctx.private());
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let provider = Provider::builder()
@@ -234,6 +302,7 @@ async fn main() {
         .resource_with(|client: Arc<AwsClient>| BucketResource { client })
         .data_source_with(|client: Arc<AwsClient>| BucketByArn { client })
         .data_source_list_with(|client: Arc<AwsClient>| BucketsByName { client })
+        .ephemeral_with(|client: Arc<AwsClient>| SessionTokenEphemeral { client })
         .function("arn_for", ArnFor)
         .function_variadic("join", Join)
         .build()

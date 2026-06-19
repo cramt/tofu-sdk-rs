@@ -78,13 +78,17 @@ sees a facet-derived user type — `plan.rs` and `service.rs` operate purely on 
 + `Value`.
 
 `ProviderBuilder` exposes that seam directly: `dyn_resource` / `dyn_data_source`
-(hand-built `Block` + erased handler) and `dyn_provider_config` / `dyn_configure`.
-The **Node binding** (`packages/tofu-sdk/native`) is built entirely on it — it
-builds the IR from a JS schema description and implements the erased traits by
-calling async JS handlers over `ThreadsafeFunction<String, Promise<String>>`,
-marshalling `Value` ⇄ JSON through facet (never hand-rolled). All schema shaping
-(singular/plural data sources, search keys) stays in JS; Rust stays
-schema-agnostic. Build/test it with `pnpm build` / `pnpm test` inside the dev
+/ `dyn_ephemeral` (hand-built `Block` + erased handler) and `dyn_provider_config`
+/ `dyn_configure`. The **Node binding** (`packages/tofu-sdk/native`) is built
+entirely on it — it builds the IR from a JS schema description and implements the
+erased traits (incl. `DynEphemeral`) by calling async JS handlers over
+`ThreadsafeFunction<String, Promise<String>>`, marshalling `Value` ⇄ JSON through
+facet (never hand-rolled). All schema shaping (singular/plural data sources,
+search keys) stays in JS; Rust stays schema-agnostic. The ephemeral seam is the
+one place the binding reaches the ambient `Ctx` (via the public `current_ctx()`):
+`open` returns `{ result, private?, renewAt? }` and the addon writes private/
+renewAt onto the ctx (the service reads them back), while `renew`/`close` receive
+the private handle string. Build/test it with `pnpm build` / `pnpm test` inside the dev
 shell (it shells out to `cargo`, which needs `PROTOC`); `pnpm test` drives a real
 `tofu` through `examples/aws-provider.cjs`.
 
@@ -282,6 +286,34 @@ Both shapes erase to `DynDataSource` (`data_source.rs`) and dispatch on
 namespace per provider — `resource "aws_s3_bucket"` and `data "aws_s3_bucket"`
 coexist (separate maps in the IR `ProviderSchema`); a plural data source
 conventionally takes the plural name (`aws_s3_buckets`).
+
+**Ephemeral resources** (`ephemeral.rs`) are a *separate* primitive, not a
+managed resource with a flag — they have their own IR (`EphemeralSchema`,
+`ProviderSchema.ephemeral_resources`), their own schema slot
+(`ephemeral_resource_schemas` + `GetMetadata.ephemeral_resources`), and their own
+RPCs (`Open`/`Renew`/`Close`/`ValidateEphemeralResourceConfig`, all wired in
+`service.rs`). An author implements the typed `Ephemeral` trait
+(`open`/`renew`/`close`/`validate`) over a `#[facet(terraform::ephemeral("name"))]`
+model — `reflect_ephemeral` projects it like a resource block (plain fields are
+config inputs, `computed` fields the result `open` fills; there's no version, no
+drift, no search keys). Registered with `ProviderBuilder::ephemeral` /
+`ephemeral_with` / `dyn_ephemeral` (mirroring resources/data sources, incl. the
+meta-backed factory + dynamic seam). Gotchas worth knowing before touching this:
+- **`open` runs during plan *and* apply**, so it must be plan-safe; that's
+  exactly why it can't be auto-derived from a managed resource's create (which
+  never runs at plan time). It's the ephemeral analog of a data-source read.
+- **`Renew`/`Close` receive only the private bytes** (`type_name` + `private`) —
+  no config, no result. Whatever they need is stashed via `Ctx::set_private` in
+  `open`. The existing `Ctx` private plumbing carries it; `renew` echoes the
+  incoming private back if it doesn't rewrite it (see `service.rs`).
+- **`renew_at`** (a `google.protobuf.Timestamp`) is set by `open`/`renew` via
+  `Ctx::set_renew_at`/`renew_after`; it rides on `CtxOutputs.renew_at` and is
+  converted in `service.rs::to_timestamp` (needs `prost-types`).
+- **`EphemeralFromResource<R>`** is the opt-in auto-derive: it `impl`s `Ephemeral`
+  for any `Resource` (Open = create, Close = delete), serializing the created
+  model into private state (via `facet_json`) so `close` can reconstruct it for
+  `delete`. No renew; the created object leaks on interrupt — for cheap,
+  reversible resources only.
 
 ## Testing approach
 

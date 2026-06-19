@@ -26,11 +26,13 @@ use std::sync::Arc;
 
 use facet::Facet;
 use terraform_codec::from_value;
-use terraform_ir::{Block, DataSourceSchema, FunctionSignature, ProviderSchema, ResourceSchema};
+use terraform_ir::{
+    Block, DataSourceSchema, EphemeralSchema, FunctionSignature, ProviderSchema, ResourceSchema,
+};
 use terraform_reflect::{
-    data_source_list_name, data_source_name, reflect_block, reflect_data_source,
-    reflect_data_source_list, reflect_function, reflect_resource, reflect_variadic_function,
-    resource_name, PluralDataSource, ReflectError,
+    data_source_list_name, data_source_name, ephemeral_name, reflect_block, reflect_data_source,
+    reflect_data_source_list, reflect_ephemeral, reflect_function, reflect_resource,
+    reflect_variadic_function, resource_name, PluralDataSource, ReflectError,
 };
 use terraform_value::{Type, Value};
 use tokio::sync::OnceCell;
@@ -40,6 +42,7 @@ use async_trait::async_trait;
 use crate::data_source::{
     DataSource, DataSourceAdapter, DataSourceList, DataSourceListAdapter, DynDataSource,
 };
+use crate::ephemeral::{DynEphemeral, Ephemeral, EphemeralAdapter};
 use crate::function::{
     DynFunction, Function, FunctionAdapter, VariadicFunction, VariadicFunctionAdapter,
 };
@@ -165,6 +168,9 @@ type ResourceMap = HashMap<String, Arc<dyn DynResource>>;
 /// The set of data source handlers keyed by type name.
 type DataSourceMap = HashMap<String, Arc<dyn DynDataSource>>;
 
+/// The set of ephemeral resource handlers keyed by type name.
+type EphemeralMap = HashMap<String, Arc<dyn DynEphemeral>>;
+
 /// The set of function handlers keyed by name. Functions are pure (no provider
 /// meta), so they are always eager.
 type FunctionMap = HashMap<String, Arc<dyn DynFunction>>;
@@ -174,6 +180,7 @@ type FunctionMap = HashMap<String, Arc<dyn DynFunction>>;
 struct Configured {
     resources: ResourceMap,
     data_sources: DataSourceMap,
+    ephemerals: EphemeralMap,
 }
 
 /// Builds the shared meta `Arc<M>` from the decoded provider config value.
@@ -186,6 +193,10 @@ type ResourceFactory<M> = Box<dyn Fn(Arc<M>) -> Arc<dyn DynResource> + Send + Sy
 /// Builds one data source handler from the shared meta. Stored per registered
 /// `data_source_with` until the meta exists at configure time.
 type DataSourceFactory<M> = Box<dyn Fn(Arc<M>) -> Arc<dyn DynDataSource> + Send + Sync>;
+
+/// Builds one ephemeral resource handler from the shared meta. Stored per
+/// registered `ephemeral_with` until the meta exists at configure time.
+type EphemeralFactory<M> = Box<dyn Fn(Arc<M>) -> Arc<dyn DynEphemeral> + Send + Sync>;
 
 /// The fully-erased configure step: decode-and-build the meta, then construct
 /// every meta-backed handler. `M` has been erased away by this point.
@@ -219,6 +230,8 @@ pub struct Provider {
     eager: Arc<ResourceMap>,
     /// Data source handlers that need no provider meta; available immediately.
     eager_data: Arc<DataSourceMap>,
+    /// Ephemeral resource handlers that need no provider meta; available now.
+    eager_ephemeral: Arc<EphemeralMap>,
     /// Function handlers (pure; always available, even before configure).
     functions: Arc<FunctionMap>,
     /// The `cty` type of the provider config block, for decoding `ConfigureProvider`.
@@ -269,6 +282,17 @@ impl Provider {
         self.eager_data.get(name).map(Arc::clone)
     }
 
+    /// The handler for ephemeral resource type `name`, if registered. Configured
+    /// (meta-backed) handlers take precedence over eager ones.
+    pub(crate) fn ephemeral_handler(&self, name: &str) -> Option<Arc<dyn DynEphemeral>> {
+        if let Some(configured) = self.configured.get() {
+            if let Some(handler) = configured.ephemerals.get(name) {
+                return Some(Arc::clone(handler));
+            }
+        }
+        self.eager_ephemeral.get(name).map(Arc::clone)
+    }
+
     /// The handler for function `name`, if registered.
     pub(crate) fn function_handler(&self, name: &str) -> Option<Arc<dyn DynFunction>> {
         self.functions.get(name).map(Arc::clone)
@@ -304,6 +328,15 @@ impl Provider {
             .iter()
             .find(|d| d.name == name)
             .map(|d| d.block.cty_type())
+    }
+
+    /// The `cty` object type of ephemeral resource `name`, from its schema block.
+    pub(crate) fn ephemeral_cty(&self, name: &str) -> Option<Type> {
+        self.schema
+            .ephemeral_resources
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.block.cty_type())
     }
 
     /// The `cty` type Terraform's `ConfigureProvider` config decodes under. An
@@ -349,9 +382,11 @@ pub struct ProviderBuilder<M = ()> {
     schema: ProviderSchema,
     resources: ResourceMap,
     data_sources: DataSourceMap,
+    ephemerals: EphemeralMap,
     functions: FunctionMap,
     factories: Vec<(String, ResourceFactory<M>)>,
     data_factories: Vec<(String, DataSourceFactory<M>)>,
+    ephemeral_factories: Vec<(String, EphemeralFactory<M>)>,
     configure: Option<MetaFn<M>>,
     dyn_configure: Option<Arc<dyn DynConfigure>>,
     validate_config: Option<Arc<dyn DynValidateConfig>>,
@@ -365,9 +400,11 @@ impl<M> Default for ProviderBuilder<M> {
             schema: ProviderSchema::default(),
             resources: HashMap::new(),
             data_sources: HashMap::new(),
+            ephemerals: HashMap::new(),
             functions: HashMap::new(),
             factories: Vec::new(),
             data_factories: Vec::new(),
+            ephemeral_factories: Vec::new(),
             configure: None,
             dyn_configure: None,
             validate_config: None,
@@ -532,6 +569,54 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
         self
     }
 
+    /// Register an ephemeral resource type with its `handler`. Use this for
+    /// ephemeral resources that need no provider configuration; for ones that need
+    /// the configured meta, use [`ProviderBuilder::ephemeral_with`].
+    ///
+    /// The type name comes from the model: an explicit
+    /// `#[facet(terraform::ephemeral("name"))]`, or `snake_case` of the struct
+    /// identifier when none is given. To expose an existing managed [`Resource`]
+    /// as an ephemeral resource, wrap it in
+    /// [`EphemeralFromResource`](crate::EphemeralFromResource) (which is itself an
+    /// [`Ephemeral`]) and pass it here.
+    pub fn ephemeral<E: Ephemeral>(mut self, handler: E) -> Self {
+        let name = ephemeral_name::<E::Model>();
+        match reflect_ephemeral::<E::Model>(name.clone()) {
+            Ok(ephemeral) => {
+                self.schema.ephemeral_resources.push(ephemeral);
+                self.ephemerals
+                    .insert(name, EphemeralAdapter::erased(handler));
+            }
+            Err(source) => self.record(name, source),
+        }
+        self
+    }
+
+    /// Register an ephemeral resource whose handler is built from the configured
+    /// provider meta. `factory` receives the shared `Arc<M>` produced by
+    /// [`ProviderBuilder::configure`] and returns the ephemeral handler.
+    ///
+    /// The type name comes from the model (see [`ProviderBuilder::ephemeral`]).
+    /// Requires a [`ProviderBuilder::configure`] step (which fixes `M`); building
+    /// without one is a [`BuildError::MissingConfigure`].
+    pub fn ephemeral_with<E, F>(mut self, factory: F) -> Self
+    where
+        E: Ephemeral,
+        F: Fn(Arc<M>) -> E + Send + Sync + 'static,
+    {
+        let name = ephemeral_name::<E::Model>();
+        match reflect_ephemeral::<E::Model>(name.clone()) {
+            Ok(ephemeral) => {
+                self.schema.ephemeral_resources.push(ephemeral);
+                let make: EphemeralFactory<M> =
+                    Box::new(move |meta: Arc<M>| EphemeralAdapter::erased(factory(meta)));
+                self.ephemeral_factories.push((name, make));
+            }
+            Err(source) => self.record(name, source),
+        }
+        self
+    }
+
     // --- Dynamic seam ------------------------------------------------------
     //
     // The methods above are the facet *frontend*: a Rust `Model` is reflected
@@ -627,6 +712,24 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
         self
     }
 
+    /// Register an ephemeral resource from a hand-built schema `block` and an
+    /// erased [`DynEphemeral`] handler, bypassing facet reflection (the dynamic
+    /// seam used by non-Rust frontends such as the Node binding).
+    pub fn dyn_ephemeral(
+        mut self,
+        name: impl Into<String>,
+        block: Block,
+        handler: Arc<dyn DynEphemeral>,
+    ) -> Self {
+        let name = name.into();
+        self.schema.ephemeral_resources.push(EphemeralSchema {
+            name: name.clone(),
+            block,
+        });
+        self.ephemerals.insert(name, handler);
+        self
+    }
+
     /// Register a provider-defined function under `name` with its `handler`.
     /// Functions are pure (no provider configuration or state), so this needs no
     /// `configure` step. The signature is reflected from the handler's `Params`
@@ -689,10 +792,12 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
             Some(meta_fn) => {
                 let factories = Arc::new(self.factories);
                 let data_factories = Arc::new(self.data_factories);
+                let ephemeral_factories = Arc::new(self.ephemeral_factories);
                 let configure: Arc<ConfigureFn> = Arc::new(move |config: Value| {
                     let meta_fn = Arc::clone(&meta_fn);
                     let factories = Arc::clone(&factories);
                     let data_factories = Arc::clone(&data_factories);
+                    let ephemeral_factories = Arc::clone(&ephemeral_factories);
                     Box::pin(async move {
                         let meta = meta_fn(config).await?;
                         let mut resources = ResourceMap::with_capacity(factories.len());
@@ -703,9 +808,14 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
                         for (name, make) in data_factories.iter() {
                             data_sources.insert(name.clone(), make(Arc::clone(&meta)));
                         }
+                        let mut ephemerals = EphemeralMap::with_capacity(ephemeral_factories.len());
+                        for (name, make) in ephemeral_factories.iter() {
+                            ephemerals.insert(name.clone(), make(Arc::clone(&meta)));
+                        }
                         Ok(Configured {
                             resources,
                             data_sources,
+                            ephemerals,
                         })
                     }) as BoxFuture<Result<Configured, Diagnostics>>
                 });
@@ -713,7 +823,10 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
             }
             // Meta-backed handlers were registered but there is nothing to build
             // their meta — a programming error worth surfacing at build time.
-            None if !self.factories.is_empty() || !self.data_factories.is_empty() => {
+            None if !self.factories.is_empty()
+                || !self.data_factories.is_empty()
+                || !self.ephemeral_factories.is_empty() =>
+            {
                 return Err(BuildError::MissingConfigure)
             }
             None => None,
@@ -723,6 +836,7 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
             schema: Arc::new(self.schema),
             eager: Arc::new(self.resources),
             eager_data: Arc::new(self.data_sources),
+            eager_ephemeral: Arc::new(self.ephemerals),
             functions: Arc::new(self.functions),
             config_ty,
             configure,
@@ -781,9 +895,11 @@ impl ProviderBuilder<()> {
             schema: self.schema,
             resources: self.resources,
             data_sources: self.data_sources,
+            ephemerals: self.ephemerals,
             functions: self.functions,
             factories: Vec::new(),
             data_factories: Vec::new(),
+            ephemeral_factories: Vec::new(),
             configure: Some(meta_fn),
             dyn_configure: self.dyn_configure,
             validate_config: self.validate_config,

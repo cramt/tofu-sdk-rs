@@ -3,8 +3,8 @@
 use facet::{Def, Facet, Field, PrimitiveType, Shape, Type as FType, UserType};
 use terraform_attrs::Attr as TfAttr;
 use terraform_ir::{
-    AttributeSchema, Block, DataSourceSchema, FunctionSignature, NestedBlock, NestingMode,
-    Parameter, ResourceSchema,
+    AttributeSchema, Block, DataSourceSchema, EphemeralSchema, FunctionSignature, NestedBlock,
+    NestingMode, Parameter, ResourceSchema,
 };
 use terraform_value::{Number, ObjectAttr, Type, Value};
 
@@ -101,6 +101,12 @@ pub fn data_source_list_name<T: Facet<'static>>() -> String {
     format!("{}s", data_source_name::<T>())
 }
 
+/// The Terraform type name for an ephemeral resource model — the explicit name
+/// from `#[facet(terraform::ephemeral("name"))]`, else `snake_case(Ident)`.
+pub fn ephemeral_name<T: Facet<'static>>() -> String {
+    container_name(T::SHAPE, "ephemeral")
+}
+
 /// Resolve a container's Terraform name: the optional string payload of the
 /// `terraform::<key>` attribute, else the snake-cased struct identifier.
 fn container_name(shape: &'static Shape, key: &str) -> String {
@@ -118,7 +124,7 @@ fn explicit_name(shape: &'static Shape, key: &str) -> Option<String> {
     // The attribute decodes to the grammar enum; both container markers carry an
     // `Option<&'static str>` name (`None` for the bare `resource` form).
     let name = match attr.get_as::<TfAttr>()? {
-        TfAttr::Resource(name) | TfAttr::DataSource(name) => *name,
+        TfAttr::Resource(name) | TfAttr::DataSource(name) | TfAttr::Ephemeral(name) => *name,
         _ => return None,
     };
     name.map(str::to_string)
@@ -253,6 +259,21 @@ pub fn reflect_data_source<T: Facet<'static>>(
             attributes,
             nested_blocks,
         },
+    })
+}
+
+/// Reflect a Rust type into an [`EphemeralSchema`]. Unlike a data source, an
+/// ephemeral resource has no search-key projection: its block is the model's
+/// attributes as declared — plain fields are settable config inputs, and
+/// `#[facet(terraform::computed)]` fields are the result the `open` handler
+/// fills. (`force_new` is meaningless here and simply never emitted, as for any
+/// block.)
+pub fn reflect_ephemeral<T: Facet<'static>>(
+    name: impl Into<String>,
+) -> Result<EphemeralSchema, ReflectError> {
+    Ok(EphemeralSchema {
+        name: name.into(),
+        block: reflect_block::<T>()?,
     })
 }
 
@@ -1173,5 +1194,49 @@ mod tests {
     fn search_key_with_both_cardinalities_errors() {
         let err = reflect_data_source::<BadKey>("bad").unwrap_err();
         assert!(matches!(err, ReflectError::InvalidSearchKey { .. }));
+    }
+
+    // --- ephemeral resources ------------------------------------------------
+
+    #[derive(Facet)]
+    #[facet(terraform::ephemeral("aws_session_token"))]
+    #[allow(dead_code)]
+    struct SessionToken {
+        role: String,
+        #[facet(terraform::optional)]
+        ttl_seconds: Option<i64>,
+        #[facet(terraform::computed)]
+        #[facet(terraform::sensitive)]
+        token: String,
+    }
+
+    #[test]
+    fn ephemeral_name_prefers_explicit_then_snake_case() {
+        assert_eq!(ephemeral_name::<SessionToken>(), "aws_session_token");
+        assert_eq!(ephemeral_name::<AwsS3Bucket>(), "aws_s3_bucket");
+    }
+
+    #[test]
+    fn reflect_ephemeral_keeps_inputs_and_computed_outputs() {
+        let eph = reflect_ephemeral::<SessionToken>("aws_session_token").expect("reflects");
+        assert_eq!(eph.name, "aws_session_token");
+
+        let role = attr(&eph.block, "role");
+        assert!(
+            role.required && !role.computed,
+            "plain field is a required input"
+        );
+
+        let ttl = attr(&eph.block, "ttl_seconds");
+        assert!(
+            ttl.optional && !ttl.required,
+            "Option field is an optional input"
+        );
+
+        let token = attr(&eph.block, "token");
+        assert!(
+            token.computed && token.sensitive,
+            "computed sensitive result"
+        );
     }
 }

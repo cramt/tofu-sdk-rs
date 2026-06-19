@@ -105,8 +105,9 @@ are available for the Rust build.
 Early but functional. Resources (CRUD + `force_new` replacement + `import` +
 `version`/`upgrade` state migrations + a `validate` config hook), provider
 configuration (`config`), both singular (`dataSource`) and plural
-(`dataSourceList`) data sources, HCL nested **blocks** (the `blocks` disposition),
-and single-file packaging (the `@tofu-sdk/core/tsdown` preset) all work end-to-end
-against real OpenTofu — see `test/e2e.test.mjs`. Not yet wired up: prebuilt
+(`dataSourceList`) data sources, **ephemeral resources** (`ephemeral` — an
+`open`/`renew`/`close` lifecycle, never persisted to state), HCL nested **blocks**
+(the `blocks` disposition), and single-file packaging (the `@tofu-sdk/core/tsdown`
+preset) all work end-to-end against real OpenTofu — see `test/e2e.test.mjs`. Not yet wired up: prebuilt
 multi-platform addons (the preset inlines the addon for the platform you build
 on, so cross-compiling a provider for other OSes/arches isn't covered yet).

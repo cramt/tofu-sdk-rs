@@ -26,6 +26,9 @@ pub struct ProviderSchema {
     pub resources: Vec<ResourceSchema>,
     /// Read-only data sources keyed by type name.
     pub data_sources: Vec<DataSourceSchema>,
+    /// Ephemeral resources keyed by type name (e.g. `aws_session_token`): values
+    /// produced for the duration of a single operation and never persisted.
+    pub ephemeral_resources: Vec<EphemeralSchema>,
     /// Provider-defined functions, callable from HCL as `provider::<p>::<name>`.
     pub functions: Vec<FunctionSignature>,
 }
@@ -87,6 +90,20 @@ pub struct DataSourceSchema {
     /// Fully-qualified type name, e.g. `aws_s3_bucket`.
     pub name: String,
     /// The data source's attribute/block structure.
+    pub block: Block,
+}
+
+/// An ephemeral resource type.
+///
+/// Structurally identical to a [`DataSourceSchema`] — a name plus a [`Block`]
+/// (settable config inputs plus computed result attributes) — but driven by the
+/// `Open`/`Renew`/`Close` lifecycle rather than a read. Its result is never
+/// written to state, so there is no version and no drift.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EphemeralSchema {
+    /// Fully-qualified type name, e.g. `aws_session_token`.
+    pub name: String,
+    /// The ephemeral resource's attribute/block structure.
     pub block: Block,
 }
 

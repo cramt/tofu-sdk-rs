@@ -47,6 +47,14 @@ interface RawProvider {
     validate: RawHandler,
   ): void;
   dataSource(typeName: string, schemaJson: string, read: RawHandler, validate: RawHandler): void;
+  ephemeral(
+    typeName: string,
+    schemaJson: string,
+    open: RawHandler,
+    renew: RawHandler,
+    close: RawHandler,
+    validate: RawHandler,
+  ): void;
   serve(): Promise<void>;
 }
 
@@ -326,6 +334,49 @@ export interface DataSourceList<S extends z.ZodObject<z.ZodRawShape>> {
   list(query: z.infer<S>): Promise<z.infer<S>[]>;
 }
 
+/** What an ephemeral `open` produces: the result plus an optional handle/deadline. */
+export interface EphemeralOpen<S extends z.ZodObject<z.ZodRawShape>> {
+  /** The result value (computed fields filled), validated against the schema. */
+  result: z.infer<S>;
+  /**
+   * An opaque handle to hand to `renew`/`close` — they receive *only* this
+   * string (not the config or result). Stash a lease ID, a created object's ID,
+   * etc. Omit it for a pure reader that holds nothing.
+   */
+  private?: string;
+  /**
+   * When to renew, in milliseconds since the Unix epoch (e.g. `Date.now() +
+   * 300_000`). Terraform calls `renew` before then. Omit for "never expires".
+   */
+  renewAt?: number;
+}
+
+/** What an ephemeral `renew` may refresh: a new handle and/or a new deadline. */
+export interface EphemeralRenew {
+  /** Replace the stored handle (omit to keep the existing one). */
+  private?: string;
+  /** Push the renewal deadline forward (ms since epoch). */
+  renewAt?: number;
+}
+
+/**
+ * An **ephemeral resource**: a value produced for the duration of a single
+ * operation and never written to state. `open` runs during *both* plan and
+ * apply, so keep it plan-safe. Because `renew`/`close` receive only the private
+ * handle, stash whatever they need in `open`'s returned `private`.
+ */
+export interface Ephemeral<S extends z.ZodObject<z.ZodRawShape>> extends Dispositions<S> {
+  schema: S;
+  /** Open the resource: produce the result (and optionally a handle + renewal). */
+  open(config: z.infer<S>): Promise<EphemeralOpen<S>>;
+  /** Renew a lease before its `renewAt`. Receives the stashed handle. */
+  renew?(handle: string): Promise<EphemeralRenew | void>;
+  /** Tear the resource down. Receives the stashed handle. */
+  close?(handle: string): Promise<void>;
+  /** Validate the configuration, returning diagnostics (or nothing). */
+  validate?: Validate<z.infer<S>>;
+}
+
 /** Provider-level configuration; `configure` runs once at `ConfigureProvider`. */
 export interface ProviderConfig<S extends z.ZodObject<z.ZodRawShape>> {
   schema: S;
@@ -490,6 +541,44 @@ export class Provider {
       return JSON.stringify({ ...inputs, results: validated });
     };
     this.raw.dataSource(typeName, JSON.stringify({ attributes }), read, validateAdapter(undefined));
+    return this;
+  }
+
+  /**
+   * Register an ephemeral resource under `typeName`: a value produced for the
+   * duration of a single operation and never written to state. `open` runs during
+   * plan *and* apply; `renew`/`close` receive only the handle `open` returned in
+   * `private`.
+   */
+  ephemeral<S extends z.ZodObject<z.ZodRawShape>>(typeName: string, def: Ephemeral<S>): this {
+    type M = z.infer<S>;
+    const open = adapt(async (config: M) => {
+      const opened = await def.open(config);
+      return {
+        result: validateOut(def.schema, opened.result, `ephemeral ${typeName} open`),
+        private: opened.private,
+        renewAt: opened.renewAt,
+      };
+    });
+    // renew/close receive the raw private handle string, not marshalled JSON.
+    const renew: RawHandler = async (err, handle) => {
+      if (err) throw err;
+      const refreshed = (def.renew && (await def.renew(handle))) || {};
+      return JSON.stringify({ private: refreshed.private, renewAt: refreshed.renewAt });
+    };
+    const close: RawHandler = async (err, handle) => {
+      if (err) throw err;
+      if (def.close) await def.close(handle);
+      return "null";
+    };
+    this.raw.ephemeral(
+      typeName,
+      schemaJson(def.schema, def),
+      open,
+      renew,
+      close,
+      validateAdapter(def.validate),
+    );
     return this;
   }
 

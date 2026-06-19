@@ -11,8 +11,9 @@ use std::sync::Arc;
 use facet::Facet;
 use terraform_attrs as terraform;
 use terraform_runtime::{
-    async_trait, ConfigureError, Ctx, DataSource, DataSourceError, DataSourceList, Diag,
-    PlanModifications, Provider, ProviderService, Resource, ResourceError,
+    async_trait, ConfigureError, Ctx, DataSource, DataSourceError, DataSourceList, Diag, Ephemeral,
+    EphemeralError, EphemeralFromResource, PlanModifications, Provider, ProviderService, Resource,
+    ResourceError,
 };
 use terraform_tfplugin6::tfplugin6::{self, provider_server::Provider as _};
 use tonic::{Code, Request};
@@ -1680,5 +1681,312 @@ async fn variadic_function_splits_heterogeneous_leading_and_trailing_args() {
     assert_eq!(
         decode(resp),
         terraform_value::Value::String("ys: []".into())
+    );
+}
+
+// --- Ephemeral resources ---------------------------------------------------
+
+/// An ephemeral auth token: `open` mints one bound to `role`, stashes the role in
+/// private state (the only thing `renew`/`close` receive), and asks for renewal.
+#[derive(Facet)]
+#[facet(terraform::ephemeral("auth_token"))]
+#[allow(dead_code)]
+struct Token {
+    role: String,
+    #[facet(terraform::computed)]
+    token: String,
+}
+
+struct TokenEphemeral;
+
+#[async_trait]
+impl Ephemeral for TokenEphemeral {
+    type Model = Token;
+
+    async fn open(&self, ctx: &mut Ctx, mut config: Token) -> Result<Token, EphemeralError> {
+        config.token = format!("tok-{}", config.role);
+        ctx.set_private(config.role.clone().into_bytes());
+        ctx.renew_after(std::time::Duration::from_secs(300));
+        Ok(config)
+    }
+
+    async fn renew(&self, ctx: &mut Ctx) -> Result<(), EphemeralError> {
+        // The handle is the role stashed on open; re-arm the renewal window.
+        if ctx.private().is_empty() {
+            return Err(EphemeralError::new("renew got no handle"));
+        }
+        ctx.renew_after(std::time::Duration::from_secs(300));
+        Ok(())
+    }
+
+    async fn close(&self, ctx: &mut Ctx) -> Result<(), EphemeralError> {
+        if ctx.private().is_empty() {
+            return Err(EphemeralError::new("close got no handle"));
+        }
+        Ok(())
+    }
+}
+
+/// The `cty` object type for the `Token` ephemeral resource's config/result.
+fn token_cty() -> terraform_value::Type {
+    terraform_value::Type::Object(vec![
+        terraform_value::ObjectAttr {
+            name: "role".into(),
+            ty: terraform_value::Type::String,
+            optional: false,
+        },
+        terraform_value::ObjectAttr {
+            name: "token".into(),
+            ty: terraform_value::Type::String,
+            optional: true,
+        },
+    ])
+}
+
+fn token_config(role: &str) -> tfplugin6::DynamicValue {
+    let mut obj = std::collections::BTreeMap::new();
+    obj.insert(
+        "role".to_string(),
+        terraform_value::Value::String(role.into()),
+    );
+    obj.insert("token".to_string(), terraform_value::Value::Null);
+    tfplugin6::DynamicValue {
+        msgpack: terraform_codec::encode_msgpack(
+            &terraform_value::Value::Object(obj),
+            &token_cty(),
+        )
+        .unwrap(),
+        json: vec![],
+    }
+}
+
+fn ephemeral_service() -> ProviderService {
+    Provider::builder()
+        .ephemeral(TokenEphemeral)
+        .build()
+        .map(ProviderService::new)
+        .expect("provider builds")
+}
+
+#[tokio::test]
+async fn open_ephemeral_fills_result_sets_private_and_renew_at() {
+    let svc = ephemeral_service();
+
+    let resp = svc
+        .open_ephemeral_resource(Request::new(tfplugin6::open_ephemeral_resource::Request {
+            type_name: "auth_token".into(),
+            config: Some(token_config("admin")),
+            ..Default::default()
+        }))
+        .await
+        .expect("open")
+        .into_inner();
+
+    assert!(resp.diagnostics.is_empty(), "{:?}", resp.diagnostics);
+
+    // The computed result is filled and encoded back.
+    let result = resp.result.expect("result");
+    let value = terraform_codec::decode_msgpack(&result.msgpack, &token_cty()).unwrap();
+    let terraform_value::Value::Object(fields) = value else {
+        panic!("result should be an object");
+    };
+    assert_eq!(
+        fields["token"],
+        terraform_value::Value::String("tok-admin".into())
+    );
+
+    // The handle was stashed and a renewal deadline was requested.
+    assert_eq!(resp.private.as_deref(), Some(b"admin".as_slice()));
+    assert!(resp.renew_at.is_some(), "open requested a renewal time");
+}
+
+#[tokio::test]
+async fn renew_ephemeral_echoes_handle_and_refreshes_deadline() {
+    let svc = ephemeral_service();
+
+    let resp = svc
+        .renew_ephemeral_resource(Request::new(tfplugin6::renew_ephemeral_resource::Request {
+            type_name: "auth_token".into(),
+            private: Some(b"admin".to_vec()),
+        }))
+        .await
+        .expect("renew")
+        .into_inner();
+
+    assert!(resp.diagnostics.is_empty(), "{:?}", resp.diagnostics);
+    // A handler that didn't rewrite private state keeps the incoming handle.
+    assert_eq!(resp.private.as_deref(), Some(b"admin".as_slice()));
+    assert!(resp.renew_at.is_some(), "renew pushed the deadline forward");
+}
+
+#[tokio::test]
+async fn close_ephemeral_reads_handle_and_surfaces_errors() {
+    let svc = ephemeral_service();
+
+    // With a handle: clean close.
+    let ok = svc
+        .close_ephemeral_resource(Request::new(tfplugin6::close_ephemeral_resource::Request {
+            type_name: "auth_token".into(),
+            private: Some(b"admin".to_vec()),
+        }))
+        .await
+        .expect("close")
+        .into_inner();
+    assert!(ok.diagnostics.is_empty(), "{:?}", ok.diagnostics);
+
+    // Without a handle: the handler errors, surfaced as a diagnostic.
+    let missing = svc
+        .close_ephemeral_resource(Request::new(tfplugin6::close_ephemeral_resource::Request {
+            type_name: "auth_token".into(),
+            private: None,
+        }))
+        .await
+        .expect("close")
+        .into_inner();
+    assert_eq!(missing.diagnostics.len(), 1, "missing handle is an error");
+
+    // An unknown type name is rejected.
+    let unknown = svc
+        .open_ephemeral_resource(Request::new(tfplugin6::open_ephemeral_resource::Request {
+            type_name: "nope".into(),
+            config: Some(token_config("x")),
+            ..Default::default()
+        }))
+        .await
+        .expect("open")
+        .into_inner();
+    assert_eq!(
+        unknown.diagnostics.len(),
+        1,
+        "unknown ephemeral is an error"
+    );
+}
+
+/// A managed resource with observable create/delete, exposed as an ephemeral
+/// resource via [`EphemeralFromResource`] — proving Open→create, Close→delete,
+/// and the private-state round-trip the wrapper uses to hand the model to delete.
+#[derive(Facet)]
+#[facet(terraform::resource("temp_rule"))]
+#[allow(dead_code)]
+struct TempRule {
+    cidr: String,
+    #[facet(terraform::computed)]
+    id: String,
+}
+
+struct TempRuleResource {
+    log: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Resource for TempRuleResource {
+    type Model = TempRule;
+
+    async fn create(
+        &self,
+        _ctx: &mut Ctx,
+        mut planned: TempRule,
+    ) -> Result<TempRule, ResourceError> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("create {}", planned.cidr));
+        planned.id = format!("rule-{}", planned.cidr);
+        Ok(planned)
+    }
+
+    async fn delete(&self, _ctx: &mut Ctx, prior: TempRule) -> Result<(), ResourceError> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("delete {}", prior.id));
+        Ok(())
+    }
+}
+
+fn temp_rule_cty() -> terraform_value::Type {
+    terraform_value::Type::Object(vec![
+        terraform_value::ObjectAttr {
+            name: "cidr".into(),
+            ty: terraform_value::Type::String,
+            optional: false,
+        },
+        terraform_value::ObjectAttr {
+            name: "id".into(),
+            ty: terraform_value::Type::String,
+            optional: true,
+        },
+    ])
+}
+
+#[tokio::test]
+async fn ephemeral_from_resource_runs_create_on_open_and_delete_on_close() {
+    let log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    // No ephemeral marker on `TempRule`, so it registers under snake_case of the
+    // identifier: `temp_rule`.
+    let svc = Provider::builder()
+        .ephemeral(EphemeralFromResource(TempRuleResource { log: log.clone() }))
+        .build()
+        .map(ProviderService::new)
+        .expect("provider builds");
+
+    let mut cfg = std::collections::BTreeMap::new();
+    cfg.insert(
+        "cidr".to_string(),
+        terraform_value::Value::String("10.0.0.0/8".into()),
+    );
+    cfg.insert("id".to_string(), terraform_value::Value::Null);
+    let config = tfplugin6::DynamicValue {
+        msgpack: terraform_codec::encode_msgpack(
+            &terraform_value::Value::Object(cfg),
+            &temp_rule_cty(),
+        )
+        .unwrap(),
+        json: vec![],
+    };
+
+    let opened = svc
+        .open_ephemeral_resource(Request::new(tfplugin6::open_ephemeral_resource::Request {
+            type_name: "temp_rule".into(),
+            config: Some(config),
+            ..Default::default()
+        }))
+        .await
+        .expect("open")
+        .into_inner();
+    assert!(opened.diagnostics.is_empty(), "{:?}", opened.diagnostics);
+
+    // create() filled the computed id.
+    let value =
+        terraform_codec::decode_msgpack(&opened.result.expect("result").msgpack, &temp_rule_cty())
+            .unwrap();
+    let terraform_value::Value::Object(fields) = value else {
+        panic!("result should be an object");
+    };
+    assert_eq!(
+        fields["id"],
+        terraform_value::Value::String("rule-10.0.0.0/8".into())
+    );
+
+    // The wrapper stashed the created model as JSON so close can reconstruct it.
+    let private = opened.private.expect("wrapper recorded the handle");
+    let closed = svc
+        .close_ephemeral_resource(Request::new(tfplugin6::close_ephemeral_resource::Request {
+            type_name: "temp_rule".into(),
+            private: Some(private),
+        }))
+        .await
+        .expect("close")
+        .into_inner();
+    assert!(closed.diagnostics.is_empty(), "{:?}", closed.diagnostics);
+
+    // Open ran create; Close ran delete with the reconstructed model.
+    let log = log.lock().unwrap();
+    assert_eq!(
+        *log,
+        vec![
+            "create 10.0.0.0/8".to_string(),
+            "delete rule-10.0.0.0/8".to_string()
+        ]
     );
 }

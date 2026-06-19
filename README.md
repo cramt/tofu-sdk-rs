@@ -228,9 +228,20 @@ plus data sources, functions, nested blocks, a handler context, and lossless
   zero-value-decodes); and computed attributes *inside nested blocks* are now
   planned unknown correctly
 
+- **Ephemeral resources ✅** — values produced for the duration of a single
+  operation and never written to state. Implement the `Ephemeral` trait
+  (`open` → optional `renew` → `close`) over a `#[facet(terraform::ephemeral)]`
+  model, registered with `ProviderBuilder::ephemeral` / `ephemeral_with` (or the
+  `dyn_ephemeral` seam). `open` runs during *both* plan and apply, stashes a
+  handle via `Ctx::set_private`, and may request renewal with `Ctx::renew_after`;
+  `renew`/`close` receive only that private handle. Wrap an existing managed
+  `Resource` in `EphemeralFromResource` to expose it ephemerally (Open = create,
+  Close = delete) — for cheap, reversible resources only (no renewal; a created
+  object leaks if the run is interrupted).
+
 ### Not yet implemented
 
-Ephemeral resources and cross-type state move. There is no dedicated
+Cross-type state move. There is no dedicated
 semantic-equality / normalization hook for suppressing spurious diffs — though
 modeling structured data as structured types (sets as sets, nested blocks as
 blocks) plus `cty`'s native unordered-set semantics avoids most of the need.

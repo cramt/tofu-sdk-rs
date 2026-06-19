@@ -53,7 +53,11 @@ pub fn emit_provider_schema(schema: &ProviderSchema) -> get_provider_schema::Res
             .map(|d| (d.name.clone(), emit_schema(&d.block, 0)))
             .collect(),
         functions: emit_functions(schema),
-        ephemeral_resource_schemas: HashMap::new(),
+        ephemeral_resource_schemas: schema
+            .ephemeral_resources
+            .iter()
+            .map(|e| (e.name.clone(), emit_schema(&e.block, 0)))
+            .collect(),
         list_resource_schemas: HashMap::new(),
         state_store_schemas: HashMap::new(),
         action_schemas: HashMap::new(),
@@ -89,7 +93,13 @@ pub fn emit_metadata(schema: &ProviderSchema) -> get_metadata::Response {
                 name: f.name.clone(),
             })
             .collect(),
-        ephemeral_resources: Vec::new(),
+        ephemeral_resources: schema
+            .ephemeral_resources
+            .iter()
+            .map(|e| get_metadata::EphemeralMetadata {
+                type_name: e.name.clone(),
+            })
+            .collect(),
         list_resources: Vec::new(),
         state_stores: Vec::new(),
         actions: Vec::new(),

@@ -5,9 +5,9 @@
 //! attributes as JSON) and async lifecycle handlers. This crate:
 //!
 //! - parses the schema JSON into a `terraform-ir` [`Block`];
-//! - implements the erased [`DynResource`]/[`DynDataSource`] traits by calling
-//!   the JS handlers (marshalling the dynamic `Value` to/from JSON across the
-//!   boundary, typed by the schema); and
+//! - implements the erased [`DynResource`]/[`DynDataSource`]/[`DynEphemeral`]
+//!   traits by calling the JS handlers (marshalling the dynamic `Value` to/from
+//!   JSON across the boundary, typed by the schema); and
 //! - runs the real tfplugin6 server in-process via `terraform_runtime::serve`.
 //!
 //! All Terraform/protocol concerns stay in Rust; JS only sees decoded values.
@@ -20,11 +20,13 @@ use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunction;
 use napi_derive::napi;
 
+use std::time::{Duration, SystemTime};
+
 use terraform_codec::{decode_json, encode_json};
 use terraform_ir::{AttributeSchema, Block, NestedBlock, NestingMode};
 use terraform_runtime::{
-    async_trait, serve as serve_provider, Diag, Diagnostics, DynConfigure, DynDataSource,
-    DynResource, Provider as RtProvider,
+    async_trait, current_ctx, serve as serve_provider, Diag, Diagnostics, DynConfigure,
+    DynDataSource, DynEphemeral, DynResource, Provider as RtProvider,
 };
 use terraform_value::{Type, Value};
 
@@ -340,6 +342,105 @@ impl DynDataSource for JsDataSource {
     }
 }
 
+/// An ephemeral resource whose `Open`/`Renew`/`Close`/`validate` lifecycle is a
+/// set of async JS callbacks.
+///
+/// `Renew`/`Close` receive only the private handle (the protocol gives them
+/// nothing else), so `open` returns `{ result, private?, renewAt? }`: the private
+/// string and renewal deadline are written to the ambient [`Ctx`] (via
+/// `current_ctx`), which the service reads back. The handle reaches `renew`/`close`
+/// as the (UTF-8) private string the JS author stashed.
+struct JsEphemeral {
+    /// The ephemeral resource's cty object type, used to type the `open` result.
+    ty: Type,
+    open: Handler,
+    renew: Handler,
+    close: Handler,
+    validate: Handler,
+}
+
+/// Apply a handler's `{ private?, renewAt? }` JSON to the ambient context: the
+/// private handle (an opaque string, stored as UTF-8 bytes) and the renewal
+/// deadline (`renewAt`, milliseconds since the Unix epoch).
+fn apply_open_outputs(obj: &facet_value::Value) {
+    let mut ctx = current_ctx();
+    if let Some(p) = obj
+        .as_object()
+        .and_then(|o| o.get("private"))
+        .and_then(|v| v.as_string())
+    {
+        ctx.set_private(p.as_str().as_bytes().to_vec());
+    }
+    if let Some(ms) = obj
+        .as_object()
+        .and_then(|o| o.get("renewAt"))
+        .and_then(|v| v.as_number())
+        .and_then(|n| n.to_i64())
+        .filter(|ms| *ms >= 0)
+    {
+        ctx.set_renew_at(SystemTime::UNIX_EPOCH + Duration::from_millis(ms as u64));
+    }
+}
+
+/// Call a JS handler whose input is the raw private handle string (not a
+/// marshalled `Value`), awaiting its JSON result.
+async fn call_with_handle(
+    handler: &Handler,
+    ctx: &str,
+) -> std::result::Result<String, Diagnostics> {
+    let handle = String::from_utf8_lossy(current_ctx().private()).into_owned();
+    let promise = handler
+        .call_async(Ok(handle))
+        .await
+        .map_err(|e| handler_err(ctx, e))?;
+    promise.await.map_err(|e| handler_err(ctx, e))
+}
+
+#[async_trait]
+impl DynEphemeral for JsEphemeral {
+    async fn open(&self, config: Value) -> std::result::Result<Value, Diagnostics> {
+        let out = call_handler(&self.open, &config, "open").await?;
+        let parsed: facet_value::Value =
+            facet_json::from_slice(out.as_bytes()).map_err(|e| handler_err("open", e))?;
+        let result = parsed
+            .as_object()
+            .and_then(|o| o.get("result"))
+            .ok_or_else(|| {
+                handler_err("open", "open must return `{ result, private?, renewAt? }`")
+            })?;
+        // Stash the private handle / renewal deadline on the ambient ctx.
+        apply_open_outputs(&parsed);
+        // The result is itself a Value (typed by the schema); re-serialize and
+        // decode it under the ephemeral type.
+        let result_json = facet_json::to_string(result).map_err(|e| handler_err("open", e))?;
+        json_to_value(&result_json, &self.ty).map_err(|e| handler_err("open", e))
+    }
+
+    async fn renew(&self) -> std::result::Result<(), Diagnostics> {
+        let out = call_with_handle(&self.renew, "renew").await?;
+        // A `null` (or non-object) result means "no change"; otherwise apply any
+        // refreshed private/renewAt.
+        if let Ok(parsed) = facet_json::from_slice::<facet_value::Value>(out.as_bytes()) {
+            if parsed.as_object().is_some() {
+                apply_open_outputs(&parsed);
+            }
+        }
+        Ok(())
+    }
+
+    async fn close(&self) -> std::result::Result<(), Diagnostics> {
+        call_with_handle(&self.close, "close").await?;
+        Ok(())
+    }
+
+    async fn validate(&self, config: Value) -> Diagnostics {
+        match call_handler(&self.validate, &config, "ephemeral validate").await {
+            Ok(out) => parse_diagnostics(&out),
+            Err(diags) => diags,
+        }
+    }
+}
+
 /// The provider-configure callback: a single async JS handler that receives the
 /// decoded provider config (and sets up JS-side state the handlers read).
 struct JsConfigure {
@@ -371,6 +472,13 @@ struct DataSourceReg {
     handler: Arc<dyn DynDataSource>,
 }
 
+/// A registered ephemeral resource.
+struct EphemeralReg {
+    name: String,
+    block: Block,
+    handler: Arc<dyn DynEphemeral>,
+}
+
 /// The provider-level config block and its configure handler.
 struct ProviderConfigReg {
     block: Block,
@@ -382,6 +490,7 @@ struct ProviderConfigReg {
 pub struct Provider {
     resources: Vec<ResourceReg>,
     data_sources: Vec<DataSourceReg>,
+    ephemerals: Vec<EphemeralReg>,
     config: Option<ProviderConfigReg>,
 }
 
@@ -399,6 +508,7 @@ impl Provider {
         Provider {
             resources: Vec::new(),
             data_sources: Vec::new(),
+            ephemerals: Vec::new(),
             config: None,
         }
     }
@@ -478,6 +588,37 @@ impl Provider {
         Ok(())
     }
 
+    /// Register an ephemeral resource: its `type_name`, a schema description, and
+    /// the async lifecycle handlers. `open` receives the marshalled config and
+    /// returns `{ result, private?, renewAt? }` JSON; `renew`/`close` receive the
+    /// raw private handle string; `validate` receives the config and returns a
+    /// diagnostics array.
+    #[napi]
+    pub fn ephemeral(
+        &mut self,
+        type_name: String,
+        schema_json: String,
+        open: ThreadsafeFunction<String, Promise<String>>,
+        renew: ThreadsafeFunction<String, Promise<String>>,
+        close: ThreadsafeFunction<String, Promise<String>>,
+        validate: ThreadsafeFunction<String, Promise<String>>,
+    ) -> Result<()> {
+        let block = block_from_schema_json(&schema_json).map_err(napi_err)?;
+        let ty = block.cty_type();
+        self.ephemerals.push(EphemeralReg {
+            name: type_name,
+            block,
+            handler: Arc::new(JsEphemeral {
+                ty,
+                open,
+                renew,
+                close,
+                validate,
+            }),
+        });
+        Ok(())
+    }
+
     /// Serve the provider over the Terraform plugin protocol. Performs the
     /// go-plugin handshake on stdout and runs until SIGTERM, so the returned
     /// promise stays pending for the provider's lifetime.
@@ -500,6 +641,10 @@ impl Provider {
         for d in &self.data_sources {
             builder =
                 builder.dyn_data_source(d.name.clone(), d.block.clone(), Arc::clone(&d.handler));
+        }
+        for e in &self.ephemerals {
+            builder =
+                builder.dyn_ephemeral(e.name.clone(), e.block.clone(), Arc::clone(&e.handler));
         }
         let provider = builder.build().map_err(napi_err)?;
         serve_provider(provider).await.map_err(napi_err)

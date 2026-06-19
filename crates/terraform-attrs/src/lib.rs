@@ -70,6 +70,13 @@ facet::define_attr_grammar! {
         /// Marks a struct as a data source, with the same optional name override
         /// as [`Attr::Resource`].
         DataSource(Option<&'static str>),
+        /// Marks a struct as an *ephemeral resource* — a value produced for the
+        /// duration of a single Terraform operation (opened during plan and
+        /// apply, optionally renewed, then closed) and never written to state.
+        /// Takes the same optional name override as [`Attr::Resource`]:
+        /// `#[facet(terraform::ephemeral("aws_session_token"))]`, or bare
+        /// `#[facet(terraform::ephemeral)]` to infer `snake_case(Ident)`.
+        Ephemeral(Option<&'static str>),
         /// Marks a field as a data source lookup key. The [`SearchKey`] payload
         /// records the cardinality of a match:
         ///

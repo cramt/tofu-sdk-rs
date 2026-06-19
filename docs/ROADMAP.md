@@ -75,7 +75,9 @@ Rough priority order, each pointing at its tracked item:
    object attribute — unavoidable for a `list(object(...))`). → **3.7**.
 7. **Modern protocol surfaces** — ~~provider-defined functions~~ ✅ **DONE**
    (`GetFunctions`/`CallFunction`, typed `Function` + `VariadicFunction` traits);
-   ephemeral resources and cross-type state move remain. → **3.2** + **Tier 4**.
+   ~~ephemeral resources~~ ✅ **DONE** (`Open`/`Renew`/`Close`, typed `Ephemeral`
+   trait + `EphemeralFromResource` adapter, dynamic seam via `dyn_ephemeral`);
+   cross-type state move remains. → **3.2** + **Tier 4**.
 
 ## How to verify (the four test layers)
 
@@ -406,7 +408,19 @@ All are stubbed in `service.rs` (`unimplemented_unary!` or streaming stubs).
   variadic types and zero-arity), the schema contract test, and
   `functions.tftest.hcl` (real `tofu` calling both `arn_for` and the variadic
   `join`). Examples: `example-aws`'s `arn_for` and `join`.
-- **Ephemeral resources** (`Open/Renew/CloseEphemeralResource`).
+- ~~**Ephemeral resources** (`Open/Renew/CloseEphemeralResource`).~~ ✅ **DONE** —
+  typed `Ephemeral` trait (`open` → optional `renew` → `close`, plus `validate`)
+  over an erased `DynEphemeral` seam; `reflect_ephemeral` builds the
+  `EphemeralSchema` IR (plain fields = config inputs, `computed` = result),
+  `emit.rs` publishes it in `ephemeral_resource_schemas` + `GetMetadata`, and
+  `service.rs` dispatches all four RPCs. `open` runs during plan *and* apply and
+  threads a handle through `Ctx::set_private`; `Ctx::set_renew_at`/`renew_after`
+  drive the `renew_at` deadline. Registered with `ProviderBuilder::ephemeral` /
+  `ephemeral_with` / `dyn_ephemeral`. `EphemeralFromResource<R>` adapts a managed
+  `Resource` (Open = create, Close = delete) for the cheap-reversible case (no
+  renew; leaks on interrupt). Verified by direct service tests (open/renew/close,
+  private round-trip, the wrapper) and the schema contract test. Example:
+  `example-aws`'s `aws_session_token`.
 - **List resources** (`ListResource`, streaming).
 - **Resource identity** (`GetResourceIdentitySchemas`/`UpgradeResourceIdentity`).
 - **State store** (`ReadStateBytes`/`WriteStateBytes`/`Lock`/`Unlock`/…, streaming).

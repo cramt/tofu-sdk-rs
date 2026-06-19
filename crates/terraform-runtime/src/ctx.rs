@@ -22,6 +22,7 @@
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use tokio_util::sync::CancellationToken;
 
@@ -39,6 +40,7 @@ tokio::task_local! {
 struct CtxSink {
     warnings: Vec<Diag>,
     private_out: Option<Vec<u8>>,
+    renew_at: Option<SystemTime>,
 }
 
 /// The context handed to every handler call as `&mut Ctx`.
@@ -92,6 +94,21 @@ impl Ctx {
         self.lock().private_out = Some(bytes.into());
     }
 
+    /// Request that Terraform renew this ephemeral resource at `when` (an
+    /// absolute time), calling [`Ephemeral::renew`](crate::Ephemeral::renew)
+    /// before then. Only meaningful from an ephemeral `open`/`renew` handler;
+    /// ignored for managed-resource and data-source operations. Leaving it unset
+    /// means "no renewal needed".
+    pub fn set_renew_at(&mut self, when: SystemTime) {
+        self.lock().renew_at = Some(when);
+    }
+
+    /// Convenience over [`set_renew_at`](Ctx::set_renew_at): request renewal
+    /// `after` from now (e.g. half a lease's TTL).
+    pub fn renew_after(&mut self, after: Duration) {
+        self.set_renew_at(SystemTime::now() + after);
+    }
+
     /// Whether `StopProvider` has been received — poll this in long loops.
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
@@ -118,6 +135,7 @@ impl Ctx {
         CtxOutputs {
             warnings: std::mem::take(&mut sink.warnings),
             private_out: sink.private_out.take(),
+            renew_at: sink.renew_at.take(),
         }
     }
 }
@@ -127,6 +145,9 @@ impl Ctx {
 pub(crate) struct CtxOutputs {
     pub warnings: Vec<Diag>,
     pub private_out: Option<Vec<u8>>,
+    /// When set by an ephemeral `open`/`renew`, the absolute time Terraform
+    /// should next renew the ephemeral resource.
+    pub renew_at: Option<SystemTime>,
 }
 
 /// Run `fut` with `ctx` installed as the ambient handler context, returning the
@@ -139,6 +160,12 @@ pub(crate) async fn with_ctx<T>(ctx: Ctx, fut: impl Future<Output = T>) -> (T, C
 
 /// The ambient context for the currently-executing handler, or a detached one
 /// when called outside a dispatch.
-pub(crate) fn current_ctx() -> Ctx {
+///
+/// Public for dynamic-seam frontends (e.g. the Node binding) that implement the
+/// erased handler traits directly and need to reach private state / the renewal
+/// deadline — the typed adapters use it internally. Clones share the same sink,
+/// so writes (`set_private`, `set_renew_at`) made through the returned handle are
+/// read back by the service after the dispatch.
+pub fn current_ctx() -> Ctx {
     CTX.try_with(Ctx::clone).unwrap_or_else(|_| Ctx::detached())
 }

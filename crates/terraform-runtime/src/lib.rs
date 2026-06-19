@@ -11,6 +11,7 @@
 mod builder;
 mod ctx;
 mod data_source;
+mod ephemeral;
 mod function;
 pub mod handshake;
 mod log;
@@ -26,6 +27,7 @@ pub use builder::{
 };
 pub use ctx::Ctx;
 pub use data_source::{DataSource, DataSourceError, DataSourceList};
+pub use ephemeral::{Ephemeral, EphemeralError, EphemeralFromResource};
 pub use function::{Function, FunctionError, VariadicFunction};
 pub use resource::{PlanModifications, Resource, ResourceError};
 pub use serve::{serve, ServeError};
@@ -34,7 +36,9 @@ pub use serve::{serve, ServeError};
 /// the dynamic seam used by non-Rust frontends (paired with
 /// [`ProviderBuilder::dyn_resource`] / [`ProviderBuilder::dyn_data_source`]);
 /// Rust authors use the typed [`Resource`] / [`DataSource`] traits instead.
+pub use ctx::current_ctx;
 pub use data_source::DynDataSource;
+pub use ephemeral::DynEphemeral;
 pub use function::DynFunction;
 pub use resource::{Diag, Diagnostics, DynResource, Severity};
 pub use service::{current_cancellation, ProviderService};

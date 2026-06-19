@@ -73,6 +73,34 @@ fn real_engine_loads_reflected_schema() {
         "provider schema block must be present"
     );
 
+    // The ephemeral resource `aws_session_token`: the engine surfaces it in its
+    // own `ephemeral_resource_schemas` map, with a required `role` input and a
+    // computed, sensitive `token` result.
+    let eph = common::get(
+        provider,
+        &[
+            "ephemeral_resource_schemas",
+            "aws_session_token",
+            "block",
+            "attributes",
+        ],
+    );
+    assert_eq!(
+        common::get(eph, &["role", "required"]).as_bool(),
+        Some(true),
+        "role is a required ephemeral input"
+    );
+    assert_eq!(
+        common::get(eph, &["token", "computed"]).as_bool(),
+        Some(true),
+        "token is a computed ephemeral result"
+    );
+    assert_eq!(
+        common::get(eph, &["token", "sensitive"]).as_bool(),
+        Some(true),
+        "token is sensitive"
+    );
+
     // The provider-defined function `arn_for(name) -> string`.
     let func = common::get(provider, &["functions", "arn_for"]);
     assert_eq!(

@@ -299,3 +299,93 @@ resource "aws_s3_bucket" "test" {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("exposes the ephemeral resource in the engine's schema", () => {
+  const bin = engine();
+  const { dir, cfg, env } = workspace();
+  try {
+    writeFileSync(
+      join(cfg, "main.tf"),
+      `
+terraform {
+  required_providers {
+    aws = {
+      source = "example/aws"
+    }
+  }
+}
+`,
+    );
+    // The engine launches the JS provider and reports its schema; the ephemeral
+    // resource must surface in its own `ephemeral_resource_schemas` map with a
+    // required `role` input and a computed, sensitive `token` result.
+    const out = run(bin, ["providers", "schema", "-json"], cfg, env);
+    assert.equal(out.status, 0, `providers schema failed:\n${out.stdout}\n${out.stderr}`);
+    const schema = JSON.parse(out.stdout);
+    const provider = Object.entries(schema.provider_schemas).find(([k]) =>
+      k.endsWith("example/aws"),
+    )[1];
+    const eph = provider.ephemeral_resource_schemas?.aws_session_token;
+    assert.ok(eph, "the ephemeral resource is present in the schema");
+    const attrs = eph.block.attributes;
+    assert.equal(attrs.role.required, true, "role is a required ephemeral input");
+    assert.equal(attrs.token.computed, true, "token is a computed ephemeral result");
+    assert.equal(attrs.token.sensitive, true, "token is sensitive");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("opens the ephemeral resource and its minted value reaches HCL", () => {
+  const bin = engine();
+  const { dir, cfg, env } = workspace();
+  try {
+    // A `check` block's assertion references the ephemeral token: the engine must
+    // Open the resource (running the JS `open` handler) to evaluate it, then
+    // Close it — without persisting the value. The assertion proves the minted
+    // value round-tripped through the napi marshalling correctly; a failing
+    // condition surfaces as `token not minted` in the output.
+    writeFileSync(
+      join(cfg, "main.tf"),
+      `
+terraform {
+  required_providers {
+    aws = {
+      source = "example/aws"
+    }
+  }
+}
+
+provider "aws" {
+  region = "eu-west-1"
+}
+
+ephemeral "aws_session_token" "s" {
+  role = "admin"
+}
+
+check "minted" {
+  assert {
+    condition     = startswith(ephemeral.aws_session_token.s.token, "tok-admin-")
+    error_message = "token not minted"
+  }
+}
+`,
+    );
+
+    const apply = run(bin, ["apply", "-auto-approve"], cfg, env);
+    assert.equal(apply.status, 0, `apply failed:\n${apply.stdout}\n${apply.stderr}`);
+    // The engine logs the Open/Close lifecycle, and the check did not fire.
+    assert.match(apply.stdout, /Open complete/, "the ephemeral resource was opened");
+    assert.doesNotMatch(
+      apply.stdout + apply.stderr,
+      /token not minted/,
+      "the minted token value reached HCL through the marshalling",
+    );
+
+    const destroy = run(bin, ["destroy", "-auto-approve"], cfg, env);
+    assert.equal(destroy.status, 0, `destroy failed:\n${destroy.stdout}\n${destroy.stderr}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -3,11 +3,12 @@
 //! Answers schema discovery (`GetMetadata`, `GetProviderSchema`), the resource
 //! lifecycle (`ConfigureProvider`, validation, `UpgradeResourceState`,
 //! `PlanResourceChange`, `ReadResource`, `ApplyResourceChange`), and data source
-//! reads (`ReadDataSource`), import (`ImportResourceState`), and provider-defined
-//! functions (`GetFunctions`/`CallFunction`) by dispatching to the registered
-//! handlers through the value codec. RPCs for features the SDK does not yet
-//! support (ephemeral resources, identity, state stores, actions, move) still
-//! return `Unimplemented`.
+//! reads (`ReadDataSource`), the ephemeral resource lifecycle
+//! (`Open`/`Renew`/`Close`/`ValidateEphemeralResourceConfig`), import
+//! (`ImportResourceState`), and provider-defined functions
+//! (`GetFunctions`/`CallFunction`) by dispatching to the registered handlers
+//! through the value codec. RPCs for features the SDK does not yet support
+//! (identity, state stores, actions, move) still return `Unimplemented`.
 
 use std::pin::Pin;
 
@@ -448,6 +449,7 @@ impl tfplugin6::provider_server::Provider for ProviderService {
                     let CtxOutputs {
                         warnings: w,
                         private_out,
+                        ..
                     } = outs;
                     warnings = w;
                     if let Some(p) = private_out {
@@ -677,6 +679,164 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         }
     }
 
+    // --- Ephemeral resources -----------------------------------------------
+
+    async fn validate_ephemeral_resource_config(
+        &self,
+        request: Request<tfplugin6::validate_ephemeral_resource_config::Request>,
+    ) -> Result<Response<tfplugin6::validate_ephemeral_resource_config::Response>, Status> {
+        use tfplugin6::validate_ephemeral_resource_config::Response as Resp;
+        let req = request.into_inner();
+
+        let Some(ty) = self.provider.ephemeral_cty(&req.type_name) else {
+            return Ok(Response::new(Resp {
+                diagnostics: unknown_ephemeral(&req.type_name),
+            }));
+        };
+        // Like resources/data sources, the handler may not be built yet (this runs
+        // before ConfigureProvider); the type is still known, so skip rather than
+        // error.
+        let Some(handler) = self.provider.ephemeral_handler(&req.type_name) else {
+            return Ok(Response::new(Resp::default()));
+        };
+        let config = match decode_dynamic(&req.config, &ty) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to decode config", e.to_string()),
+                }))
+            }
+        };
+        let (diags, outs) = self
+            .run_diags("validate ephemeral config", handler.validate(config))
+            .await;
+        Ok(Response::new(Resp {
+            diagnostics: diags_with_warnings(diags, outs),
+        }))
+    }
+
+    async fn open_ephemeral_resource(
+        &self,
+        request: Request<tfplugin6::open_ephemeral_resource::Request>,
+    ) -> Result<Response<tfplugin6::open_ephemeral_resource::Response>, Status> {
+        use tfplugin6::open_ephemeral_resource::Response as Resp;
+        let req = request.into_inner();
+        tracing::debug!(type_name = %req.type_name, "OpenEphemeralResource");
+
+        let (Some(ty), Some(handler)) = (
+            self.provider.ephemeral_cty(&req.type_name),
+            self.provider.ephemeral_handler(&req.type_name),
+        ) else {
+            return Ok(Response::new(Resp {
+                diagnostics: unknown_ephemeral(&req.type_name),
+                ..Default::default()
+            }));
+        };
+
+        let config = match decode_dynamic(&req.config, &ty) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to decode ephemeral config", e.to_string()),
+                    ..Default::default()
+                }))
+            }
+        };
+
+        // Open starts fresh — there is no prior private state.
+        let (outcome, outs) = self
+            .run("open ephemeral resource", Vec::new(), handler.open(config))
+            .await;
+        let renew_at = outs.renew_at.map(to_timestamp);
+        match outcome {
+            Ok(result) => match encode_dynamic(&result, &ty) {
+                Ok(dv) => Ok(Response::new(Resp {
+                    result: Some(dv),
+                    private: outs.private_out,
+                    renew_at,
+                    diagnostics: pb_diagnostics(outs.warnings),
+                    ..Default::default()
+                })),
+                Err(e) => {
+                    let mut diagnostics = pb_diagnostics(outs.warnings);
+                    diagnostics.extend(error_diag(
+                        "failed to encode ephemeral result",
+                        e.to_string(),
+                    ));
+                    Ok(Response::new(Resp {
+                        diagnostics,
+                        ..Default::default()
+                    }))
+                }
+            },
+            Err(diags) => Ok(Response::new(Resp {
+                diagnostics: diags_with_warnings(diags, outs),
+                ..Default::default()
+            })),
+        }
+    }
+
+    async fn renew_ephemeral_resource(
+        &self,
+        request: Request<tfplugin6::renew_ephemeral_resource::Request>,
+    ) -> Result<Response<tfplugin6::renew_ephemeral_resource::Response>, Status> {
+        use tfplugin6::renew_ephemeral_resource::Response as Resp;
+        let req = request.into_inner();
+        tracing::debug!(type_name = %req.type_name, "RenewEphemeralResource");
+
+        let Some(handler) = self.provider.ephemeral_handler(&req.type_name) else {
+            return Ok(Response::new(Resp {
+                diagnostics: unknown_ephemeral(&req.type_name),
+                ..Default::default()
+            }));
+        };
+
+        // Renew receives only the private bytes (no config, no result).
+        let incoming = req.private.clone().unwrap_or_default();
+        let (outcome, outs) = self
+            .run("renew ephemeral resource", incoming, handler.renew())
+            .await;
+        let renew_at = outs.renew_at.map(to_timestamp);
+        match outcome {
+            // A handler that didn't rewrite private state keeps the incoming bytes,
+            // so the next renew/close still has the handle.
+            Ok(()) => Ok(Response::new(Resp {
+                private: outs.private_out.or(req.private),
+                renew_at,
+                diagnostics: pb_diagnostics(outs.warnings),
+            })),
+            Err(diags) => Ok(Response::new(Resp {
+                diagnostics: diags_with_warnings(diags, outs),
+                ..Default::default()
+            })),
+        }
+    }
+
+    async fn close_ephemeral_resource(
+        &self,
+        request: Request<tfplugin6::close_ephemeral_resource::Request>,
+    ) -> Result<Response<tfplugin6::close_ephemeral_resource::Response>, Status> {
+        use tfplugin6::close_ephemeral_resource::Response as Resp;
+        let req = request.into_inner();
+        tracing::debug!(type_name = %req.type_name, "CloseEphemeralResource");
+
+        let Some(handler) = self.provider.ephemeral_handler(&req.type_name) else {
+            return Ok(Response::new(Resp {
+                diagnostics: unknown_ephemeral(&req.type_name),
+            }));
+        };
+
+        let incoming = req.private.unwrap_or_default();
+        let (outcome, outs) = self
+            .run("close ephemeral resource", incoming, handler.close())
+            .await;
+        let diagnostics = match outcome {
+            Ok(()) => pb_diagnostics(outs.warnings),
+            Err(diags) => diags_with_warnings(diags, outs),
+        };
+        Ok(Response::new(Resp { diagnostics }))
+    }
+
     async fn import_resource_state(
         &self,
         request: Request<tfplugin6::import_resource_state::Request>,
@@ -733,10 +893,6 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         upgrade_resource_identity => upgrade_resource_identity,
         move_resource_state => move_resource_state,
         generate_resource_config => generate_resource_config,
-        validate_ephemeral_resource_config => validate_ephemeral_resource_config,
-        open_ephemeral_resource => open_ephemeral_resource,
-        renew_ephemeral_resource => renew_ephemeral_resource,
-        close_ephemeral_resource => close_ephemeral_resource,
         validate_list_resource_config => validate_list_resource_config,
         validate_state_store_config => validate_state_store,
         configure_state_store => configure_state_store,
@@ -959,6 +1115,7 @@ fn respond_state<R>(
     let CtxOutputs {
         warnings,
         private_out,
+        ..
     } = outs;
     let private = private_out.unwrap_or(private);
     let mut diagnostics = pb_diagnostics(warnings);
@@ -1024,4 +1181,30 @@ fn unknown_data_source(name: &str) -> Vec<tfplugin6::Diagnostic> {
         "unknown data source type",
         format!("the provider has no data source named `{name}`"),
     )
+}
+
+fn unknown_ephemeral(name: &str) -> Vec<tfplugin6::Diagnostic> {
+    error_diag(
+        "unknown ephemeral resource type",
+        format!("the provider has no ephemeral resource named `{name}`"),
+    )
+}
+
+/// Convert a [`SystemTime`](std::time::SystemTime) into the protocol's
+/// `google.protobuf.Timestamp`, for an ephemeral resource's `renew_at`. A
+/// renewal time is always in the future, so the pre-epoch branch is defensive.
+fn to_timestamp(t: std::time::SystemTime) -> prost_types::Timestamp {
+    match t.duration_since(std::time::SystemTime::UNIX_EPOCH) {
+        Ok(d) => prost_types::Timestamp {
+            seconds: d.as_secs() as i64,
+            nanos: d.subsec_nanos() as i32,
+        },
+        Err(e) => {
+            let d = e.duration();
+            prost_types::Timestamp {
+                seconds: -(d.as_secs() as i64),
+                nanos: -(d.subsec_nanos() as i32),
+            }
+        }
+    }
 }
