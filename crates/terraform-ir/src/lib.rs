@@ -82,6 +82,36 @@ pub struct ResourceSchema {
     pub version: i64,
     /// The resource's attribute/block structure.
     pub block: Block,
+    /// The resource's identity schema, if it declares one — a small, stable set
+    /// of attributes that uniquely identify the resource independent of its
+    /// config. `None` means the resource has no identity.
+    pub identity: Option<IdentitySchema>,
+}
+
+/// A resource's identity: a stable set of attributes that uniquely identify the
+/// resource, used for import-by-identity and tracking across config changes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IdentitySchema {
+    /// Bumped whenever the identity structure changes; Terraform calls
+    /// `UpgradeResourceIdentity` to migrate stored identity forward.
+    pub version: i64,
+    /// The attributes forming the identity.
+    pub attributes: Vec<IdentityAttribute>,
+}
+
+/// A single attribute within an [`IdentitySchema`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct IdentityAttribute {
+    /// Attribute name, matching the resource attribute it mirrors.
+    pub name: String,
+    /// The attribute's `cty` type.
+    pub ty: Type,
+    /// Human-readable description.
+    pub description: Option<String>,
+    /// The caller must supply this attribute to import by identity.
+    pub required_for_import: bool,
+    /// The caller may supply this attribute to import by identity.
+    pub optional_for_import: bool,
 }
 
 /// A data source type.

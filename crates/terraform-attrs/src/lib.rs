@@ -58,6 +58,12 @@ facet::define_attr_grammar! {
         /// shown to users: `#[facet(terraform::deprecated("use `foo` instead"))]`,
         /// or bare `#[facet(terraform::deprecated)]` for no message.
         Deprecated(Option<&'static str>),
+        /// Marks the attribute as part of the resource's **identity** — a stable
+        /// key (e.g. an ARN or ID) that identifies the resource independent of
+        /// its config. The field keeps its normal disposition; it is additionally
+        /// projected into the identity schema and the identity data the runtime
+        /// returns. Typically placed on a `computed` key.
+        Identity,
         /// A default applied during planning when the caller leaves this optional
         /// attribute unset. The payload is the default written as a string literal
         /// (`#[facet(terraform::default("us-east-1")]`); `terraform-reflect` parses

@@ -13,7 +13,9 @@
 use std::pin::Pin;
 
 use terraform_codec::{decode_json, decode_json_value, decode_msgpack, encode_msgpack, CodecError};
-use terraform_tfplugin6::{emit_functions, emit_metadata, emit_provider_schema, tfplugin6};
+use terraform_tfplugin6::{
+    emit_functions, emit_identity_schemas, emit_metadata, emit_provider_schema, tfplugin6,
+};
 use terraform_value::{Type, Value};
 use tokio_util::sync::CancellationToken;
 use tonic::codegen::tokio_stream::Stream;
@@ -996,8 +998,15 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         }
     }
 
+    async fn get_resource_identity_schemas(
+        &self,
+        _request: Request<tfplugin6::get_resource_identity_schemas::Request>,
+    ) -> Result<Response<tfplugin6::get_resource_identity_schemas::Response>, Status> {
+        tracing::debug!("GetResourceIdentitySchemas");
+        Ok(Response::new(emit_identity_schemas(self.provider.schema())))
+    }
+
     unimplemented_unary! {
-        get_resource_identity_schemas => get_resource_identity_schemas,
         upgrade_resource_identity => upgrade_resource_identity,
         generate_resource_config => generate_resource_config,
         validate_list_resource_config => validate_list_resource_config,

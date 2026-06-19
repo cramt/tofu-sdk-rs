@@ -3,8 +3,8 @@
 use facet::{Def, Facet, Field, PrimitiveType, Shape, Type as FType, UserType};
 use terraform_attrs::Attr as TfAttr;
 use terraform_ir::{
-    AttributeSchema, Block, DataSourceSchema, EphemeralSchema, FunctionSignature, NestedBlock,
-    NestingMode, Parameter, ResourceSchema,
+    AttributeSchema, Block, DataSourceSchema, EphemeralSchema, FunctionSignature,
+    IdentityAttribute, IdentitySchema, NestedBlock, NestingMode, Parameter, ResourceSchema,
 };
 use terraform_value::{Number, ObjectAttr, Type, Value};
 
@@ -88,7 +88,34 @@ pub fn reflect_resource<T: Facet<'static>>(
         name: name.into(),
         version: 0,
         block: reflect_block::<T>()?,
+        identity: identity_from_shape(T::SHAPE)?,
     })
+}
+
+/// Build a resource's [`IdentitySchema`] from its `#[facet(terraform::identity)]`
+/// fields. Returns `None` when the model marks no identity fields. Each marked
+/// field becomes a `required_for_import` identity attribute carrying the field's
+/// own `cty` type.
+fn identity_from_shape(shape: &'static Shape) -> Result<Option<IdentitySchema>, ReflectError> {
+    let mut attributes = Vec::new();
+    for field in struct_fields(shape)? {
+        if !field.has_attr(Some(NS), "identity") {
+            continue;
+        }
+        let name = field.rename.unwrap_or(field.name).to_string();
+        let ty = map_type(field.shape(), &name)?;
+        attributes.push(IdentityAttribute {
+            name,
+            ty,
+            description: description(field),
+            required_for_import: true,
+            optional_for_import: false,
+        });
+    }
+    Ok((!attributes.is_empty()).then_some(IdentitySchema {
+        version: 0,
+        attributes,
+    }))
 }
 
 /// The Terraform type name for a resource model: the explicit name from
@@ -1293,6 +1320,44 @@ mod tests {
         legacy_name: Option<String>,
         #[facet(terraform::deprecated)]
         old_flag: Option<bool>,
+    }
+
+    #[derive(Facet)]
+    #[facet(terraform::resource)]
+    #[allow(dead_code)]
+    struct IdentityModel {
+        name: String,
+        #[facet(terraform::computed)]
+        #[facet(terraform::identity)]
+        arn: String,
+    }
+
+    #[test]
+    fn identity_is_projected_from_marked_fields() {
+        let resource = reflect_resource::<IdentityModel>("identity_model").expect("reflects");
+        let identity = resource.identity.expect("declares an identity");
+        assert_eq!(identity.version, 0);
+        assert_eq!(identity.attributes.len(), 1, "only the marked field");
+        let arn = &identity.attributes[0];
+        assert_eq!(arn.name, "arn");
+        assert_eq!(
+            arn.ty,
+            Type::String,
+            "identity carries the field's cty type"
+        );
+        assert!(
+            arn.required_for_import,
+            "identity attributes are required for import by default"
+        );
+    }
+
+    #[test]
+    fn no_identity_marker_yields_no_identity_schema() {
+        let resource = reflect_resource::<Bucket>("aws_s3_bucket").expect("reflects");
+        assert!(
+            resource.identity.is_none(),
+            "a model without identity markers has no identity schema"
+        );
     }
 
     #[test]

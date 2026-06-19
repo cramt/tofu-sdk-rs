@@ -9,11 +9,13 @@
 use std::collections::HashMap;
 
 use terraform_ir::{
-    AttributeSchema, Block, FunctionSignature, NestedBlock, NestingMode, Parameter, ProviderSchema,
+    AttributeSchema, Block, FunctionSignature, IdentityAttribute, IdentitySchema, NestedBlock,
+    NestingMode, Parameter, ProviderSchema,
 };
 
 use crate::tfplugin6::{
-    self, function, get_metadata, get_provider_schema, schema, Function, ServerCapabilities,
+    self, function, get_metadata, get_provider_schema, get_resource_identity_schemas,
+    resource_identity_schema, schema, Function, ResourceIdentitySchema, ServerCapabilities,
     StringKind,
 };
 
@@ -64,6 +66,48 @@ pub fn emit_provider_schema(schema: &ProviderSchema) -> get_provider_schema::Res
         diagnostics: Vec::new(),
         provider_meta: None,
         server_capabilities: Some(server_capabilities()),
+    }
+}
+
+/// Build the `GetResourceIdentitySchemas` response: the identity schema of every
+/// resource that declares one (resources without an identity are omitted).
+pub fn emit_identity_schemas(schema: &ProviderSchema) -> get_resource_identity_schemas::Response {
+    get_resource_identity_schemas::Response {
+        identity_schemas: schema
+            .resources
+            .iter()
+            .filter_map(|r| {
+                r.identity
+                    .as_ref()
+                    .map(|identity| (r.name.clone(), emit_identity_schema(identity)))
+            })
+            .collect(),
+        diagnostics: Vec::new(),
+    }
+}
+
+/// Lower an IR [`IdentitySchema`] into a protocol [`ResourceIdentitySchema`].
+fn emit_identity_schema(identity: &IdentitySchema) -> ResourceIdentitySchema {
+    ResourceIdentitySchema {
+        version: identity.version,
+        identity_attributes: identity
+            .attributes
+            .iter()
+            .map(emit_identity_attribute)
+            .collect(),
+    }
+}
+
+/// Lower an IR [`IdentityAttribute`] into its protocol form.
+fn emit_identity_attribute(
+    attr: &IdentityAttribute,
+) -> resource_identity_schema::IdentityAttribute {
+    resource_identity_schema::IdentityAttribute {
+        name: attr.name.clone(),
+        r#type: attr.ty.to_cty_json_bytes(),
+        required_for_import: attr.required_for_import,
+        optional_for_import: attr.optional_for_import,
+        description: attr.description.clone().unwrap_or_default(),
     }
 }
 

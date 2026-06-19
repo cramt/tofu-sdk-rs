@@ -688,6 +688,9 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
             name: name.clone(),
             version,
             block,
+            // The dynamic seam carries no identity; identity is a reflection-only
+            // projection today.
+            identity: None,
         });
         self.resources.insert(name, handler);
         self

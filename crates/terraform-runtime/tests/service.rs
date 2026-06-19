@@ -2345,3 +2345,59 @@ async fn move_resource_state_unsupported_yields_diagnostic() {
     );
     assert!(resp.target_state.is_none());
 }
+
+/// A resource that declares a resource **identity** (the computed `id`). Proves
+/// `GetResourceIdentitySchemas` reports the reflected identity schema.
+#[derive(Facet)]
+#[facet(terraform::resource("ident_widget"))]
+#[allow(dead_code)]
+struct IdentWidget {
+    name: String,
+    #[facet(terraform::computed)]
+    #[facet(terraform::identity)]
+    id: String,
+}
+
+struct IdentWidgetResource;
+
+#[async_trait]
+impl Resource for IdentWidgetResource {
+    type Model = IdentWidget;
+
+    async fn create(
+        &self,
+        _ctx: &mut Ctx,
+        planned: IdentWidget,
+    ) -> Result<IdentWidget, ResourceError> {
+        Ok(planned)
+    }
+}
+
+#[tokio::test]
+async fn get_resource_identity_schemas_reports_declared_identity() {
+    let svc = Provider::builder()
+        .resource(IdentWidgetResource)
+        .build()
+        .map(ProviderService::new)
+        .expect("provider builds");
+
+    let resp = svc
+        .get_resource_identity_schemas(Request::new(
+            tfplugin6::get_resource_identity_schemas::Request::default(),
+        ))
+        .await
+        .expect("identity schemas")
+        .into_inner();
+
+    assert!(resp.diagnostics.is_empty(), "{:?}", resp.diagnostics);
+    let identity = resp
+        .identity_schemas
+        .get("ident_widget")
+        .expect("ident_widget has an identity schema");
+    assert_eq!(identity.identity_attributes.len(), 1);
+    assert_eq!(identity.identity_attributes[0].name, "id");
+    assert!(
+        identity.identity_attributes[0].required_for_import,
+        "identity attribute is required for import"
+    );
+}
