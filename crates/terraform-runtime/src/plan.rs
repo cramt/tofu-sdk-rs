@@ -22,7 +22,7 @@ use terraform_tfplugin6::tfplugin6::{
 };
 use terraform_value::Value;
 
-use crate::resource::PlanModifications;
+use crate::resource::{Path, PathStep, PlanModifications};
 
 /// The outcome of planning a single resource change.
 pub struct Plan {
@@ -68,7 +68,7 @@ fn requires_replace(prior: &Value, proposed: &Value, block: &Block) -> Vec<Attri
         let before = prior_fields.get(&attr.name);
         let after = proposed_fields.get(&attr.name);
         if before != after {
-            paths.push(attribute_path(&attr.name));
+            paths.push(to_attribute_path(&Path::from(attr.name.as_str())));
         }
     }
     paths
@@ -145,31 +145,66 @@ fn mark_block_computed_unknown(
 }
 
 /// Apply a resource's [`PlanModifications`] to the mechanically-produced plan:
-/// mark named top-level attributes unknown and add `require_replace` paths
-/// (deduped against the mechanical ones).
+/// mark the targeted attributes unknown (walking into nested blocks/collections)
+/// and add `require_replace` paths (deduped against the mechanical ones).
 pub fn apply_modifications(plan: &mut Plan, mods: PlanModifications) {
-    if let Value::Object(fields) = &mut plan.planned {
-        for name in &mods.unknown {
-            if fields.contains_key(name) {
-                fields.insert(name.clone(), Value::Unknown);
-            }
-        }
+    for path in &mods.unknown {
+        set_at_path(&mut plan.planned, &path.0, Value::Unknown);
     }
-    for name in mods.require_replace {
-        let path = attribute_path(&name);
-        if !plan.requires_replace.contains(&path) {
-            plan.requires_replace.push(path);
+    for path in &mods.require_replace {
+        let attribute_path = to_attribute_path(path);
+        if !plan.requires_replace.contains(&attribute_path) {
+            plan.requires_replace.push(attribute_path);
         }
     }
 }
 
-/// A single-step path to a top-level attribute.
-fn attribute_path(name: &str) -> AttributePath {
-    AttributePath {
-        steps: vec![Step {
-            selector: Some(Selector::AttributeName(name.to_string())),
-        }],
+/// Walk `value` along `steps` and overwrite the addressed leaf with `leaf`. A
+/// step that doesn't resolve against the value's shape (missing key, wrong
+/// container, out-of-bounds index) is a silent no-op — the planned value is left
+/// untouched, matching the mechanical pass's tolerance of absent attributes.
+fn set_at_path(value: &mut Value, steps: &[PathStep], leaf: Value) {
+    let Some((step, rest)) = steps.split_first() else {
+        *value = leaf;
+        return;
+    };
+    match (step, value) {
+        (PathStep::Attribute(name), Value::Object(fields)) => {
+            if let Some(child) = fields.get_mut(name) {
+                set_at_path(child, rest, leaf);
+            }
+        }
+        (PathStep::Index(index), Value::List(items) | Value::Set(items)) => {
+            if let Ok(index) = usize::try_from(*index) {
+                if let Some(child) = items.get_mut(index) {
+                    set_at_path(child, rest, leaf);
+                }
+            }
+        }
+        (PathStep::Key(key), Value::Map(entries)) => {
+            if let Some(child) = entries.get_mut(key) {
+                set_at_path(child, rest, leaf);
+            }
+        }
+        _ => {}
     }
+}
+
+/// Convert a public [`Path`] into the protocol [`AttributePath`] Terraform reads
+/// for `requires_replace`.
+fn to_attribute_path(path: &Path) -> AttributePath {
+    let steps = path
+        .0
+        .iter()
+        .map(|step| Step {
+            selector: Some(match step {
+                PathStep::Attribute(name) => Selector::AttributeName(name.clone()),
+                PathStep::Index(index) => Selector::ElementKeyInt(*index),
+                PathStep::Key(key) => Selector::ElementKeyString(key.clone()),
+            }),
+        })
+        .collect();
+    AttributePath { steps }
 }
 
 #[cfg(test)]
@@ -396,6 +431,128 @@ mod tests {
         assert!(
             fields(&items[0])["id"].is_unknown(),
             "on replace, computed-in-block goes unknown even with a prior value"
+        );
+    }
+
+    #[test]
+    fn modification_marks_top_level_attribute_unknown() {
+        // A bare name (via From<&str>) still targets a top-level attribute.
+        let mut plan = plan(
+            &Value::Null,
+            obj(&[
+                ("name", Value::String("a".into())),
+                ("arn", Value::String("known".into())),
+            ]),
+            &block(),
+        );
+        apply_modifications(&mut plan, PlanModifications::new().unknown("arn"));
+        assert!(fields(&plan.planned)["arn"].is_unknown());
+    }
+
+    #[test]
+    fn modification_marks_nested_block_attribute_unknown() {
+        // settings[0].id is a *known* value the rule decides must be recomputed.
+        let settings = Value::List(vec![obj(&[
+            ("key", Value::String("k".into())),
+            ("id", Value::String("known".into())),
+        ])]);
+        let mut plan = plan(
+            &Value::Null,
+            obj(&[("name", Value::String("a".into())), ("settings", settings)]),
+            &block_with_nested(),
+        );
+
+        apply_modifications(
+            &mut plan,
+            PlanModifications::new()
+                .unknown(Path::root().attribute("settings").index(0).attribute("id")),
+        );
+
+        let Value::List(items) = &fields(&plan.planned)["settings"] else {
+            panic!("settings should be a list");
+        };
+        assert!(
+            fields(&items[0])["id"].is_unknown(),
+            "the nested id should be marked unknown by path"
+        );
+        assert_eq!(
+            fields(&items[0])["key"],
+            Value::String("k".into()),
+            "siblings untouched"
+        );
+    }
+
+    #[test]
+    fn modification_with_unresolvable_path_is_a_noop() {
+        let mut plan = plan(
+            &Value::Null,
+            obj(&[("name", Value::String("a".into()))]),
+            &block(),
+        );
+        let before = plan.planned.clone();
+        // Index into a non-list, and a missing attribute: both silently skipped.
+        apply_modifications(
+            &mut plan,
+            PlanModifications::new()
+                .unknown(Path::root().attribute("name").index(3))
+                .unknown("does_not_exist"),
+        );
+        assert_eq!(
+            plan.planned, before,
+            "unresolvable paths leave the plan as-is"
+        );
+    }
+
+    #[test]
+    fn modification_require_replace_targets_nested_path() {
+        let mut plan = plan(
+            &Value::Null,
+            obj(&[("name", Value::String("a".into()))]),
+            &block(),
+        );
+        apply_modifications(
+            &mut plan,
+            PlanModifications::new()
+                .require_replace(Path::root().attribute("settings").index(0).attribute("id")),
+        );
+        assert_eq!(plan.requires_replace.len(), 1);
+        let steps = &plan.requires_replace[0].steps;
+        assert_eq!(steps.len(), 3);
+        assert!(matches!(
+            steps[0].selector,
+            Some(Selector::AttributeName(ref n)) if n == "settings"
+        ));
+        assert!(matches!(
+            steps[1].selector,
+            Some(Selector::ElementKeyInt(0))
+        ));
+        assert!(matches!(
+            steps[2].selector,
+            Some(Selector::AttributeName(ref n)) if n == "id"
+        ));
+    }
+
+    #[test]
+    fn require_replace_dedupes_against_mechanical_paths() {
+        let prior = obj(&[
+            ("name", Value::String("a".into())),
+            ("arn", Value::Null),
+            ("note", Value::Null),
+        ]);
+        // name (force_new) changes -> mechanical requires_replace on `name`.
+        let proposed = obj(&[
+            ("name", Value::String("b".into())),
+            ("arn", Value::Null),
+            ("note", Value::Null),
+        ]);
+        let mut plan = plan(&prior, proposed, &block());
+        assert_eq!(plan.requires_replace.len(), 1);
+        // The author also asks to replace on `name`: deduped, not doubled.
+        apply_modifications(&mut plan, PlanModifications::new().require_replace("name"));
+        assert_eq!(
+            plan.requires_replace.len(),
+            1,
+            "duplicate path not added twice"
         );
     }
 

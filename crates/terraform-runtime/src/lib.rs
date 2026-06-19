@@ -29,7 +29,7 @@ pub use ctx::Ctx;
 pub use data_source::{DataSource, DataSourceError, DataSourceList};
 pub use ephemeral::{Ephemeral, EphemeralError, EphemeralFromResource};
 pub use function::{Function, FunctionError, VariadicFunction};
-pub use resource::{PlanModifications, Resource, ResourceError};
+pub use resource::{Path, PathStep, PlanModifications, Resource, ResourceError};
 pub use serve::{serve, ServeError};
 
 /// The erased, `Value`-oriented handler traits and diagnostic types. These are

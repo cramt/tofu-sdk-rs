@@ -28,9 +28,10 @@ e2e). Tier 1.2 shipped its three pieces: attribute defaults, `Resource::
 modify_plan`, computed-attr-in-block consistency, and the `TfValue<T>` field
 wrapper (known/unknown/null preserved through decode).
 
-Remaining caveats (additive, not part of the landed cut): `modify_plan` operates
-on top-level attribute names and decodes the proposed model through the
-zero-value rule (use `TfValue<T>` fields to read unknowns).
+Remaining caveats (additive, not part of the landed cut): `modify_plan` decodes
+the proposed model through the zero-value rule (use `TfValue<T>` fields to read
+unknowns); its `PlanModifications` now target attribute `Path`s, so nested
+attributes are reachable (see **3.5**).
 
 The **handler `Ctx`** (`terraform-runtime/src/ctx.rs`) now unifies what used to be
 a list of separate gaps: every handler takes `ctx: &mut Ctx`, giving it
@@ -56,10 +57,11 @@ Rough priority order, each pointing at its tracked item:
    Ctx`; `ctx.warn(...)` surfaces a warning alongside a *successful* apply/read,
    and `ctx.private`/`ctx.set_private` carry per-resource private state. The same
    `Ctx` also exposes cancellation. → **2.2** + the handler-ctx keystone.
-3. **Plan modification depth.** `modify_plan` sees top-level attribute names only
-   and decodes the proposed model via the zero-value rule. Real plan logic
-   (diff suppression, nested computed-by-rule, known-after-apply on nested
-   attributes) needs richer typed access. → new **3.5**.
+3. ~~**Plan modification depth.**~~ ✅ **DONE** — `PlanModifications` now targets
+   attribute `Path`s (`Attribute`/`Index`/`Key` steps), so `modify_plan` can
+   force-replace or mark unknown a *nested* attribute (inside a block or
+   collection), not just a top-level one. Known/unknown access stays via
+   `TfValue<T>` fields. → **3.5**.
 4. **Semantic equality / normalization.** No hook to treat
    differently-encoded-but-equal values (reordered JSON, equivalent set
    ordering, case-insensitive IDs) as unchanged, so providers surface spurious
@@ -339,26 +341,36 @@ via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`)
   validated/used but never persisted to state). (Required-block `min_items` is
   done — see 3.7 / nested-block fidelity.)
 
-### 3.5 Plan modification depth
-- **Why:** `Resource::modify_plan` today operates on **top-level attribute
-  names** only (`PlanModifications` holds bare names) and decodes the proposed
-  model through the zero-value rule, so it can't express nested plan logic:
-  diff suppression on a sub-attribute, computed-by-rule inside a block, or
-  known-after-apply on a nested field. Real resources need this.
-- **Current:** `PlanModifications` (`resource.rs`) carries top-level
-  `require_replace`/`unknown` attribute names; `apply_modifications`
-  (`plan.rs`) applies them at the top level; the proposed model is decoded via
-  the zero-value rule unless fields are typed `TfValue<T>`.
-- **Approach:** let plan modifications target `AttributePath`s (not just names),
-  and give `modify_plan` typed access to prior/config/proposed with the
-  known/unknown distinction preserved (the `TfValue<T>` machinery already
-  exists; thread it through the ctx). This is a `DynResource` shape change —
-  keep the method defaulted so the Node binding is unaffected.
-- **Verify:** `plan.rs` unit test marking a nested attribute unknown / forcing
-  replace on a nested-block change; a `harness/` config proving a suppressed
-  nested diff doesn't trip "inconsistent result after apply".
-- **Done when:** a resource can adjust the plan of a nested attribute, not just a
-  top-level one.
+### 3.5 Plan modification depth — ✅ DONE
+- **Done:** `PlanModifications` (`resource.rs`) now targets attribute **`Path`s**
+  instead of bare names. A `Path` is a sequence of `PathStep`s
+  (`Attribute(name)` / `Index(i)` / `Key(k)`) built fluently
+  (`Path::root().attribute("settings").index(0).attribute("id")`); `From<&str>`/
+  `From<String>` keep the common top-level case ergonomic, so existing
+  `require_replace("tier")` / `unknown("foo")` call sites are unchanged.
+  `apply_modifications` (`plan.rs`) walks `plan.planned` along each unknown path
+  via `set_at_path` (a step that doesn't resolve is a silent no-op) and converts
+  each `require_replace` path to a protocol `AttributePath` via `to_attribute_path`
+  (deduped against the mechanical `force_new` paths). `Path`/`PathStep` are
+  re-exported from `terraform_runtime`. The `DynResource::modify_plan` signature
+  is unchanged (it already passed `Value`s), so the **Node binding is
+  unaffected**.
+- **Typed unknown access:** preserved as before via `TfValue<T>` fields — a model
+  field typed `TfValue<T>` decodes known/unknown/null faithfully inside
+  `modify_plan`, so a rule can branch on whether a value is yet known. (Plain
+  fields still zero-value-decode.)
+- **Verified:** `plan.rs` unit tests (`modification_marks_nested_block_attribute_unknown`,
+  `modification_require_replace_targets_nested_path`,
+  `modification_with_unresolvable_path_is_a_noop`,
+  `require_replace_dedupes_against_mechanical_paths`, plus the top-level
+  back-compat case) and an end-to-end service test
+  (`modify_plan_marks_nested_block_attribute_unknown` in
+  `terraform-runtime/tests/service.rs`) that drives `PlanResourceChange` and
+  asserts `settings[0].id` comes back unknown through the encode round-trip.
+- **Not in scope (separate items):** diff-suppression / "keep prior value" is the
+  normalization concern of 3.6 (deliberately not done — handled by correct data
+  modeling); passing the raw `config` (distinct from `proposed`) into
+  `modify_plan` was not needed and is left out.
 
 ### 3.6 Semantic equality / normalization
 - **Why:** Terraform diffs by structural value equality. Providers routinely need

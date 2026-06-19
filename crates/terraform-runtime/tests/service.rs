@@ -12,8 +12,8 @@ use facet::Facet;
 use terraform_attrs as terraform;
 use terraform_runtime::{
     async_trait, ConfigureError, Ctx, DataSource, DataSourceError, DataSourceList, Diag, Ephemeral,
-    EphemeralError, EphemeralFromResource, PlanModifications, Provider, ProviderService, Resource,
-    ResourceError,
+    EphemeralError, EphemeralFromResource, Path, PlanModifications, Provider, ProviderService,
+    Resource, ResourceError,
 };
 use terraform_tfplugin6::tfplugin6::{self, provider_server::Provider as _};
 use tonic::{Code, Request};
@@ -282,6 +282,144 @@ async fn modify_plan_can_force_replacement() {
         "no tier change, no replace: {:?}",
         plan.requires_replace
     );
+}
+
+/// A resource with a `settings` list block carrying a computed `id`, whose
+/// `modify_plan` marks the *nested* `settings[0].id` unknown by path — proving a
+/// plan modification can reach inside a block, not just a top-level attribute,
+/// and that it survives the `PlanResourceChange` encode round-trip.
+#[derive(Facet)]
+#[facet(terraform::resource("planmod_nested"))]
+#[allow(dead_code)]
+struct PlanModNested {
+    name: String,
+    #[facet(terraform::block)]
+    settings: Vec<Setting>,
+}
+
+#[derive(Facet)]
+#[allow(dead_code)]
+struct Setting {
+    key: String,
+    #[facet(terraform::computed)]
+    id: String,
+}
+
+struct PlanModNestedResource;
+
+#[async_trait]
+impl Resource for PlanModNestedResource {
+    type Model = PlanModNested;
+
+    async fn create(
+        &self,
+        _ctx: &mut Ctx,
+        planned: PlanModNested,
+    ) -> Result<PlanModNested, ResourceError> {
+        Ok(planned)
+    }
+
+    async fn modify_plan(
+        &self,
+        _ctx: &mut Ctx,
+        _prior: Option<PlanModNested>,
+        _proposed: PlanModNested,
+    ) -> Result<PlanModifications, ResourceError> {
+        // Recompute the first setting's id by rule, addressing it by nested path.
+        Ok(PlanModifications::new()
+            .unknown(Path::root().attribute("settings").index(0).attribute("id")))
+    }
+}
+
+#[tokio::test]
+async fn modify_plan_marks_nested_block_attribute_unknown() {
+    let svc = Provider::builder()
+        .resource(PlanModNestedResource)
+        .build()
+        .map(ProviderService::new)
+        .expect("provider builds");
+
+    // The resource's cty type, with `settings` a list(object({key, id})).
+    let setting_ty = terraform_value::Type::Object(vec![
+        terraform_value::ObjectAttr {
+            name: "key".into(),
+            ty: terraform_value::Type::String,
+            optional: false,
+        },
+        terraform_value::ObjectAttr {
+            name: "id".into(),
+            ty: terraform_value::Type::String,
+            optional: false,
+        },
+    ]);
+    let ty = terraform_value::Type::Object(vec![
+        terraform_value::ObjectAttr {
+            name: "name".into(),
+            ty: terraform_value::Type::String,
+            optional: false,
+        },
+        terraform_value::ObjectAttr {
+            name: "settings".into(),
+            ty: terraform_value::Type::list(setting_ty.clone()),
+            optional: false,
+        },
+    ]);
+
+    // A create (null prior) carrying a *known* settings[0].id; the rule should
+    // overwrite it with unknown.
+    let mut setting = std::collections::BTreeMap::new();
+    setting.insert(
+        "key".to_string(),
+        terraform_value::Value::String("k".into()),
+    );
+    setting.insert(
+        "id".to_string(),
+        terraform_value::Value::String("known".into()),
+    );
+    let mut obj = std::collections::BTreeMap::new();
+    obj.insert(
+        "name".to_string(),
+        terraform_value::Value::String("a".into()),
+    );
+    obj.insert(
+        "settings".to_string(),
+        terraform_value::Value::List(vec![terraform_value::Value::Object(setting)]),
+    );
+    let proposed = tfplugin6::DynamicValue {
+        msgpack: terraform_codec::encode_msgpack(&terraform_value::Value::Object(obj), &ty)
+            .unwrap(),
+        json: vec![],
+    };
+
+    let plan = svc
+        .plan_resource_change(Request::new(tfplugin6::plan_resource_change::Request {
+            type_name: "planmod_nested".into(),
+            prior_state: None,
+            proposed_new_state: Some(proposed),
+            ..Default::default()
+        }))
+        .await
+        .expect("plan")
+        .into_inner();
+    assert!(plan.diagnostics.is_empty(), "{:?}", plan.diagnostics);
+
+    // Decode the planned new state and assert settings[0].id came back unknown.
+    let planned = plan.planned_state.expect("planned new state");
+    let planned = terraform_codec::decode_msgpack(&planned.msgpack, &ty).expect("decode planned");
+    let terraform_value::Value::Object(fields) = planned else {
+        panic!("planned should be an object");
+    };
+    let terraform_value::Value::List(items) = &fields["settings"] else {
+        panic!("settings should be a list");
+    };
+    let terraform_value::Value::Object(first) = &items[0] else {
+        panic!("settings[0] should be an object");
+    };
+    assert!(
+        first["id"].is_unknown(),
+        "settings[0].id should be planned unknown by the nested path modification"
+    );
+    assert_eq!(first["key"], terraform_value::Value::String("k".into()));
 }
 
 /// A resource whose `create` records whether it observed cancellation, proving

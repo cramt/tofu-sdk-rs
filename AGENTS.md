@@ -193,9 +193,14 @@ it; keep it static. The preset is exposed via the package.json `exports` subpath
   are now `PartialEq` but **not `Eq`** (an `AttributeSchema.default` holds a
   `Value`, hence `f64`).
 - **`Resource::modify_plan`** runs after the mechanical plan and returns
-  `PlanModifications` (top-level attr names to force-replace / mark unknown). It
-  is a defaulted `DynResource` method, so the Node binding and other seam
-  implementors need no change.
+  `PlanModifications` — attribute **`Path`s** to force-replace / mark unknown
+  (`Path::root().attribute(..).index(..).key(..)`; a bare `&str`/`String` is the
+  top-level case via `From`). `apply_modifications` (`plan.rs`) walks the planned
+  `Value` along each path (`set_at_path`; unresolvable steps are no-ops) and emits
+  protocol `AttributePath`s for replacements. The `DynResource::modify_plan`
+  signature still passes `Value`s, so it stays a defaulted seam method — the Node
+  binding and other seam implementors need no change. (Read the known/unknown/null
+  distinction inside `modify_plan` by typing the field `TfValue<T>`.)
 - **Numbers are `Value::Number(Number)` where `Number` is `I64 | U64 | F64`**
   (`terraform-value`). The full signed+unsigned 64-bit integer range round-trips
   losslessly through msgpack and cty JSON; only truly arbitrary precision (beyond

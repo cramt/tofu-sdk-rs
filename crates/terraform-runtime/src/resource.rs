@@ -172,18 +172,78 @@ impl From<ResourceError> for Diagnostics {
 /// A collection of diagnostics returned from an erased resource operation.
 pub type Diagnostics = Vec<Diag>;
 
+/// One step in an attribute [`Path`]: into an object attribute / block field by
+/// name, into a list or set element by index, or into a map entry by key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathStep {
+    /// Descend into an object attribute or block field by name.
+    Attribute(String),
+    /// Descend into a list or set element by index.
+    Index(i64),
+    /// Descend into a map entry by key.
+    Key(String),
+}
+
+/// A path to a (possibly nested) attribute within a resource's planned value — a
+/// sequence of [`PathStep`]s from the root object. A bare attribute name (via
+/// `From<&str>`/`From<String>`) is the common single-step top-level case, so
+/// `"tier"` and `Path::root().attribute("tier")` are equivalent; build deeper
+/// paths to reach inside nested blocks (`settings[0].id`) or collections.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Path(pub Vec<PathStep>);
+
+impl Path {
+    /// An empty path (the root object). Extend it with
+    /// [`attribute`](Path::attribute) / [`index`](Path::index) /
+    /// [`key`](Path::key).
+    pub fn root() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Descend into an object attribute or block field by name.
+    pub fn attribute(mut self, name: impl Into<String>) -> Self {
+        self.0.push(PathStep::Attribute(name.into()));
+        self
+    }
+
+    /// Descend into a list or set element by index.
+    pub fn index(mut self, index: i64) -> Self {
+        self.0.push(PathStep::Index(index));
+        self
+    }
+
+    /// Descend into a map entry by key.
+    pub fn key(mut self, key: impl Into<String>) -> Self {
+        self.0.push(PathStep::Key(key.into()));
+        self
+    }
+}
+
+impl From<&str> for Path {
+    fn from(name: &str) -> Self {
+        Path::root().attribute(name)
+    }
+}
+
+impl From<String> for Path {
+    fn from(name: String) -> Self {
+        Path::root().attribute(name)
+    }
+}
+
 /// Adjustments a resource's [`Resource::modify_plan`] makes to the
 /// mechanically-produced plan: extra attributes to force replacement, and
-/// computed attributes to mark unknown by custom rule. Both name **top-level**
-/// attributes (nested-block paths are a future refinement).
+/// attributes to mark unknown by custom rule. Each targets an attribute
+/// [`Path`], so a nested attribute (inside a block, list, set, or map) can be
+/// reached — a bare name still works for the common top-level case.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlanModifications {
-    /// Top-level attribute names whose planned change should force replacement,
-    /// in addition to the `force_new` attributes handled mechanically.
-    pub require_replace: Vec<String>,
-    /// Top-level attribute names to mark unknown in the planned state (a value
-    /// the provider will compute by rule during apply).
-    pub unknown: Vec<String>,
+    /// Attribute paths whose planned change should force replacement, in addition
+    /// to the `force_new` attributes handled mechanically.
+    pub require_replace: Vec<Path>,
+    /// Attribute paths to mark unknown in the planned state (a value the provider
+    /// will compute by rule during apply).
+    pub unknown: Vec<Path>,
 }
 
 impl PlanModifications {
@@ -192,15 +252,17 @@ impl PlanModifications {
         Self::default()
     }
 
-    /// Force replacement when the named top-level attribute changes.
-    pub fn require_replace(mut self, name: impl Into<String>) -> Self {
-        self.require_replace.push(name.into());
+    /// Force replacement when the attribute at `path` changes. A bare name
+    /// targets a top-level attribute; build a [`Path`] to target a nested one.
+    pub fn require_replace(mut self, path: impl Into<Path>) -> Self {
+        self.require_replace.push(path.into());
         self
     }
 
-    /// Mark the named top-level attribute unknown in the plan.
-    pub fn unknown(mut self, name: impl Into<String>) -> Self {
-        self.unknown.push(name.into());
+    /// Mark the attribute at `path` unknown in the plan. A bare name targets a
+    /// top-level attribute; build a [`Path`] to target a nested one.
+    pub fn unknown(mut self, path: impl Into<Path>) -> Self {
+        self.unknown.push(path.into());
         self
     }
 }
@@ -291,13 +353,17 @@ pub trait Resource: Send + Sync + 'static {
 
     /// Adjust the plan after the SDK's mechanical pass (defaults applied,
     /// `force_new` replacements and computed-unknowns marked). Return
-    /// [`PlanModifications`] to force replacement by custom rule or mark a
-    /// computed attribute unknown.
+    /// [`PlanModifications`] to force replacement by custom rule or mark an
+    /// attribute unknown — each targeting an attribute [`Path`], so a nested
+    /// attribute (inside a block or collection) can be reached, not just a
+    /// top-level one.
     ///
     /// `prior` is the current state (`None` on create); `proposed` is the planned
-    /// model. Note both decode through the zero-value rule, so a computed field
-    /// that planned as *unknown* reads here as its zero value — compare the
-    /// config-driven fields, not computed ones. Defaults to no modifications.
+    /// model. Both decode through the zero-value rule, so a computed field that
+    /// planned as *unknown* reads here as its zero value — to read the
+    /// known/unknown/null distinction (e.g. to drive a plan decision off whether a
+    /// value is yet known), type that field [`TfValue<T>`](terraform_value::TfValue).
+    /// Defaults to no modifications.
     async fn modify_plan(
         &self,
         _ctx: &mut Ctx,
