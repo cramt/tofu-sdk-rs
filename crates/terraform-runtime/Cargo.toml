@@ -7,7 +7,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-facet = { workspace = true }
+# `reflect` gives `Partial` (used by the semantic-equality spike to canonicalize a
+# string attribute through its type's own `parse`/`display` vtable).
+facet = { workspace = true, features = ["reflect"] }
 terraform-value = { workspace = true }
 terraform-ir = { workspace = true }
 terraform-reflect = { workspace = true }

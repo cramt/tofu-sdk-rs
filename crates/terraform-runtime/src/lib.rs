@@ -15,6 +15,8 @@ mod ephemeral;
 mod function;
 pub mod handshake;
 mod log;
+// Semantic-equality spike: diff suppression derived from a field's quotient type.
+mod normalize;
 mod plan;
 mod resource;
 mod serve;
