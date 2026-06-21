@@ -11,9 +11,9 @@ use std::sync::Arc;
 use facet::Facet;
 use terraform_attrs as terraform;
 use terraform_runtime::{
-    async_trait, ConfigureError, Ctx, DataSource, DataSourceError, DataSourceList, Diag, Ephemeral,
-    EphemeralError, EphemeralFromResource, Path, PlanModifications, Provider, ProviderService,
-    Resource, ResourceError,
+    async_trait, string_quotient, Canon, ConfigureError, Ctx, DataSource, DataSourceError,
+    DataSourceList, Diag, Ephemeral, EphemeralError, EphemeralFromResource, Path,
+    PlanModifications, Provider, ProviderService, Resource, ResourceError,
 };
 use terraform_tfplugin6::tfplugin6::{self, provider_server::Provider as _};
 use tonic::{Code, Request};
@@ -279,6 +279,116 @@ async fn modify_plan_can_force_replacement() {
         plan.requires_replace.is_empty(),
         "no tier change, no replace: {:?}",
         plan.requires_replace
+    );
+}
+
+/// A case-insensitive identifier — a *quotient* type whose canonical
+/// representative is the lowercased form. Only its `TryFrom` conversions are used
+/// (by `string_quotient`); the model field stays a plain `String` (the wire type),
+/// since the codec can't decode an `opaque+proxy` type yet.
+struct CiId(String);
+#[allow(clippy::infallible_try_from)]
+impl TryFrom<String> for CiId {
+    type Error = std::convert::Infallible;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Ok(CiId(s.to_lowercase()))
+    }
+}
+#[allow(clippy::infallible_try_from)]
+impl TryFrom<&CiId> for String {
+    type Error = std::convert::Infallible;
+    fn try_from(id: &CiId) -> Result<Self, Self::Error> {
+        Ok(id.0.clone())
+    }
+}
+
+/// A resource whose `force_new` `id` is case-insensitive in meaning.
+#[derive(Facet)]
+#[facet(terraform::resource("ci_thing"))]
+#[allow(dead_code)]
+struct CiThing {
+    #[facet(terraform::force_new)]
+    id: String,
+}
+
+struct CiResource;
+
+#[async_trait]
+impl Resource for CiResource {
+    type Model = CiThing;
+
+    async fn create(&self, _ctx: &mut Ctx, planned: CiThing) -> Result<CiThing, ResourceError> {
+        Ok(planned)
+    }
+
+    fn semantic_equality(&self) -> Canon {
+        Canon::new().with("id", string_quotient::<CiId>())
+    }
+}
+
+#[tokio::test]
+async fn semantic_equality_suppresses_spurious_replacement_in_plan() {
+    let svc = Provider::builder()
+        .resource(CiResource)
+        .build()
+        .map(ProviderService::new)
+        .expect("provider builds");
+
+    let ty = terraform_value::Type::Object(vec![terraform_value::ObjectAttr {
+        name: "id".into(),
+        ty: terraform_value::Type::String,
+        optional: false,
+    }]);
+    let state = |id: &str| {
+        let mut obj = std::collections::BTreeMap::new();
+        obj.insert("id".to_string(), terraform_value::Value::String(id.into()));
+        tfplugin6::DynamicValue {
+            msgpack: terraform_codec::encode_msgpack(&terraform_value::Value::Object(obj), &ty)
+                .unwrap(),
+            json: vec![],
+        }
+    };
+
+    // Case-only change to the force_new `id`: semantically equal → no replacement.
+    let plan = svc
+        .plan_resource_change(Request::new(tfplugin6::plan_resource_change::Request {
+            type_name: "ci_thing".into(),
+            prior_state: Some(state("aBc")),
+            proposed_new_state: Some(state("ABC")),
+            ..Default::default()
+        }))
+        .await
+        .expect("plan")
+        .into_inner();
+    assert!(plan.diagnostics.is_empty(), "{:?}", plan.diagnostics);
+    assert!(
+        plan.requires_replace.is_empty(),
+        "case-only change is semantically equal → no replacement: {:?}",
+        plan.requires_replace
+    );
+    // And the planned state keeps the prior bytes verbatim (store-raw).
+    let planned = plan.planned_state.expect("planned state");
+    let planned = terraform_codec::decode_msgpack(&planned.msgpack, &ty).expect("decode planned");
+    let terraform_value::Value::Object(fields) = planned else {
+        panic!("planned state should be an object");
+    };
+    assert_eq!(fields["id"], terraform_value::Value::String("aBc".into()));
+
+    // A genuinely different id: not equal → replacement still fires.
+    let plan = svc
+        .plan_resource_change(Request::new(tfplugin6::plan_resource_change::Request {
+            type_name: "ci_thing".into(),
+            prior_state: Some(state("aBc")),
+            proposed_new_state: Some(state("xyz")),
+            ..Default::default()
+        }))
+        .await
+        .expect("plan")
+        .into_inner();
+    assert_eq!(
+        plan.requires_replace.len(),
+        1,
+        "a real id change still forces replacement"
     );
 }
 

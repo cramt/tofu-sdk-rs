@@ -190,9 +190,15 @@ mod tests {
     #[test]
     fn quotient_canonicalizes_via_the_types_own_conversions() {
         let canon = string_quotient::<CiId>();
-        assert_eq!(canon(&Value::String("AbC".into())), Value::String("abc".into()));
+        assert_eq!(
+            canon(&Value::String("AbC".into())),
+            Value::String("abc".into())
+        );
         // already canonical -> unchanged
-        assert_eq!(canon(&Value::String("abc".into())), Value::String("abc".into()));
+        assert_eq!(
+            canon(&Value::String("abc".into())),
+            Value::String("abc".into())
+        );
         // non-string -> identity
         assert_eq!(canon(&Value::Null), Value::Null);
     }
