@@ -62,7 +62,7 @@ Rough priority order, each pointing at its tracked item:
    force-replace or mark unknown a *nested* attribute (inside a block or
    collection), not just a top-level one. Known/unknown access stays via
    `TfValue<T>` fields. → **3.5**.
-4. ~~**Semantic equality / normalization.**~~ ✅ **DONE (partial)** — *quotient
+4. ~~**Semantic equality / normalization.**~~ ✅ **DONE** — *quotient
    types*: a value modeled as a newtype whose constructor canonicalizes makes
    semantic equality free (`canonical(a) == canonical(b)`), and the planner keeps
    the prior value when a change is within the equivalence class. Now **zero-wiring**:
@@ -412,7 +412,7 @@ via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`)
   modeling); passing the raw `config` (distinct from `proposed`) into
   `modify_plan` was not needed and is left out.
 
-### 3.6 Semantic equality / normalization — ✅ DONE (partial; explicit opt-in)
+### 3.6 Semantic equality / normalization — ✅ DONE (zero-wiring via auto-harvest)
 - **Why:** Terraform core (not the provider) diffs by structural value equality
   over `cty`. Providers routinely need to treat differently-encoded-but-equal
   values as unchanged — equivalent set ordering, case-insensitive IDs, normalized
