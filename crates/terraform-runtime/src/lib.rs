@@ -32,6 +32,7 @@ pub use ctx::Ctx;
 pub use data_source::{DataSource, DataSourceError, DataSourceList};
 pub use ephemeral::{Ephemeral, EphemeralError, EphemeralFromResource};
 pub use function::{Function, FunctionError, VariadicFunction};
+pub use normalize::{string_quotient, Canon};
 pub use resource::{Path, PathStep, PlanModifications, Resource, ResourceError};
 pub use serve::{serve, ServeError};
 

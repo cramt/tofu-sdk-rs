@@ -430,6 +430,16 @@ impl tfplugin6::provider_server::Provider for ProviderService {
             }
         };
 
+        // Semantic-equality diff suppression (roadmap 3.6): for a quotient-typed
+        // attribute, rewrite a proposed value that is semantically equal to prior
+        // back to the prior value, so the mechanical plan below sees no change and
+        // emits neither a spurious diff nor a spurious replacement. A no-op unless
+        // the resource declares quotient attributes (`Resource::semantic_equality`).
+        let mut proposed = proposed;
+        if let Some(handler) = self.provider.resource_handler(&req.type_name) {
+            crate::normalize::keep_prior(&prior, &mut proposed, &handler.semantic_equality());
+        }
+
         let mut plan = plan(&prior, proposed, block);
 
         // Author plan modification: adjust the mechanical plan (force-replace by

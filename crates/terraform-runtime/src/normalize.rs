@@ -164,6 +164,10 @@ mod tests {
     #[facet(opaque, proxy = String)]
     struct CiId(String);
 
+    // facet's `opaque, proxy` contract mandates `TryFrom` in both directions even
+    // when a particular quotient's conversions can't fail, so the infallible-case
+    // lint is a false positive here.
+    #[allow(clippy::infallible_try_from)]
     impl TryFrom<String> for CiId {
         type Error = Infallible;
         fn try_from(s: String) -> Result<Self, Self::Error> {
@@ -171,6 +175,7 @@ mod tests {
             Ok(CiId(s.to_lowercase()))
         }
     }
+    #[allow(clippy::infallible_try_from)]
     impl TryFrom<&CiId> for String {
         type Error = Infallible;
         fn try_from(id: &CiId) -> Result<Self, Self::Error> {

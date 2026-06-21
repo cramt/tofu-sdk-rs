@@ -13,6 +13,8 @@ use facet::Facet;
 use terraform_codec::{from_value, to_value};
 use terraform_value::Value;
 
+use crate::normalize::Canon;
+
 use crate::ctx::{current_ctx, Ctx};
 
 /// An error returned by a resource operation, surfaced to Terraform as an error
@@ -390,6 +392,20 @@ pub trait Resource: Send + Sync + 'static {
             "this resource does not support moving state from another resource type",
         ))
     }
+
+    /// Declare which attributes are *quotient types* (semantic-equality / diff
+    /// suppression — roadmap 3.6). Build a [`Canon`] with
+    /// [`string_quotient`](crate::string_quotient), mapping an attribute name to a
+    /// canonicalizer derived from its type's own conversions, e.g.
+    /// `Canon::new().with("id", string_quotient::<MyId>())`. The planner then
+    /// suppresses a spurious diff/replacement when a value changes only within its
+    /// equivalence class (case, ordering, normalized spelling). Defaults to none.
+    ///
+    /// (This is the explicit opt-in; reflection auto-harvest from the model is a
+    /// follow-up gated on codec proxy-decode support — see `normalize.rs`.)
+    fn semantic_equality(&self) -> Canon {
+        Canon::new()
+    }
 }
 
 /// Object-safe, value-oriented form of [`Resource`] that the service dispatches
@@ -429,6 +445,13 @@ pub trait DynResource: Send + Sync {
             "unsupported state move",
             "this resource does not support moving state from another resource type",
         )])
+    }
+
+    /// The resource's quotient-typed attributes for semantic-equality diff
+    /// suppression. Defaults to none, so dynamic-seam implementors (e.g. the Node
+    /// binding) need not implement it.
+    fn semantic_equality(&self) -> Canon {
+        Canon::new()
     }
 }
 
@@ -564,5 +587,9 @@ impl<R: Resource> DynResource for ResourceAdapter<R> {
             .await
             .map_err(Diagnostics::from)?;
         to_value(&result).map_err(|e| codec_diag("encode moved state", e))
+    }
+
+    fn semantic_equality(&self) -> Canon {
+        self.inner.semantic_equality()
     }
 }
