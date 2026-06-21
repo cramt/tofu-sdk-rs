@@ -31,17 +31,25 @@
 //! per-resource code. The same conversions facet uses to (de)serialize the type
 //! are reused as its diff semantics.
 //!
-//! What does *not* work yet, and is the integration TODO:
-//! - `#[derive(Facet)]` auto-wires the `display`/`debug`/`partial_eq` vtable hooks
-//!   (via spez) but has **no `parse` arm** — a `FromStr` impl never reaches the
-//!   `parse` vtable slot. So the "harvest `parse`+`display` off any type's vtable"
-//!   route only works for facet *builtins* that wire it explicitly
-//!   (`vtable_direct!(T => FromStr, Display, …)`: `Ipv6Addr`, `Url`, …).
-//! - `terraform-codec` does not drive the `try_from` vtable, so an `opaque+proxy`
-//!   type does not round-trip through the codec yet. Auto-*harvesting* the
-//!   canonicalizer by reflection (walk `M::SHAPE`, detect proxy/quotient fields,
-//!   build a [`Canon`] automatically) therefore needs that codec bridge first.
-//!   Until then a [`Canon`] is assembled explicitly from [`string_quotient`].
+//! Where this stands now:
+//! - **The codec bridge exists.** `terraform-codec` now drives facet's
+//!   container-level proxy vtable (`convert_in`/`convert_out` via
+//!   `begin_custom_deserialization_from_shape` / `custom_serialization_from_shape`),
+//!   and `terraform-reflect` maps an `opaque+proxy` field to its proxy's cty type.
+//!   So a quotient type round-trips through the codec and **can be a real model
+//!   field** (decode runs the canonicalizing `TryFrom`, encode renders it back).
+//! - **Auto-harvest is the remaining step.** Building a [`Canon`] by reflection
+//!   (walk `M::SHAPE`, detect proxy/quotient fields, derive each canonicalizer
+//!   automatically) is now unblocked by that bridge but not yet done — a [`Canon`]
+//!   is still assembled explicitly from [`string_quotient`]. The type-erased,
+//!   `Value`-level canonicalizer it needs is a shape-driven codec round-trip
+//!   (`Partial::alloc_shape` → fill → re-encode); see the integration note in the
+//!   roadmap.
+//! - One caveat unrelated to the codec: `#[derive(Facet)]` auto-wires the
+//!   `display`/`debug`/`partial_eq` vtable hooks (via spez) but has **no `parse`
+//!   arm** — a `FromStr` impl never reaches the `parse` vtable slot. The quotient
+//!   route deliberately uses the `proxy` `TryFrom` conversions instead, which the
+//!   derive *does* wire, so this does not affect [`string_quotient`].
 //!
 //! ## Scope (current)
 //!
@@ -173,8 +181,9 @@ mod tests {
     // A case-insensitive identifier: the quotient is "same up to ASCII case".
     // `#[facet(opaque, proxy = String)]` is the author-facing declaration — it
     // makes facet (de)serialize the type through these very `TryFrom`s, so the
-    // canonicalizer below and the codec see one source of truth. (We exercise the
-    // conversions directly here; the codec-driven path is the integration TODO.)
+    // canonicalizer below and the codec see one source of truth. (The codec-driven
+    // path now works too — see `terraform-codec`'s proxy round-trip tests; here we
+    // exercise the conversions directly.)
     #[derive(facet::Facet)]
     #[facet(opaque, proxy = String)]
     struct CiId(String);

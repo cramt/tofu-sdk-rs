@@ -660,6 +660,13 @@ fn map_type(shape: &'static Shape, field_path: &str) -> Result<Type, ReflectErro
         return map_type(inner, field_path);
     }
 
+    // A container-level proxy type (`#[facet(opaque, proxy = P)]`, e.g. a quotient
+    // newtype) reflects as its proxy's cty type — the same wire representation the
+    // codec encodes it through (`peek_to_value`/`fill` drive the proxy vtable).
+    if let Some(proxy) = shape.effective_proxy(None) {
+        return map_type(proxy.shape, field_path);
+    }
+
     // Collections and option are recognized by their semantic `Def`.
     match &shape.def {
         Def::List(d) => return Ok(Type::list(map_type(d.t, field_path)?)),
@@ -833,6 +840,50 @@ mod tests {
         let size = attr(&block, "size");
         assert_eq!(size.ty, Type::Number, "TfValue<i64> -> number");
         assert!(size.computed);
+    }
+
+    // A string-backed quotient type: reflects through its `String` proxy (matching
+    // how the codec encodes/decodes it). See `terraform-codec` for the value-level
+    // round-trip and `terraform-runtime::normalize` for the semantic-equality use.
+    #[derive(Facet)]
+    #[facet(opaque, proxy = String)]
+    #[allow(dead_code)]
+    struct CiId(String);
+
+    #[allow(clippy::infallible_try_from)]
+    impl TryFrom<String> for CiId {
+        type Error = std::convert::Infallible;
+        fn try_from(s: String) -> Result<Self, Self::Error> {
+            Ok(CiId(s.to_lowercase()))
+        }
+    }
+    #[allow(clippy::infallible_try_from)]
+    impl TryFrom<&CiId> for String {
+        type Error = std::convert::Infallible;
+        fn try_from(id: &CiId) -> Result<Self, Self::Error> {
+            Ok(id.0.clone())
+        }
+    }
+
+    #[derive(Facet)]
+    #[allow(dead_code)]
+    struct WithQuotient {
+        id: CiId,
+        alias: Option<CiId>,
+    }
+
+    #[test]
+    fn proxy_field_maps_to_proxy_cty_type() {
+        let block = reflect_block::<WithQuotient>().expect("WithQuotient reflects");
+        let id = attr(&block, "id");
+        assert_eq!(id.ty, Type::String, "opaque+proxy=String -> string");
+        assert!(id.required, "a bare quotient field is required");
+
+        // `Option<Quotient>` still maps to the proxy type, and stays optional.
+        let alias = attr(&block, "alias");
+        assert_eq!(alias.ty, Type::String);
+        assert!(alias.optional);
+        assert!(!alias.required);
     }
 
     #[derive(Facet)]

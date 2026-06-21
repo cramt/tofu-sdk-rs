@@ -235,12 +235,17 @@ it; keep it static. The preset is exposed via the package.json `exports` subpath
   (a type's `TryFrom<String>`/`TryFrom<&T>` — the same conversions
   `#[facet(opaque, proxy = String)]` uses), assembled into a `Canon` returned from
   the defaulted `Resource::semantic_equality` (forwarded through the `DynResource`
-  seam → Node binding unaffected). **Partial:** opt-in is explicit (the model field
-  stays the wire type `String`; the quotient type only builds the canonicalizer)
-  because the **codec can't decode an `opaque+proxy` type yet** — it doesn't drive
-  facet's `try_from`/`effective_proxy` vtable. That codec bridge is the prerequisite
-  for both using such a type as a real model field *and* auto-harvesting the `Canon`
-  from `M::SHAPE` by reflection (the next step). Top-level scalars only.
+  seam → Node binding unaffected). **The codec bridge now exists:**
+  `terraform-codec` drives facet's container-level proxy vtable
+  (`convert_in`/`convert_out` via `begin_custom_deserialization_from_shape` /
+  `custom_serialization_from_shape` in `typed.rs`) and `terraform-reflect`'s
+  `map_type` maps an `opaque+proxy` field to its proxy's cty type — so a quotient
+  type round-trips through the codec and **can be a real model field** (decode runs
+  the canonicalizing `TryFrom`, encode renders it back). **Still explicit opt-in:**
+  a `Canon` is assembled by hand from `string_quotient::<T>()`; auto-harvesting it
+  from `M::SHAPE` by reflection (the next step) needs a type-erased, `Value`-level
+  canonicalizer — a shape-driven codec round-trip via `Partial::alloc_shape`. Top-
+  level scalars only.
 - **Numbers are `Value::Number(Number)` where `Number` is `I64 | U64 | F64`**
   (`terraform-value`). The full signed+unsigned 64-bit integer range round-trips
   losslessly through msgpack and cty JSON; only truly arbitrary precision (beyond

@@ -66,8 +66,9 @@ Rough priority order, each pointing at its tracked item:
    types*: a value modeled as a newtype whose constructor canonicalizes makes
    semantic equality free (`canonical(a) == canonical(b)`), and the planner keeps
    the prior value when a change is within the equivalence class. Explicit opt-in
-   today (`Resource::semantic_equality`); reflection auto-harvest is deferred on
-   codec proxy-decode support. → **3.6**.
+   today (`Resource::semantic_equality`); the codec proxy-decode bridge is now done
+   (a quotient type is a usable model field), so reflection auto-harvest is the next
+   step. → **3.6**.
 5. ~~**Write-only attributes.**~~ ✅ **DONE** — the schema flag
    (`#[facet(terraform::write_only)]` → IR/emit/TS) *and* the runtime semantics:
    the value is nulled out of the planned and every returned state but merged
@@ -438,14 +439,20 @@ via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`)
   (`semantic_equality_suppresses_spurious_replacement_in_plan`) driving
   `PlanResourceChange`: a case-only change to a `force_new` attr plans as
   no-change (planned keeps prior bytes), a real change still replaces.
+- **Codec proxy-decode support — ✅ DONE.** `terraform-codec` now drives facet's
+  container-level proxy vtable: `peek_to_value` calls `custom_serialization_from_shape`
+  (→ `convert_out`) and `fill` calls `begin_custom_deserialization_from_shape`
+  (→ `convert_in`), both in `typed.rs`; `terraform-reflect::map_type` maps an
+  `opaque+proxy` field to its proxy's cty type. So an `opaque+proxy` quotient type
+  round-trips through the codec and **can be a real model field** (decode runs the
+  canonicalizing `TryFrom`, encode renders it back). Verified by
+  `terraform-codec` proxy round-trip tests and a `terraform-reflect` type test.
 - **Deferred (promotion follow-ups, see `normalize.rs` docs):**
   1. **Reflection auto-harvest** of `Canon` from `M::SHAPE` so a quotient field
-     needs *zero* per-resource wiring. Blocked on **codec proxy-decode support**:
-     `terraform-codec` doesn't drive facet's `try_from`/`effective_proxy` vtable,
-     so an `opaque+proxy` type can't round-trip through the codec yet (and thus
-     can't even be used as a normal model field — the field currently stays the
-     wire type `String`, with the quotient type used only to build the
-     canonicalizer). This is the highest-value next step.
+     needs *zero* per-resource wiring — now unblocked by the codec bridge above.
+     The remaining work is a type-erased, `Value`-level canonicalizer (a shape-driven
+     codec round-trip via `Partial::alloc_shape`) plus a `M::SHAPE` walk that detects
+     proxy-typed fields and registers each. This is the highest-value next step.
   2. Build the `Canon` once and cache it (currently rebuilt per plan call).
   3. `TryFrom<&str>`/`Cow` to avoid the per-call string clone.
   4. Recurse into nested blocks / collections (top-level scalars only today).

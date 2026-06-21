@@ -64,6 +64,17 @@ fn peek_to_value(peek: Peek<'_, '_>) -> Result<Value, TypedError> {
         return tfvalue_to_value(peek);
     }
 
+    // A container-level proxy type (`#[facet(opaque, proxy = P)]`, e.g. a quotient
+    // newtype like an ARN or case-insensitive id): serialize through its proxy
+    // representation by running `convert_out` (the type's `TryFrom<&T> for P`), then
+    // encode the proxy value. This is what lets a quotient type be a real model
+    // field rather than only a canonicalizer source (roadmap 3.6).
+    if shape.has_any_proxy() {
+        if let Some(proxy) = peek.custom_serialization_from_shape().map_err(reflect)? {
+            return peek_to_value(proxy.as_peek());
+        }
+    }
+
     // Containers and option are recognized by their semantic `Def`.
     match shape.def {
         Def::Option(_) => {
@@ -193,6 +204,35 @@ fn fill<'f, const B: bool>(
         return fill_tfvalue(partial, value);
     }
 
+    // A container-level proxy type (`#[facet(opaque, proxy = P)]`): decode the
+    // proxy representation (e.g. a `String`) then let facet run `convert_in` (the
+    // type's `TryFrom<P>`), which is the canonicalizing parse for a quotient type.
+    // `begin_custom_deserialization_from_shape` pushes a frame for the proxy shape;
+    // we recurse to fill it, then `end()` triggers the conversion. If the shape
+    // turns out not to be a container proxy, the partial is returned unchanged and
+    // we fall through to the normal mapping.
+    if partial.shape().has_any_proxy() {
+        let (partial, began) = partial
+            .begin_custom_deserialization_from_shape()
+            .map_err(reflect)?;
+        if began {
+            let partial = fill(partial, value)?;
+            return partial.end().map_err(reflect);
+        }
+        return fill_def(partial, value);
+    }
+
+    fill_def(partial, value)
+}
+
+/// Drive a [`Partial`] from a [`Value`] by the partial's structural shape —
+/// the body of [`fill`] after the `TfValue`/proxy special-cases are handled.
+/// Split out so the proxy path can fall through to it without re-detecting a
+/// proxy (which would loop).
+fn fill_def<'f, const B: bool>(
+    partial: Partial<'f, B>,
+    value: &Value,
+) -> Result<Partial<'f, B>, TypedError> {
     match &partial.shape().def {
         Def::Option(_) => match value {
             Value::Null | Value::Unknown => partial.set_default().map_err(reflect),
@@ -629,6 +669,88 @@ mod tests {
         let value = to_value(&original).unwrap();
         let back: WithTfValue = from_value(&value).unwrap();
         assert_eq!(back, original);
+    }
+
+    // A string-backed quotient type: `#[facet(opaque, proxy = String)]` makes facet
+    // (de)serialize it through its `TryFrom` conversions. The canonicalizing parse
+    // lowercases; the render echoes the stored representative. The codec must drive
+    // that proxy vtable so the type works as a real model field.
+    #[derive(facet::Facet)]
+    #[facet(opaque, proxy = String)]
+    struct CiId(String);
+
+    #[allow(clippy::infallible_try_from)]
+    impl TryFrom<String> for CiId {
+        type Error = std::convert::Infallible;
+        fn try_from(s: String) -> Result<Self, Self::Error> {
+            Ok(CiId(s.to_lowercase()))
+        }
+    }
+    #[allow(clippy::infallible_try_from)]
+    impl TryFrom<&CiId> for String {
+        type Error = std::convert::Infallible;
+        fn try_from(id: &CiId) -> Result<Self, Self::Error> {
+            Ok(id.0.clone())
+        }
+    }
+
+    #[derive(Facet)]
+    struct WithQuotient {
+        name: String,
+        id: CiId,
+    }
+
+    #[test]
+    fn decode_drives_proxy_convert_in_and_canonicalizes() {
+        // The wire carries the user's casing; `convert_in` (TryFrom<String>) runs on
+        // decode and canonicalizes to lowercase. Re-encoding through `convert_out`
+        // proves the stored representative is the canonical form.
+        let mut obj = BTreeMap::new();
+        obj.insert("name".to_string(), Value::String("x".into()));
+        obj.insert("id".to_string(), Value::String("AbC".into()));
+
+        let decoded: WithQuotient = from_value(&Value::Object(obj)).expect("decode proxy");
+
+        let Value::Object(fields) = to_value(&decoded).expect("encode proxy") else {
+            panic!("expected object");
+        };
+        assert_eq!(
+            fields["id"],
+            Value::String("abc".into()),
+            "convert_in canonicalized on decode; convert_out rendered it back"
+        );
+        assert_eq!(fields["name"], Value::String("x".into()));
+    }
+
+    #[test]
+    fn encode_drives_proxy_convert_out() {
+        // A value already canonical in Rust encodes to its proxy string.
+        let v = WithQuotient {
+            name: "n".into(),
+            id: CiId::try_from("already-lower".to_string()).unwrap(),
+        };
+        let Value::Object(fields) = to_value(&v).expect("encode") else {
+            panic!("expected object");
+        };
+        assert_eq!(fields["id"], Value::String("already-lower".into()));
+    }
+
+    #[test]
+    fn proxy_field_round_trips_through_codec() {
+        // Value -> Rust -> Value is stable once canonical (the integration the
+        // semantic-equality work was blocked on).
+        let mut obj = BTreeMap::new();
+        obj.insert("name".to_string(), Value::String("r".into()));
+        obj.insert("id".to_string(), Value::String("MixedCase".into()));
+        let decoded: WithQuotient = from_value(&Value::Object(obj)).expect("decode");
+        let encoded = to_value(&decoded).expect("encode");
+        let twice: WithQuotient = from_value(&encoded).expect("decode again");
+        let encoded_twice = to_value(&twice).expect("encode again");
+        assert_eq!(encoded, encoded_twice);
+        let Value::Object(fields) = encoded else {
+            panic!("expected object");
+        };
+        assert_eq!(fields["id"], Value::String("mixedcase".into()));
     }
 
     #[test]
