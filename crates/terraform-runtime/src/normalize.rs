@@ -1,4 +1,7 @@
-//! Semantic-equality spike — diff suppression derived from the type, not a hook.
+//! Semantic equality (roadmap 3.6) — diff suppression derived from the type, not
+//! a hook. Partial: explicit opt-in via [`crate::Resource::semantic_equality`];
+//! reflection auto-harvest from the model is deferred (see the integration TODO
+//! below).
 //!
 //! Terraform core, not the provider, computes the user-facing diff: it compares
 //! the prior state and the planned state structurally over `cty` values. So a
@@ -18,7 +21,7 @@
 //! equality" is just `canonical(a) == canonical(b)`, and the canonicalizer is the
 //! type's own constructor. "Parse, don't validate," but the parse quotients.
 //!
-//! ## How the quotient is expressed (spike findings on facet 0.46.5)
+//! ## How the quotient is expressed (facet 0.46.5)
 //!
 //! The clean author mechanism is facet's **`#[facet(opaque, proxy = String)]`**:
 //! the newtype serializes through a `String` proxy via *bidirectional `TryFrom`*
@@ -40,7 +43,7 @@
 //!   build a [`Canon`] automatically) therefore needs that codec bridge first.
 //!   Until then a [`Canon`] is assembled explicitly from [`string_quotient`].
 //!
-//! ## Scope of the spike
+//! ## Scope (current)
 //!
 //! - **Top-level scalar attributes only** (nested blocks/collections are a
 //!   follow-up — the pre-pass would recurse like `write_only::strip`).

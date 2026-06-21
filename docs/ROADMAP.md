@@ -62,10 +62,12 @@ Rough priority order, each pointing at its tracked item:
    force-replace or mark unknown a *nested* attribute (inside a block or
    collection), not just a top-level one. Known/unknown access stays via
    `TfValue<T>` fields. → **3.5**.
-4. **Semantic equality / normalization.** No hook to treat
-   differently-encoded-but-equal values (reordered JSON, equivalent set
-   ordering, case-insensitive IDs) as unchanged, so providers surface spurious
-   diffs. → new **3.6**.
+4. ~~**Semantic equality / normalization.**~~ ✅ **DONE (partial)** — *quotient
+   types*: a value modeled as a newtype whose constructor canonicalizes makes
+   semantic equality free (`canonical(a) == canonical(b)`), and the planner keeps
+   the prior value when a change is within the equivalence class. Explicit opt-in
+   today (`Resource::semantic_equality`); reflection auto-harvest is deferred on
+   codec proxy-decode support. → **3.6**.
 5. ~~**Write-only attributes.**~~ ✅ **DONE** — the schema flag
    (`#[facet(terraform::write_only)]` → IR/emit/TS) *and* the runtime semantics:
    the value is nulled out of the planned and every returned state but merged
@@ -409,23 +411,50 @@ via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`)
   modeling); passing the raw `config` (distinct from `proposed`) into
   `modify_plan` was not needed and is left out.
 
-### 3.6 Semantic equality / normalization
-- **Why:** Terraform diffs by structural value equality. Providers routinely need
-  to treat differently-encoded-but-equal values as unchanged — reordered JSON in
-  a string attribute, equivalent set ordering, case-insensitive IDs, normalized
-  ARNs/URLs. Without a hook, every such attribute shows a spurious perpetual diff.
-- **Current:** none — `plan.rs` compares `Value`s directly; there is no
-  per-attribute normalize/equate hook.
-- **Approach:** add an optional per-attribute (or per-resource) normalization
-  hook — e.g. a `normalize(attr_path, value) -> Value` called on config/prior
-  before diffing, or a typed `PlanModifications`-style "keep prior value" signal
-  (SDKv2's `DiffSuppressFunc` / Plugin Framework's `PlanModifier` analogue).
-  Likely folded into the 3.5 plan ctx.
-- **Verify:** `plan.rs` unit test where a normalized attribute (e.g. JSON with
-  reordered keys) plans as no-change; a `harness/` config proving no perpetual
-  diff across two applies of equivalent input.
-- **Done when:** an attribute with a normalization hook stops showing a spurious
-  diff for an equivalent-but-differently-encoded value.
+### 3.6 Semantic equality / normalization — ✅ DONE (partial; explicit opt-in)
+- **Why:** Terraform core (not the provider) diffs by structural value equality
+  over `cty`. Providers routinely need to treat differently-encoded-but-equal
+  values as unchanged — equivalent set ordering, case-insensitive IDs, normalized
+  ARNs/URLs. Without a hook, every such attribute shows a spurious perpetual diff
+  (and a `force_new` such attribute spuriously *replaces*).
+- **Design (shipped):** *quotient types*, not a free-floating hook. The provider's
+  only lever is `PlanResourceChange` — return the prior value when the new value
+  is semantically equal (the blessed move; what SDKv2 `DiffSuppressFunc` and the
+  Plugin Framework `StringSemanticEquals` do). A value modeled as a **quotient
+  type** (a newtype whose constructor maps an equivalence class to one canonical
+  representative) makes equality free: `canonical(a) == canonical(b)`, derived
+  from the type — the author writes no equality function.
+  - `terraform-runtime/src/normalize.rs`: `keep_prior` pre-pass (run *before*
+    `plan::plan`) rewrites a semantically-equal proposed attribute back to the
+    **prior bytes** ("store-raw, normalize-on-compare" — never plans a third
+    value, so no "inconsistent result after apply"). `string_quotient::<T>()`
+    builds an `Arc` canonicalizer from a type's `TryFrom<String>` / `TryFrom<&T>`
+    conversions — the same ones facet's `#[facet(opaque, proxy = String)]` uses.
+    `Canon` (`#[must_use]`, `Clone`) maps attr name → canonicalizer.
+  - Wired via a defaulted `Resource::semantic_equality(&self) -> Canon`, forwarded
+    through the `DynResource` seam (defaulted → Node binding unaffected) and
+    `ResourceAdapter`, called in `service.rs` before the mechanical plan.
+- **Verified:** `normalize.rs` unit tests + an end-to-end service test
+  (`semantic_equality_suppresses_spurious_replacement_in_plan`) driving
+  `PlanResourceChange`: a case-only change to a `force_new` attr plans as
+  no-change (planned keeps prior bytes), a real change still replaces.
+- **Deferred (promotion follow-ups, see `normalize.rs` docs):**
+  1. **Reflection auto-harvest** of `Canon` from `M::SHAPE` so a quotient field
+     needs *zero* per-resource wiring. Blocked on **codec proxy-decode support**:
+     `terraform-codec` doesn't drive facet's `try_from`/`effective_proxy` vtable,
+     so an `opaque+proxy` type can't round-trip through the codec yet (and thus
+     can't even be used as a normal model field — the field currently stays the
+     wire type `String`, with the quotient type used only to build the
+     canonicalizer). This is the highest-value next step.
+  2. Build the `Canon` once and cache it (currently rebuilt per plan call).
+  3. `TryFrom<&str>`/`Cow` to avoid the per-call string clone.
+  4. Recurse into nested blocks / collections (top-level scalars only today).
+  5. Meta-backed resources skip suppression until ConfigureProvider (configure
+     precedes plan in the normal workflow, so this only affects a pre-configure
+     partial plan).
+- **Out of scope (needs `modify_plan`):** *server-authoritative* normalization,
+  where only the remote knows the canonical form — no client-side `parse` can
+  reproduce it.
 
 ### 3.7 Data-source block projection — ✅ DONE (singular)
 - **Done:** `reflect_data_source` now honors the `block` marker, projecting a

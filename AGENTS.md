@@ -226,6 +226,21 @@ it; keep it static. The preset is exposed via the package.json `exports` subpath
   handler matches on `source_type_name` and maps the dynamic value onto its model.
   Defaulted to an "unsupported" error; defaulted `DynResource::move_state` keeps
   the Node binding unaffected.
+- **Semantic equality is a *quotient type*, not a diff-suppress closure** (roadmap
+  3.6, `terraform-runtime/src/normalize.rs`). Terraform *core* owns the structural
+  diff, so the provider's only lever is to plan the **prior** value when the new
+  value is semantically equal. `keep_prior` does exactly that *before* `plan.rs`
+  (store-raw: it writes the prior bytes, never a third value, so no "inconsistent
+  result"). The canonicalizer comes from the field's type via `string_quotient::<T>()`
+  (a type's `TryFrom<String>`/`TryFrom<&T>` — the same conversions
+  `#[facet(opaque, proxy = String)]` uses), assembled into a `Canon` returned from
+  the defaulted `Resource::semantic_equality` (forwarded through the `DynResource`
+  seam → Node binding unaffected). **Partial:** opt-in is explicit (the model field
+  stays the wire type `String`; the quotient type only builds the canonicalizer)
+  because the **codec can't decode an `opaque+proxy` type yet** — it doesn't drive
+  facet's `try_from`/`effective_proxy` vtable. That codec bridge is the prerequisite
+  for both using such a type as a real model field *and* auto-harvesting the `Canon`
+  from `M::SHAPE` by reflection (the next step). Top-level scalars only.
 - **Numbers are `Value::Number(Number)` where `Number` is `I64 | U64 | F64`**
   (`terraform-value`). The full signed+unsigned 64-bit integer range round-trips
   losslessly through msgpack and cty JSON; only truly arbitrary precision (beyond

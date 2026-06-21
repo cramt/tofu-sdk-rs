@@ -15,7 +15,9 @@ mod ephemeral;
 mod function;
 pub mod handshake;
 mod log;
-// Semantic-equality spike: diff suppression derived from a field's quotient type.
+// Semantic equality (roadmap 3.6): diff suppression derived from a field's
+// quotient type. Partial — explicit opt-in via `Resource::semantic_equality`;
+// reflection auto-harvest is deferred (see `normalize.rs`).
 mod normalize;
 mod plan;
 mod resource;
