@@ -457,11 +457,14 @@ via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`)
   (`Canon::harvest::<Self::Model>().with("id", string_quotient::<MyId>())`). A model
   with no quotient fields harvests an empty `Canon` (pre-pass skipped, zero overhead).
   Verified by `normalize.rs` harvest tests (incl. end-to-end through `keep_prior`).
+- **`Canon` caching — ✅ DONE.** `ResourceAdapter::erased` computes the `Canon`
+  once at construction (`semantic_equality` is a static description of the model);
+  `DynResource::semantic_equality` hands out a cheap `Arc`-backed clone per plan, so
+  there is no per-plan `SHAPE` walk.
 - **Deferred (promotion follow-ups, see `normalize.rs` docs):**
-  1. Build the `Canon` once and cache it (currently rebuilt per plan call).
-  2. `TryFrom<&str>`/`Cow` to avoid the per-call string clone.
-  3. Recurse into nested blocks / collections (top-level scalars only today).
-  4. Meta-backed resources skip suppression until ConfigureProvider (configure
+  1. `TryFrom<&str>`/`Cow` to avoid the per-call string clone.
+  2. Recurse into nested blocks / collections (top-level scalars only today).
+  3. Meta-backed resources skip suppression until ConfigureProvider (configure
      precedes plan in the normal workflow, so this only affects a pre-configure
      partial plan).
 - **Out of scope (needs `modify_plan`):** *server-authoritative* normalization,

@@ -247,8 +247,9 @@ it; keep it static. The preset is exposed via the package.json `exports` subpath
   (`quotient_inner` peels `Option`) and builds each canonicalizer from the
   type-erased `terraform_codec::canonicalize_through_shape` (a shape-driven codec
   round-trip via `Partial::alloc_shape`). So a quotient model field needs no code;
-  override only to add canonicalizers reflection can't see. Top-level scalars only;
-  the `Canon` is rebuilt per plan (caching is the remaining follow-up).
+  override only to add canonicalizers reflection can't see. The `Canon` is built
+  once in `ResourceAdapter::erased` and cloned per plan (top-level scalars only;
+  nested-block recursion is the remaining follow-up).
 - **Numbers are `Value::Number(Number)` where `Number` is `I64 | U64 | F64`**
   (`terraform-value`). The full signed+unsigned 64-bit integer range round-trips
   losslessly through msgpack and cty JSON; only truly arbitrary precision (beyond

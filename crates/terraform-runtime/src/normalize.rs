@@ -45,8 +45,9 @@
 //!   [`terraform_codec::canonicalize_through_shape`] — the type-erased,
 //!   `Value`-level round-trip (`Partial::alloc_shape` → fill → re-encode). It is the
 //!   default behind [`crate::Resource::semantic_equality`], so a quotient field needs
-//!   no per-resource code. (Follow-ups: cache the `Canon` per resource instead of
-//!   rebuilding per plan; recurse into nested blocks — top-level scalars only today.)
+//!   no per-resource code. The `ResourceAdapter` builds it once at construction and
+//!   clones it per plan (no per-plan `SHAPE` walk). (Follow-up: recurse into nested
+//!   blocks — top-level scalars only today.)
 //! - One caveat unrelated to the codec: `#[derive(Facet)]` auto-wires the
 //!   `display`/`debug`/`partial_eq` vtable hooks (via spez) but has **no `parse`
 //!   arm** — a `FromStr` impl never reaches the `parse` vtable slot. The quotient
@@ -79,8 +80,8 @@ use terraform_value::Value;
 /// A value-level canonicalizer: maps a `Value` to its canonical representative.
 /// For a quotient type it is `to_proxy(parse(v))`; for anything it never sees as a
 /// quotient it is the identity. `Arc` (not `Box`) so a [`Canon`] is cheap to clone
-/// — a resource's `Canon` can eventually be built once and shared across plan
-/// calls instead of reconstructed each time.
+/// — the `ResourceAdapter` builds a resource's `Canon` once at construction and
+/// hands out clones per plan, so this `Arc` is shared, never rebuilt.
 type Canonicalizer = Arc<dyn Fn(&Value) -> Value + Send + Sync>;
 
 /// A map from a top-level attribute name to its canonicalizer, for every

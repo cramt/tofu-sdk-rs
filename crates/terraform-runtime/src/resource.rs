@@ -462,12 +462,22 @@ pub trait DynResource: Send + Sync {
 /// Wraps a typed [`Resource`] as an erased [`DynResource`].
 pub struct ResourceAdapter<R: Resource> {
     inner: R,
+    /// The resource's semantic-equality canonicalizers, computed **once** at
+    /// construction. [`Resource::semantic_equality`] is a static description of the
+    /// model's quotient fields (the default harvests them from `M::SHAPE`), so there
+    /// is no reason to rebuild it on every plan — caching it here turns each plan's
+    /// lookup into a cheap `Arc` clone.
+    canon: Canon,
 }
 
 impl<R: Resource> ResourceAdapter<R> {
     /// Erase `resource` behind an `Arc<dyn DynResource>`.
     pub fn erased(resource: R) -> Arc<dyn DynResource> {
-        Arc::new(ResourceAdapter { inner: resource })
+        let canon = resource.semantic_equality();
+        Arc::new(ResourceAdapter {
+            inner: resource,
+            canon,
+        })
     }
 }
 
@@ -594,6 +604,6 @@ impl<R: Resource> DynResource for ResourceAdapter<R> {
     }
 
     fn semantic_equality(&self) -> Canon {
-        self.inner.semantic_equality()
+        self.canon.clone()
     }
 }
