@@ -58,18 +58,22 @@
 
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
+use std::sync::Arc;
 
 use terraform_value::Value;
 
 /// A value-level canonicalizer: maps a `Value` to its canonical representative.
 /// For a quotient type it is `to_proxy(parse(v))`; for anything it never sees as a
-/// quotient it is the identity.
-type Canonicalizer = Box<dyn Fn(&Value) -> Value + Send + Sync>;
+/// quotient it is the identity. `Arc` (not `Box`) so a [`Canon`] is cheap to clone
+/// — a resource's `Canon` can eventually be built once and shared across plan
+/// calls instead of reconstructed each time.
+type Canonicalizer = Arc<dyn Fn(&Value) -> Value + Send + Sync>;
 
 /// A map from a top-level attribute name to its canonicalizer, for every
 /// attribute backed by a quotient type. Assembled explicitly for now (see the
 /// module docs on why reflection auto-harvest needs a codec bridge first).
-#[derive(Default)]
+#[derive(Default, Clone)]
+#[must_use = "a Canon must be returned from `Resource::semantic_equality` to take effect"]
 pub struct Canon {
     fields: BTreeMap<String, Canonicalizer>,
 }
@@ -80,7 +84,9 @@ impl Canon {
     }
 
     /// Register the canonicalizer for attribute `name`. Use [`string_quotient`]
-    /// to derive one straight from a quotient type's proxy conversions.
+    /// to derive one straight from a quotient type's proxy conversions. Chainable;
+    /// the returned `Canon` must be used (dropping it discards the registration —
+    /// enforced by the type-level `#[must_use]`).
     pub fn with(mut self, name: impl Into<String>, canon: Canonicalizer) -> Self {
         self.fields.insert(name.into(), canon);
         self
@@ -107,7 +113,7 @@ where
     T: TryFrom<String>,
     for<'a> String: TryFrom<&'a T>,
 {
-    Box::new(|value| match value {
+    Arc::new(|value| match value {
         Value::String(s) => T::try_from(s.clone())
             .ok()
             .and_then(|t| String::try_from(&t).ok())
@@ -130,6 +136,12 @@ pub fn keep_prior(prior: &Value, proposed: &mut Value, canon: &Canon) {
     if canon.is_empty() {
         return;
     }
+    // Null/unknown prior (create, or a not-yet-known object) → nothing to keep.
+    // A field-level `Unknown` inside the prior object never canonicalizes equal to
+    // a concrete proposed string (the `string_quotient` closure passes `Unknown`
+    // through unchanged), so an unknown prior field is never suppressed — correct,
+    // since a configured resource's applied state holds concrete values, not
+    // unknowns.
     let Value::Object(prior_fields) = prior else {
         return;
     };

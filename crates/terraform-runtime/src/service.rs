@@ -435,6 +435,14 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         // back to the prior value, so the mechanical plan below sees no change and
         // emits neither a spurious diff nor a spurious replacement. A no-op unless
         // the resource declares quotient attributes (`Resource::semantic_equality`).
+        //
+        // Uses its own `resource_handler` lookup (the later `modify_plan` block
+        // fetches the same handler again — two cheap map lookups, never divergent,
+        // since the handler map is only written at configure). Like `modify_plan`,
+        // this is skipped for a meta-backed resource until after ConfigureProvider
+        // (no handler yet); eager resources are always present. In the standard
+        // workflow configure precedes plan, so this gap only affects a pre-configure
+        // partial plan — acceptable for the spike.
         let mut proposed = proposed;
         if let Some(handler) = self.provider.resource_handler(&req.type_name) {
             crate::normalize::keep_prior(&prior, &mut proposed, &handler.semantic_equality());
