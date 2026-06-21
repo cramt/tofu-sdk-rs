@@ -1,0 +1,37 @@
+[package]
+name = "example-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+# A production-shaped example provider, meant to be copied as a template for a
+# real provider. Unlike `example-aws` (backing-free) and `example-fs` (writes
+# JSON files), this one talks to a *real* PostgreSQL server: it manages roles,
+# databases, schemas, extensions, and tables, with drift detection (`read`),
+# in-place updates (`ALTER`), import, validation, and a `modify_plan` rule. Its
+# contract suite spins up Postgres in Docker and drives a real `tofu test`.
+
+[[bin]]
+name = "terraform-provider-postgres"
+path = "src/main.rs"
+
+[dependencies]
+facet = { workspace = true }
+terraform-provider = { workspace = true }
+terraform-runtime = { workspace = true }
+# `terraform::resource("name")`, `data_source("name")` and `search_key(...)` are
+# struct-payload attributes whose codegen names the `terraform_attrs` crate by
+# path, so it must be a direct dependency (the same pattern as `example-aws`).
+terraform-attrs = { workspace = true }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# Async PostgreSQL client + a connection pool. `deadpool-postgres` wraps
+# `tokio-postgres`; we build it with `NoTls` (see README "Enabling TLS").
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
+
+[lints]
+workspace = true

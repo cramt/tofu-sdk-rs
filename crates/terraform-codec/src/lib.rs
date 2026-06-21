@@ -22,7 +22,7 @@ mod typed;
 
 pub use decode::{decode_json, decode_json_value, decode_msgpack};
 pub use encode::{encode_json, encode_msgpack};
-pub use typed::{from_value, to_value, TypedError};
+pub use typed::{canonicalize_through_shape, from_value, to_value, TypedError};
 
 /// An error from encoding or decoding a `DynamicValue`.
 #[derive(Debug, thiserror::Error)]

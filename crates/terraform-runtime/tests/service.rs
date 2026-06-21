@@ -11,9 +11,9 @@ use std::sync::Arc;
 use facet::Facet;
 use terraform_attrs as terraform;
 use terraform_runtime::{
-    async_trait, string_quotient, Canon, ConfigureError, Ctx, DataSource, DataSourceError,
-    DataSourceList, Diag, Ephemeral, EphemeralError, EphemeralFromResource, Path,
-    PlanModifications, Provider, ProviderService, Resource, ResourceError,
+    async_trait, ConfigureError, Ctx, DataSource, DataSourceError, DataSourceList, Diag, Ephemeral,
+    EphemeralError, EphemeralFromResource, Path, PlanModifications, Provider, ProviderService,
+    Resource, ResourceError,
 };
 use terraform_tfplugin6::tfplugin6::{self, provider_server::Provider as _};
 use tonic::{Code, Request};
@@ -282,10 +282,12 @@ async fn modify_plan_can_force_replacement() {
     );
 }
 
-/// A case-insensitive identifier — a *quotient* type whose canonical
-/// representative is the lowercased form. Only its `TryFrom` conversions are used
-/// (by `string_quotient`); the model field stays a plain `String` (the wire type),
-/// since the codec can't decode an `opaque+proxy` type yet.
+/// A case-insensitive identifier — a *quotient* type (`#[facet(opaque, proxy =
+/// String)]`) whose canonical representative is the lowercased form. It is used as
+/// a **real model field** below; the codec round-trips it through its `String`
+/// proxy, and `Canon::harvest` derives its canonicalizer with no per-resource code.
+#[derive(Facet)]
+#[facet(opaque, proxy = String)]
 struct CiId(String);
 #[allow(clippy::infallible_try_from)]
 impl TryFrom<String> for CiId {
@@ -302,13 +304,15 @@ impl TryFrom<&CiId> for String {
     }
 }
 
-/// A resource whose `force_new` `id` is case-insensitive in meaning.
+/// A resource whose `force_new` `id` is a case-insensitive quotient type. Note
+/// there is **no `semantic_equality` override** — the default auto-harvests the
+/// `Canon` from the model's `SHAPE`, proving the zero-wiring path end to end.
 #[derive(Facet)]
 #[facet(terraform::resource("ci_thing"))]
 #[allow(dead_code)]
 struct CiThing {
     #[facet(terraform::force_new)]
-    id: String,
+    id: CiId,
 }
 
 struct CiResource;
@@ -319,10 +323,6 @@ impl Resource for CiResource {
 
     async fn create(&self, _ctx: &mut Ctx, planned: CiThing) -> Result<CiThing, ResourceError> {
         Ok(planned)
-    }
-
-    fn semantic_equality(&self) -> Canon {
-        Canon::new().with("id", string_quotient::<CiId>())
     }
 }
 

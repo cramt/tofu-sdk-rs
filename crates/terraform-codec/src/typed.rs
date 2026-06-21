@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 
-use facet::{Def, Facet, Partial, Peek, ScalarType, Type as FType, UserType};
+use facet::{Def, Facet, Partial, Peek, ScalarType, Shape, Type as FType, UserType};
 use terraform_value::{Number, Value};
 
 /// A null constant for defaulting absent struct fields.
@@ -190,6 +190,36 @@ pub fn from_value<T: Facet<'static>>(value: &Value) -> Result<T, TypedError> {
         .map_err(reflect)?
         .materialize::<T>()
         .map_err(reflect)
+}
+
+/// Canonicalize a [`Value`] through a quotient type identified at runtime by its
+/// [`Shape`] (a field's `#[facet(opaque, proxy = …)]` type, possibly wrapped in
+/// `Option`). The value is decoded into `shape` — running the canonicalizing
+/// `convert_in` (`TryFrom<Proxy>`) — then re-encoded — running `convert_out`
+/// (`TryFrom<&T> for Proxy`). The result is the value's canonical representative.
+///
+/// This is the **type-erased** counterpart to
+/// [`string_quotient`](../terraform_runtime/normalize/fn.string_quotient.html): it
+/// needs no static `T`, so a `Canon` can be auto-harvested from a model's
+/// `SHAPE` by reflection. On any failure (a value the type rejects, a non-matching
+/// shape) the input is returned unchanged — canonicalization is best-effort, never
+/// fatal to a plan.
+pub fn canonicalize_through_shape(shape: &'static Shape, value: &Value) -> Value {
+    canonicalize_try(shape, value).unwrap_or_else(|_| value.clone())
+}
+
+// `Partial::alloc_shape` is the one unsafe seam in this crate: it allocates by a
+// runtime `Shape` rather than a static `T`. The SAFETY obligation is that the shape
+// describes a real, sized type — guaranteed here because every shape reaching this
+// function is reflected off a genuine `Facet` model (`field.shape()` of `M::SHAPE`).
+#[allow(unsafe_code)]
+fn canonicalize_try(shape: &'static Shape, value: &Value) -> Result<Value, TypedError> {
+    // SAFETY: `shape` comes from a real `Facet` type's reflected fields
+    // (`field.shape()` off `M::SHAPE`), so it describes a genuine, sized type.
+    let partial = unsafe { Partial::alloc_shape(shape) }.map_err(reflect)?;
+    let partial = fill(partial, value)?;
+    let built = partial.build().map_err(reflect)?;
+    peek_to_value(built.peek())
 }
 
 /// Drive a [`Partial`] builder from a [`Value`], directed by the partial's
@@ -751,6 +781,33 @@ mod tests {
             panic!("expected object");
         };
         assert_eq!(fields["id"], Value::String("mixedcase".into()));
+    }
+
+    #[test]
+    fn canonicalize_through_shape_uses_the_proxy_conversions() {
+        // The type-erased canonicalizer (no static T): decode-then-encode through
+        // the quotient shape lowercases, and is idempotent on an already-canonical
+        // value. This is what lets a `Canon` be harvested from a model's SHAPE.
+        let shape = <CiId as Facet>::SHAPE;
+        assert_eq!(
+            canonicalize_through_shape(shape, &Value::String("MiXeD".into())),
+            Value::String("mixed".into())
+        );
+        assert_eq!(
+            canonicalize_through_shape(shape, &Value::String("flat".into())),
+            Value::String("flat".into())
+        );
+    }
+
+    #[test]
+    fn canonicalize_through_optional_shape_handles_null_and_value() {
+        // `Option<Quotient>` composes: a string canonicalizes, null stays null.
+        let shape = <Option<CiId> as Facet>::SHAPE;
+        assert_eq!(
+            canonicalize_through_shape(shape, &Value::String("AbC".into())),
+            Value::String("abc".into())
+        );
+        assert_eq!(canonicalize_through_shape(shape, &Value::Null), Value::Null);
     }
 
     #[test]

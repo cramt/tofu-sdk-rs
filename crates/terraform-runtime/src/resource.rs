@@ -394,17 +394,21 @@ pub trait Resource: Send + Sync + 'static {
     }
 
     /// Declare which attributes are *quotient types* (semantic-equality / diff
-    /// suppression — roadmap 3.6). Build a [`Canon`] with
-    /// [`string_quotient`](crate::string_quotient), mapping an attribute name to a
-    /// canonicalizer derived from its type's own conversions, e.g.
-    /// `Canon::new().with("id", string_quotient::<MyId>())`. The planner then
-    /// suppresses a spurious diff/replacement when a value changes only within its
-    /// equivalence class (case, ordering, normalized spelling). Defaults to none.
+    /// suppression — roadmap 3.6). The planner suppresses a spurious diff/replacement
+    /// when a value changes only within its equivalence class (case, ordering,
+    /// normalized spelling).
     ///
-    /// (This is the explicit opt-in; reflection auto-harvest from the model is a
-    /// follow-up gated on codec proxy-decode support — see `normalize.rs`.)
+    /// **Defaults to auto-harvesting from the model:** every top-level field whose
+    /// type is a quotient (a `#[facet(opaque, proxy = …)]` type, optionally
+    /// `Option`-wrapped) is registered automatically, so a quotient field needs
+    /// *zero* per-resource wiring. A model with no quotient fields harvests an empty
+    /// [`Canon`] and the pre-pass is skipped (zero overhead).
+    ///
+    /// Override to add canonicalizers the reflection can't see, e.g. with
+    /// [`string_quotient`](crate::string_quotient):
+    /// `Canon::harvest::<Self::Model>().with("id", string_quotient::<MyId>())`.
     fn semantic_equality(&self) -> Canon {
-        Canon::new()
+        Canon::harvest::<Self::Model>()
     }
 }
 

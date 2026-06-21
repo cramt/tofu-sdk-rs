@@ -1,7 +1,8 @@
 //! Semantic equality (roadmap 3.6) — diff suppression derived from the type, not
-//! a hook. Partial: explicit opt-in via [`crate::Resource::semantic_equality`];
-//! reflection auto-harvest from the model is deferred (see the integration TODO
-//! below).
+//! a hook. A [`Canon`] is auto-harvested from the model's `SHAPE` by reflection
+//! ([`Canon::harvest`], the default behind [`crate::Resource::semantic_equality`]),
+//! so a quotient field needs zero wiring; [`Canon::with`] + [`string_quotient`]
+//! remain for explicit additions.
 //!
 //! Terraform core, not the provider, computes the user-facing diff: it compares
 //! the prior state and the planned state structurally over `cty` values. So a
@@ -32,19 +33,20 @@
 //! are reused as its diff semantics.
 //!
 //! Where this stands now:
-//! - **The codec bridge exists.** `terraform-codec` now drives facet's
-//!   container-level proxy vtable (`convert_in`/`convert_out` via
+//! - **The codec bridge exists.** `terraform-codec` drives facet's container-level
+//!   proxy vtable (`convert_in`/`convert_out` via
 //!   `begin_custom_deserialization_from_shape` / `custom_serialization_from_shape`),
 //!   and `terraform-reflect` maps an `opaque+proxy` field to its proxy's cty type.
 //!   So a quotient type round-trips through the codec and **can be a real model
 //!   field** (decode runs the canonicalizing `TryFrom`, encode renders it back).
-//! - **Auto-harvest is the remaining step.** Building a [`Canon`] by reflection
-//!   (walk `M::SHAPE`, detect proxy/quotient fields, derive each canonicalizer
-//!   automatically) is now unblocked by that bridge but not yet done — a [`Canon`]
-//!   is still assembled explicitly from [`string_quotient`]. The type-erased,
-//!   `Value`-level canonicalizer it needs is a shape-driven codec round-trip
-//!   (`Partial::alloc_shape` → fill → re-encode); see the integration note in the
-//!   roadmap.
+//! - **Auto-harvest is wired.** [`Canon::harvest`] walks `M::SHAPE`, detects each
+//!   top-level quotient field (a container-proxy type, optionally `Option`-wrapped)
+//!   and registers a canonicalizer built from
+//!   [`terraform_codec::canonicalize_through_shape`] — the type-erased,
+//!   `Value`-level round-trip (`Partial::alloc_shape` → fill → re-encode). It is the
+//!   default behind [`crate::Resource::semantic_equality`], so a quotient field needs
+//!   no per-resource code. (Follow-ups: cache the `Canon` per resource instead of
+//!   rebuilding per plan; recurse into nested blocks — top-level scalars only today.)
 //! - One caveat unrelated to the codec: `#[derive(Facet)]` auto-wires the
 //!   `display`/`debug`/`partial_eq` vtable hooks (via spez) but has **no `parse`
 //!   arm** — a `FromStr` impl never reaches the `parse` vtable slot. The quotient
@@ -71,6 +73,7 @@ use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::sync::Arc;
 
+use facet::{Def, Facet, Shape, Type as FType, UserType};
 use terraform_value::Value;
 
 /// A value-level canonicalizer: maps a `Value` to its canonical representative.
@@ -81,8 +84,8 @@ use terraform_value::Value;
 type Canonicalizer = Arc<dyn Fn(&Value) -> Value + Send + Sync>;
 
 /// A map from a top-level attribute name to its canonicalizer, for every
-/// attribute backed by a quotient type. Assembled explicitly for now (see the
-/// module docs on why reflection auto-harvest needs a codec bridge first).
+/// attribute backed by a quotient type. Auto-harvested from a model's `SHAPE` via
+/// [`Canon::harvest`], or assembled explicitly with [`Canon::with`].
 #[derive(Default, Clone)]
 #[must_use = "a Canon must be returned from `Resource::semantic_equality` to take effect"]
 pub struct Canon {
@@ -101,6 +104,43 @@ impl Canon {
     pub fn with(mut self, name: impl Into<String>, canon: Canonicalizer) -> Self {
         self.fields.insert(name.into(), canon);
         self
+    }
+
+    /// Auto-harvest a `Canon` from a model's reflected `SHAPE`: every top-level
+    /// field whose type is a quotient — a container-`proxy` type (e.g.
+    /// `#[facet(opaque, proxy = String)]`), optionally wrapped in `Option` — gets a
+    /// canonicalizer derived from its proxy conversions, with **no per-resource
+    /// wiring**. This is the zero-config counterpart to building a `Canon` by hand
+    /// with [`Canon::with`] + [`string_quotient`], and the default behind
+    /// [`Resource::semantic_equality`](crate::Resource::semantic_equality).
+    ///
+    /// A model with no quotient fields harvests an empty `Canon` (the planner then
+    /// skips the pre-pass entirely — zero overhead). Top-level scalars only, matching
+    /// [`keep_prior`]'s scope.
+    pub fn harvest<M: Facet<'static>>() -> Self {
+        Canon::harvest_shape(M::SHAPE)
+    }
+
+    fn harvest_shape(shape: &'static Shape) -> Self {
+        let mut canon = Canon::new();
+        let FType::User(UserType::Struct(st)) = &shape.ty else {
+            return canon;
+        };
+        for field in st.fields {
+            let fshape = field.shape();
+            if quotient_inner(fshape).is_some() {
+                let name = field.rename.unwrap_or(field.name);
+                // Canonicalize through the field's *own* shape (incl. any `Option`),
+                // so null and present values both compose correctly.
+                canon = canon.with(
+                    name,
+                    Arc::new(move |v: &Value| {
+                        terraform_codec::canonicalize_through_shape(fshape, v)
+                    }),
+                );
+            }
+        }
+        canon
     }
 
     /// True when no attribute is a quotient — the planner skips the pre-pass
@@ -132,6 +172,19 @@ where
             .unwrap_or_else(|| value.clone()),
         other => other.clone(),
     })
+}
+
+/// Peel `Option` wrappers and report whether the underlying type is a container
+/// proxy (a quotient). Returns the proxy-bearing shape if so, else `None` — used by
+/// [`Canon::harvest`] to decide which fields carry a canonicalizer.
+fn quotient_inner(shape: &'static Shape) -> Option<&'static Shape> {
+    if shape.has_any_proxy() {
+        return Some(shape);
+    }
+    match shape.def {
+        Def::Option(opt) => quotient_inner(opt.t),
+        _ => None,
+    }
 }
 
 /// Diff-suppression pre-pass: for each quotient-typed attribute present in both
@@ -209,6 +262,62 @@ mod tests {
 
     fn ci_canon() -> Canon {
         Canon::new().with("id", string_quotient::<CiId>())
+    }
+
+    // A model with a quotient field (bare and Option-wrapped) plus a plain field —
+    // used to prove `Canon::harvest` finds exactly the quotient attributes.
+    #[derive(facet::Facet)]
+    #[allow(dead_code)]
+    struct Model {
+        name: String,
+        id: CiId,
+        alias: Option<CiId>,
+    }
+
+    #[derive(facet::Facet)]
+    #[allow(dead_code)]
+    struct PlainModel {
+        name: String,
+        count: i64,
+    }
+
+    #[test]
+    fn harvest_registers_only_quotient_fields() {
+        let canon = Canon::harvest::<Model>();
+        assert!(!canon.is_empty());
+        // Both the bare and the Option-wrapped quotient canonicalize to lowercase…
+        assert_eq!(
+            canon.fields["id"](&Value::String("AbC".into())),
+            Value::String("abc".into())
+        );
+        assert_eq!(
+            canon.fields["alias"](&Value::String("XyZ".into())),
+            Value::String("xyz".into())
+        );
+        // …and a null Option stays null.
+        assert_eq!(canon.fields["alias"](&Value::Null), Value::Null);
+        // The plain field is not registered.
+        assert!(!canon.fields.contains_key("name"));
+    }
+
+    #[test]
+    fn harvest_of_a_model_without_quotients_is_empty() {
+        let canon = Canon::harvest::<PlainModel>();
+        assert!(
+            canon.is_empty(),
+            "no quotient fields -> empty Canon -> no pre-pass"
+        );
+    }
+
+    #[test]
+    fn harvested_canon_suppresses_case_only_change() {
+        // End-to-end through the harvested Canon (no hand wiring): a case-only
+        // change to a quotient field is kept as the prior value.
+        let canon = Canon::harvest::<Model>();
+        let prior = obj(&[("id", "aBc")]);
+        let mut proposed = obj(&[("id", "ABC")]);
+        keep_prior(&prior, &mut proposed, &canon);
+        assert_eq!(field(&proposed, "id"), "aBc");
     }
 
     #[test]

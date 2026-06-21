@@ -65,10 +65,10 @@ Rough priority order, each pointing at its tracked item:
 4. ~~**Semantic equality / normalization.**~~ ✅ **DONE (partial)** — *quotient
    types*: a value modeled as a newtype whose constructor canonicalizes makes
    semantic equality free (`canonical(a) == canonical(b)`), and the planner keeps
-   the prior value when a change is within the equivalence class. Explicit opt-in
-   today (`Resource::semantic_equality`); the codec proxy-decode bridge is now done
-   (a quotient type is a usable model field), so reflection auto-harvest is the next
-   step. → **3.6**.
+   the prior value when a change is within the equivalence class. Now **zero-wiring**:
+   the codec proxy bridge makes a quotient type a usable model field, and
+   `Resource::semantic_equality` defaults to auto-harvesting the `Canon` from
+   `M::SHAPE`. → **3.6**.
 5. ~~**Write-only attributes.**~~ ✅ **DONE** — the schema flag
    (`#[facet(terraform::write_only)]` → IR/emit/TS) *and* the runtime semantics:
    the value is nulled out of the planned and every returned state but merged
@@ -447,16 +447,21 @@ via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`)
   round-trips through the codec and **can be a real model field** (decode runs the
   canonicalizing `TryFrom`, encode renders it back). Verified by
   `terraform-codec` proxy round-trip tests and a `terraform-reflect` type test.
+- **Reflection auto-harvest — ✅ DONE.** `Canon::harvest::<M>()` (`normalize.rs`)
+  walks `M::SHAPE`, detects each top-level quotient field (a container-proxy type,
+  optionally `Option`-wrapped, via `quotient_inner`) and registers a canonicalizer
+  built from the type-erased `terraform_codec::canonicalize_through_shape` (a
+  shape-driven codec round-trip via `Partial::alloc_shape`). It is the **default**
+  behind `Resource::semantic_equality`, so a quotient field needs *zero* per-resource
+  wiring; an override can still add canonicalizers reflection can't see
+  (`Canon::harvest::<Self::Model>().with("id", string_quotient::<MyId>())`). A model
+  with no quotient fields harvests an empty `Canon` (pre-pass skipped, zero overhead).
+  Verified by `normalize.rs` harvest tests (incl. end-to-end through `keep_prior`).
 - **Deferred (promotion follow-ups, see `normalize.rs` docs):**
-  1. **Reflection auto-harvest** of `Canon` from `M::SHAPE` so a quotient field
-     needs *zero* per-resource wiring — now unblocked by the codec bridge above.
-     The remaining work is a type-erased, `Value`-level canonicalizer (a shape-driven
-     codec round-trip via `Partial::alloc_shape`) plus a `M::SHAPE` walk that detects
-     proxy-typed fields and registers each. This is the highest-value next step.
-  2. Build the `Canon` once and cache it (currently rebuilt per plan call).
-  3. `TryFrom<&str>`/`Cow` to avoid the per-call string clone.
-  4. Recurse into nested blocks / collections (top-level scalars only today).
-  5. Meta-backed resources skip suppression until ConfigureProvider (configure
+  1. Build the `Canon` once and cache it (currently rebuilt per plan call).
+  2. `TryFrom<&str>`/`Cow` to avoid the per-call string clone.
+  3. Recurse into nested blocks / collections (top-level scalars only today).
+  4. Meta-backed resources skip suppression until ConfigureProvider (configure
      precedes plan in the normal workflow, so this only affects a pre-configure
      partial plan).
 - **Out of scope (needs `modify_plan`):** *server-authoritative* normalization,
