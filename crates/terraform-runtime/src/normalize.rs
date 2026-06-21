@@ -46,8 +46,8 @@
 //!   `Value`-level round-trip (`Partial::alloc_shape` → fill → re-encode). It is the
 //!   default behind [`crate::Resource::semantic_equality`], so a quotient field needs
 //!   no per-resource code. The `ResourceAdapter` builds it once at construction and
-//!   clones it per plan (no per-plan `SHAPE` walk). (Follow-up: recurse into nested
-//!   blocks — top-level scalars only today.)
+//!   clones it per plan (no per-plan `SHAPE` walk). Recurses into single nested
+//!   blocks; repeated (list/set) blocks are the remaining follow-up.
 //! - One caveat unrelated to the codec: `#[derive(Facet)]` auto-wires the
 //!   `display`/`debug`/`partial_eq` vtable hooks (via spez) but has **no `parse`
 //!   arm** — a `FromStr` impl never reaches the `parse` vtable slot. The quotient
@@ -56,8 +56,11 @@
 //!
 //! ## Scope (current)
 //!
-//! - **Top-level scalar attributes only** (nested blocks/collections are a
-//!   follow-up — the pre-pass would recurse like `write_only::strip`).
+//! - **Top-level scalars and single nested blocks.** A quotient scalar at the top
+//!   level, or inside a *single* nested struct/block (`Struct` / `Option<Struct>`,
+//!   recursively), is suppressed. **Repeated** blocks (`Vec`/`HashSet` of struct —
+//!   list/set nesting) are *not* recursed: keeping a quotient inside a reordered
+//!   collection needs element matching, which is out of scope.
 //! - The pre-pass [`keep_prior`] runs *before* [`crate::plan::plan`]: rewriting a
 //!   semantically-unchanged proposed value back to the prior means the mechanical
 //!   planner then sees `before == after` and emits neither a spurious
@@ -84,13 +87,20 @@ use terraform_value::Value;
 /// hands out clones per plan, so this `Arc` is shared, never rebuilt.
 type Canonicalizer = Arc<dyn Fn(&Value) -> Value + Send + Sync>;
 
-/// A map from a top-level attribute name to its canonicalizer, for every
-/// attribute backed by a quotient type. Auto-harvested from a model's `SHAPE` via
-/// [`Canon::harvest`], or assembled explicitly with [`Canon::with`].
+/// The semantic-equality canonicalizers for a resource. `fields` maps a top-level
+/// attribute name to its canonicalizer (for quotient-typed scalars); `blocks` maps a
+/// **single** nested struct/block name to a child `Canon` for the quotients *inside*
+/// it (recursively). Auto-harvested from a model's `SHAPE` via [`Canon::harvest`], or
+/// assembled explicitly with [`Canon::with`] (top-level only).
+///
+/// Repeated blocks (`Vec`/`HashSet` of struct, i.e. list/set nesting) are **not**
+/// recursed — suppressing a quotient inside a reordered collection needs element
+/// matching, which is out of scope (see the module docs).
 #[derive(Default, Clone)]
 #[must_use = "a Canon must be returned from `Resource::semantic_equality` to take effect"]
 pub struct Canon {
     fields: BTreeMap<String, Canonicalizer>,
+    blocks: BTreeMap<String, Canon>,
 }
 
 impl Canon {
@@ -116,8 +126,8 @@ impl Canon {
     /// [`Resource::semantic_equality`](crate::Resource::semantic_equality).
     ///
     /// A model with no quotient fields harvests an empty `Canon` (the planner then
-    /// skips the pre-pass entirely — zero overhead). Top-level scalars only, matching
-    /// [`keep_prior`]'s scope.
+    /// skips the pre-pass entirely — zero overhead). Recurses into single nested
+    /// blocks; repeated (list/set) blocks are not, matching [`keep_prior`]'s scope.
     pub fn harvest<M: Facet<'static>>() -> Self {
         Canon::harvest_shape(M::SHAPE)
     }
@@ -129,25 +139,33 @@ impl Canon {
         };
         for field in st.fields {
             let fshape = field.shape();
+            let name = field.rename.unwrap_or(field.name);
             if quotient_inner(fshape).is_some() {
-                let name = field.rename.unwrap_or(field.name);
-                // Canonicalize through the field's *own* shape (incl. any `Option`),
-                // so null and present values both compose correctly.
-                canon = canon.with(
-                    name,
+                // A quotient scalar: canonicalize through the field's *own* shape
+                // (incl. any `Option`), so null and present values both compose.
+                canon.fields.insert(
+                    name.to_string(),
                     Arc::new(move |v: &Value| {
                         terraform_codec::canonicalize_through_shape(fshape, v)
                     }),
                 );
+            } else if let Some(inner) = single_struct_inner(fshape) {
+                // A single nested struct/block: recurse, keeping it only if it holds
+                // a quotient somewhere inside.
+                let nested = Canon::harvest_shape(inner);
+                if !nested.is_empty() {
+                    canon.blocks.insert(name.to_string(), nested);
+                }
             }
         }
         canon
     }
 
-    /// True when no attribute is a quotient — the planner skips the pre-pass
-    /// entirely (zero overhead for the common case, like `write_only`'s `block_has`).
+    /// True when neither a top-level attribute nor any nested block carries a
+    /// quotient — the planner skips the pre-pass entirely (zero overhead for the
+    /// common case, like `write_only`'s `block_has`).
     pub fn is_empty(&self) -> bool {
-        self.fields.is_empty()
+        self.fields.is_empty() && self.blocks.is_empty()
     }
 }
 
@@ -188,6 +206,18 @@ fn quotient_inner(shape: &'static Shape) -> Option<&'static Shape> {
     }
 }
 
+/// Peel `Option` and return the inner shape iff it is a **single** nested struct
+/// (not a list/set/map of structs, nor a scalar) — the case [`keep_prior`] can
+/// recurse into as one object. Returns `None` for collections (element matching is
+/// out of scope) and non-structs.
+fn single_struct_inner(shape: &'static Shape) -> Option<&'static Shape> {
+    match shape.def {
+        Def::Option(opt) => single_struct_inner(opt.t),
+        Def::List(_) | Def::Slice(_) | Def::Array(_) | Def::Set(_) | Def::Map(_) => None,
+        _ => matches!(&shape.ty, FType::User(UserType::Struct(_))).then_some(shape),
+    }
+}
+
 /// Diff-suppression pre-pass: for each quotient-typed attribute present in both
 /// `prior` and `proposed`, if the two are *semantically equal* (equal after
 /// canonicalization) rewrite the proposed value back to the **prior** value
@@ -224,6 +254,20 @@ pub fn keep_prior(prior: &Value, proposed: &mut Value, canon: &Canon) {
             let kept = prior_value.clone();
             proposed_fields.insert(name.clone(), kept);
         }
+    }
+
+    // Recurse into single nested blocks: keep any quotient *inside* the block that is
+    // semantically equal, leaving the rest of the block (and the block's presence)
+    // exactly as proposed. A null/absent block on either side has nothing to keep —
+    // the recursive call's own object guards handle that.
+    for (name, nested) in &canon.blocks {
+        let Some(prior_block) = prior_fields.get(name) else {
+            continue;
+        };
+        let Some(proposed_block) = proposed_fields.get_mut(name) else {
+            continue;
+        };
+        keep_prior(prior_block, proposed_block, nested);
     }
 }
 
@@ -319,6 +363,66 @@ mod tests {
         let mut proposed = obj(&[("id", "ABC")]);
         keep_prior(&prior, &mut proposed, &canon);
         assert_eq!(field(&proposed, "id"), "aBc");
+    }
+
+    // A single nested block holding a quotient, plus a repeated one that must NOT be
+    // recursed (collection element-matching is out of scope).
+    #[derive(facet::Facet)]
+    #[allow(dead_code)]
+    struct Settings {
+        id: CiId,
+        note: String,
+    }
+
+    #[derive(facet::Facet)]
+    #[allow(dead_code)]
+    struct Nested {
+        name: String,
+        settings: Settings,
+        maybe: Option<Settings>,
+        list: Vec<Settings>,
+    }
+
+    #[test]
+    fn harvest_recurses_into_single_nested_blocks_only() {
+        let canon = Canon::harvest::<Nested>();
+        assert!(!canon.is_empty());
+        assert!(canon.blocks.contains_key("settings"), "bare single block");
+        assert!(canon.blocks.contains_key("maybe"), "optional single block");
+        assert!(
+            !canon.blocks.contains_key("list"),
+            "repeated blocks are not recursed"
+        );
+        // The block's own quotient is registered one level down.
+        assert!(canon.blocks["settings"].fields.contains_key("id"));
+        assert!(!canon.fields.contains_key("name"));
+    }
+
+    #[test]
+    fn keep_prior_suppresses_case_only_change_inside_a_block() {
+        let canon = Canon::harvest::<Nested>();
+        let prior = nested_obj("aBc", "keep");
+        let mut proposed = nested_obj("ABC", "keep"); // case-only change to inner id
+        keep_prior(&prior, &mut proposed, &canon);
+        assert_eq!(
+            inner_field(&proposed, "settings", "id"),
+            "aBc",
+            "case-only inner change kept the prior bytes"
+        );
+    }
+
+    #[test]
+    fn keep_prior_preserves_real_change_inside_a_block() {
+        let canon = Canon::harvest::<Nested>();
+        let prior = nested_obj("abc", "old");
+        let mut proposed = nested_obj("xyz", "new"); // real id change + note change
+        keep_prior(&prior, &mut proposed, &canon);
+        assert_eq!(inner_field(&proposed, "settings", "id"), "xyz");
+        assert_eq!(
+            inner_field(&proposed, "settings", "note"),
+            "new",
+            "non-quotient inner change is untouched"
+        );
     }
 
     #[test]
@@ -436,6 +540,25 @@ mod tests {
                 Some(Value::String(s)) => s,
                 _ => panic!("field {name} not a string"),
             },
+            _ => panic!("not an object"),
+        }
+    }
+
+    /// Build `{ name: "n", settings: { id, note } }` for the nested-block tests.
+    fn nested_obj(id: &str, note: &str) -> Value {
+        let mut settings = BTreeMap::new();
+        settings.insert("id".to_string(), Value::String(id.to_string()));
+        settings.insert("note".to_string(), Value::String(note.to_string()));
+        let mut outer = BTreeMap::new();
+        outer.insert("name".to_string(), Value::String("n".to_string()));
+        outer.insert("settings".to_string(), Value::Object(settings));
+        Value::Object(outer)
+    }
+
+    /// Read `v[block][name]` as a string.
+    fn inner_field<'a>(v: &'a Value, block: &str, name: &str) -> &'a str {
+        match v {
+            Value::Object(m) => field(m.get(block).expect("block present"), name),
             _ => panic!("not an object"),
         }
     }

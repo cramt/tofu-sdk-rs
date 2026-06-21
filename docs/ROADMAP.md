@@ -470,9 +470,14 @@ via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`)
   once at construction (`semantic_equality` is a static description of the model);
   `DynResource::semantic_equality` hands out a cheap `Arc`-backed clone per plan, so
   there is no per-plan `SHAPE` walk.
+- **Single nested-block recursion — ✅ DONE.** `harvest` + `keep_prior` recurse
+  into a single nested struct/block (`Struct`/`Option<Struct>`) so a quotient inside
+  a config block is suppressed too (`single_struct_inner` gates it). **Repeated**
+  (list/set) blocks are still not recursed — element matching across a reordered
+  collection is the remaining gap.
 - **Deferred (promotion follow-ups, see `normalize.rs` docs):**
   1. `TryFrom<&str>`/`Cow` to avoid the per-call string clone.
-  2. Recurse into nested blocks / collections (top-level scalars only today).
+  2. Recurse into **repeated** (list/set) blocks — needs element matching.
   3. Meta-backed resources skip suppression until ConfigureProvider (configure
      precedes plan in the normal workflow, so this only affects a pre-configure
      partial plan).
