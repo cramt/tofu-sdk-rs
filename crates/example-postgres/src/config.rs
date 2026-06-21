@@ -94,7 +94,7 @@ pub async fn configure(cfg: PgProviderConfig) -> Result<Arc<Pg>, Diag> {
                  README, \"Enabling TLS\", to wire up rustls."
             ),
         )
-        .at("sslmode"));
+        .at(["sslmode"]));
     }
 
     let mut pg_config = tokio_postgres::Config::new();

@@ -54,6 +54,10 @@ terraform-macros    reserved (empty)
 example-aws         example provider binary + the real-tofu contract tests
 example-fs          side-effecting example provider (writes resource JSON files);
                     subject of the TS iteration-sequence harness
+example-postgres    production-shaped template provider over a real PostgreSQL
+                    (deadpool-postgres pool): roles/databases/schemas/extensions/
+                    tables + 2 data sources. Contract suite spins Postgres up in
+                    Docker and drives `tofu test` (needs docker + tofu on PATH)
 
 packages/tofu-sdk   @tofu-sdk/core — write providers in TypeScript
   native/           napi-rs Node addon (cdylib) over the dynamic seam

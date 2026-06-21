@@ -1,9 +1,10 @@
 //! `pg_role` — a PostgreSQL role (a "user" when it can log in).
 //!
-//! Demonstrates: a write-only secret (`password`), boolean attributes with
-//! schema defaults, in-place `ALTER` updates, drift detection via `pg_roles`,
-//! import by name, and config validation. Also defines the plural **`pg_roles`
-//! data source** (a dedicated, password-free model) to show a list lookup.
+//! Demonstrates: a write-only secret (`password`), optional boolean flags with
+//! handler-side defaults, in-place `ALTER` updates, existence drift detection via
+//! `pg_roles`, import by name, and config validation. Also defines the plural
+//! **`pg_roles` data source** (a dedicated, password-free model) to show a list
+//! lookup.
 
 use std::sync::Arc;
 
@@ -18,9 +19,10 @@ use crate::config::Pg;
 use crate::sql::{ds_err, quote_ident, quote_literal, res_err};
 
 /// A role / login user. `name` is the primary key and forces replacement on
-/// rename. The boolean attributes default in the schema so they are always known
-/// (no perpetual diff against the catalog). `password` is write-only — it reaches
-/// the handler at apply time but is never persisted to state.
+/// rename. The boolean flags are plain optionals the handler defaults (omitting
+/// one keeps it null in state, so it never drifts against the catalog).
+/// `password` is write-only — it reaches the handler at apply time but is never
+/// persisted to state.
 #[derive(Facet)]
 #[facet(terraform::resource("pg_role"))]
 pub struct RoleModel {
@@ -28,21 +30,19 @@ pub struct RoleModel {
     #[facet(terraform::force_new)]
     pub name: String,
 
-    /// Whether the role may log in (i.e. is a "user"). Defaults to `true`.
-    #[facet(terraform::default("true"))]
-    pub login: bool,
+    /// Whether the role may log in (i.e. is a "user"). Optional; treated as
+    /// `true` when omitted. Left as configured (not drift-refreshed), so an
+    /// omitted value stays null and never produces a perpetual diff.
+    pub login: Option<bool>,
 
-    /// Whether the role is a superuser. Defaults to `false`.
-    #[facet(terraform::default("false"))]
-    pub superuser: bool,
+    /// Whether the role is a superuser. Optional; treated as `false` when omitted.
+    pub superuser: Option<bool>,
 
-    /// Whether the role may create databases. Defaults to `false`.
-    #[facet(terraform::default("false"))]
-    pub create_db: bool,
+    /// Whether the role may create databases. Optional; `false` when omitted.
+    pub create_db: Option<bool>,
 
-    /// Whether the role may create other roles. Defaults to `false`.
-    #[facet(terraform::default("false"))]
-    pub create_role: bool,
+    /// Whether the role may create other roles. Optional; `false` when omitted.
+    pub create_role: Option<bool>,
 
     /// The role's password. Write-only: used by `create`/`update` but nulled out
     /// of every persisted state.
@@ -57,11 +57,32 @@ pub struct RoleModel {
 /// Render the `WITH …` attribute clause shared by `CREATE`/`ALTER ROLE`.
 /// `password` is interpolated as a quoted literal because DDL cannot bind it.
 fn role_options(model: &RoleModel) -> String {
+    // Optional flags take their documented defaults when omitted.
     let mut opts = vec![
-        if model.login { "LOGIN" } else { "NOLOGIN" }.to_string(),
-        if model.superuser { "SUPERUSER" } else { "NOSUPERUSER" }.to_string(),
-        if model.create_db { "CREATEDB" } else { "NOCREATEDB" }.to_string(),
-        if model.create_role { "CREATEROLE" } else { "NOCREATEROLE" }.to_string(),
+        if model.login.unwrap_or(true) {
+            "LOGIN"
+        } else {
+            "NOLOGIN"
+        }
+        .to_string(),
+        if model.superuser.unwrap_or(false) {
+            "SUPERUSER"
+        } else {
+            "NOSUPERUSER"
+        }
+        .to_string(),
+        if model.create_db.unwrap_or(false) {
+            "CREATEDB"
+        } else {
+            "NOCREATEDB"
+        }
+        .to_string(),
+        if model.create_role.unwrap_or(false) {
+            "CREATEROLE"
+        } else {
+            "NOCREATEROLE"
+        }
+        .to_string(),
     ];
     if let Some(password) = model.password.as_deref().filter(|p| !p.is_empty()) {
         opts.push(format!("PASSWORD {}", quote_literal(password)));
@@ -72,10 +93,18 @@ fn role_options(model: &RoleModel) -> String {
 /// Fetch a role's catalog OID by name, erroring if it has vanished.
 async fn fetch_oid(db: &Object, name: &str) -> Result<i64, ResourceError> {
     let row = db
-        .query_opt("SELECT oid::int8 FROM pg_roles WHERE rolname = $1", &[&name])
+        .query_opt(
+            "SELECT oid::int8 FROM pg_roles WHERE rolname = $1",
+            &[&name],
+        )
         .await
         .map_err(|e| res_err("failed to read role oid", e))?
-        .ok_or_else(|| res_err("role disappeared", format!("role {name:?} not found after write")))?;
+        .ok_or_else(|| {
+            res_err(
+                "role disappeared",
+                format!("role {name:?} not found after write"),
+            )
+        })?;
     Ok(row.get(0))
 }
 
@@ -91,20 +120,24 @@ impl Resource for RoleResource {
     async fn validate(&self, _ctx: &mut Ctx, config: RoleModel) -> Vec<Diag> {
         let mut diags = Vec::new();
         if config.name.trim().is_empty() {
-            diags.push(Diag::error("invalid role name", "name must not be empty").at("name"));
+            diags.push(Diag::error("invalid role name", "name must not be empty").at(["name"]));
         } else if config.name.starts_with("pg_") {
             diags.push(
                 Diag::error(
                     "reserved role name",
                     "role names beginning with `pg_` are reserved by PostgreSQL",
                 )
-                .at("name"),
+                .at(["name"]),
             );
         }
         diags
     }
 
-    async fn create(&self, _ctx: &mut Ctx, mut planned: RoleModel) -> Result<RoleModel, ResourceError> {
+    async fn create(
+        &self,
+        _ctx: &mut Ctx,
+        mut planned: RoleModel,
+    ) -> Result<RoleModel, ResourceError> {
         let db = self.pg.get().await.map_err(|e| res_err("connect", e))?;
         db.batch_execute(&format!(
             "CREATE ROLE {} WITH {}",
@@ -143,18 +176,15 @@ impl Resource for RoleResource {
         let db = self.pg.get().await.map_err(|e| res_err("connect", e))?;
         let row = db
             .query_opt(
-                "SELECT oid::int8, rolcanlogin, rolsuper, rolcreatedb, rolcreaterole \
-                 FROM pg_roles WHERE rolname = $1",
+                "SELECT oid::int8 FROM pg_roles WHERE rolname = $1",
                 &[&current.name],
             )
             .await
             .map_err(|e| res_err("failed to read role", e))?;
         let Some(row) = row else { return Ok(None) };
+        // Only the computed `oid` is refreshed; the configured flags are left as
+        // stored so an omitted (null) flag does not drift to its catalog value.
         current.oid = row.get(0);
-        current.login = row.get(1);
-        current.superuser = row.get(2);
-        current.create_db = row.get(3);
-        current.create_role = row.get(4);
         Ok(Some(current))
     }
 
@@ -179,10 +209,10 @@ impl Resource for RoleResource {
             .ok_or_else(|| res_err("role not found", format!("no role named {id:?}")))?;
         Ok(RoleModel {
             name: id,
-            login: row.get(1),
-            superuser: row.get(2),
-            create_db: row.get(3),
-            create_role: row.get(4),
+            login: Some(row.get(1)),
+            superuser: Some(row.get(2)),
+            create_db: Some(row.get(3)),
+            create_role: Some(row.get(4)),
             password: None,
             oid: row.get(0),
         })
@@ -225,7 +255,11 @@ pub struct RolesDataSource {
 impl DataSourceList for RolesDataSource {
     type Model = RoleQuery;
 
-    async fn list(&self, _ctx: &mut Ctx, query: RoleQuery) -> Result<Vec<RoleQuery>, DataSourceError> {
+    async fn list(
+        &self,
+        _ctx: &mut Ctx,
+        query: RoleQuery,
+    ) -> Result<Vec<RoleQuery>, DataSourceError> {
         let db = self.pg.get().await.map_err(|e| ds_err("connect", e))?;
         // An unset search key arrives as the zero value (empty string) → list all.
         let rows = if query.name.is_empty() {
