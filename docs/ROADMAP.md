@@ -352,8 +352,17 @@ via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`)
   `ctx.set_private(...)` persists new ones, threaded through the apply/read/plan
   responses in `service.rs` (regression: `read_observes_incoming_private_state`,
   `create_success_carries_warning_and_persists_private_state`).
-- **`timeouts {}`:** the common per-operation timeout block convention. Now
-  expressible as a nested block; needs runtime plumbing to read + enforce.
+- ~~**`timeouts {}`.**~~ ✅ **DONE** — the per-operation deadline block
+  (`terraform-runtime/src/timeouts.rs`). Authors embed the ready-made
+  `terraform_runtime::Timeouts` as an optional nested block
+  (`#[facet(terraform::block)] timeouts: Option<Timeouts>`); the runtime reads the
+  relevant Go-style duration (`"30s"`/`"1h30m"`/`"500ms"`) off the dynamic `Value`
+  at apply/read time and wraps the handler in `tokio::time::timeout`
+  (`timeouts::bounded`, inside the panic-guard/ctx scope), turning an overrun into a
+  clean error diagnostic. create/update read the deadline from the planned state,
+  delete from the prior, read from the current. Absent/blank/zero → unbounded.
+  Verified by parser/extraction unit tests and an end-to-end service test
+  (`timeouts_block_bounds_a_slow_create`).
 - ~~**Write-only attributes.**~~ ✅ **DONE** — both pieces. *Schema flag:*
   `AttributeSchema.write_only` (`terraform-ir`), reflected from
   `#[facet(terraform::write_only)]` (`terraform-reflect`; rejects

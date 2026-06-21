@@ -226,6 +226,18 @@ it; keep it static. The preset is exposed via the package.json `exports` subpath
   handler matches on `source_type_name` and maps the dynamic value onto its model.
   Defaulted to an "unsupported" error; defaulted `DynResource::move_state` keeps
   the Node binding unaffected.
+- **`timeouts {}` is a plain nested block + runtime enforcement, not a schema
+  concept** (`terraform-runtime/src/timeouts.rs`). Authors embed
+  `terraform_runtime::Timeouts` (fields `create`/`read`/`update`/`delete`, all
+  `Option<String>`) as `#[facet(terraform::block)] timeouts: Option<Timeouts>`; it
+  reflects like any optional single block. The runtime reads the deadline off the
+  dynamic `Value` (NOT the typed model) — `timeouts::for_operation(value, op)` —
+  before dispatch and wraps the handler in `timeouts::bounded` (a
+  `tokio::time::timeout`) *inside* the panic-guard/ctx scope, so an overrun becomes
+  an error `Diag` and cancellation/warnings still apply up to the deadline.
+  create/update read from the planned state, delete from prior, read from current.
+  Durations are Go-style (`time.ParseDuration`); absent/blank/zero/unparseable =
+  unbounded. The seam is untouched (the binding never sees a `Timeouts`).
 - **Semantic equality is a *quotient type*, not a diff-suppress closure** (roadmap
   3.6, `terraform-runtime/src/normalize.rs`). Terraform *core* owns the structural
   diff, so the provider's only lever is to plan the **prior** value when the new

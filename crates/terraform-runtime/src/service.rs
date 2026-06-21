@@ -539,8 +539,13 @@ impl tfplugin6::provider_server::Provider for ProviderService {
             }
         };
 
+        let limit = crate::timeouts::for_operation(&current, "read");
         let (outcome, outs) = self
-            .run("read resource", req.private.clone(), handler.read(current))
+            .run(
+                "read resource",
+                req.private.clone(),
+                crate::timeouts::bounded("read", limit, handler.read(current)),
+            )
             .await;
         let mut new_value = match outcome {
             Ok(Some(v)) => v,
@@ -639,17 +644,34 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         };
         tracing::debug!(type_name = %req.type_name, action, "ApplyResourceChange");
         let private_in = req.planned_private.clone();
+        // A `timeouts {}` block bounds the operation: create/update read the deadline
+        // from the planned state, delete from the prior state. `bounded` is a no-op
+        // when no deadline is set.
+        let limit_source = if planned.is_null() { &prior } else { &planned };
+        let limit = crate::timeouts::for_operation(limit_source, action);
         let (outcome, outs): (Result<Value, Diagnostics>, CtxOutputs) = if planned.is_null() {
-            self.run("delete", private_in, async {
-                handler.delete(prior.clone()).await.map(|()| Value::Null)
-            })
+            self.run(
+                "delete",
+                private_in,
+                crate::timeouts::bounded("delete", limit, async {
+                    handler.delete(prior.clone()).await.map(|()| Value::Null)
+                }),
+            )
             .await
         } else if prior.is_null() {
-            self.run("create", private_in, handler.create(planned))
-                .await
+            self.run(
+                "create",
+                private_in,
+                crate::timeouts::bounded("create", limit, handler.create(planned)),
+            )
+            .await
         } else {
-            self.run("update", private_in, handler.update(planned, prior.clone()))
-                .await
+            self.run(
+                "update",
+                private_in,
+                crate::timeouts::bounded("update", limit, handler.update(planned, prior.clone())),
+            )
+            .await
         };
 
         match outcome {

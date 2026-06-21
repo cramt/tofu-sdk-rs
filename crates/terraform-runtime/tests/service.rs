@@ -13,7 +13,7 @@ use terraform_attrs as terraform;
 use terraform_runtime::{
     async_trait, ConfigureError, Ctx, DataSource, DataSourceError, DataSourceList, Diag, Ephemeral,
     EphemeralError, EphemeralFromResource, Path, PlanModifications, Provider, ProviderService,
-    Resource, ResourceError,
+    Resource, ResourceError, Timeouts,
 };
 use terraform_tfplugin6::tfplugin6::{self, provider_server::Provider as _};
 use tonic::{Code, Request};
@@ -389,6 +389,92 @@ async fn semantic_equality_suppresses_spurious_replacement_in_plan() {
         plan.requires_replace.len(),
         1,
         "a real id change still forces replacement"
+    );
+}
+
+/// A resource with a `timeouts {}` block and a deliberately slow `create`, used to
+/// prove the runtime reads the block and bounds the operation.
+#[derive(Facet)]
+#[facet(terraform::resource("slow_thing"))]
+#[allow(dead_code)]
+struct SlowThing {
+    name: String,
+    #[facet(terraform::block)]
+    timeouts: Option<Timeouts>,
+}
+
+struct SlowResource;
+
+#[async_trait]
+impl Resource for SlowResource {
+    type Model = SlowThing;
+
+    async fn create(&self, _ctx: &mut Ctx, planned: SlowThing) -> Result<SlowThing, ResourceError> {
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        Ok(planned)
+    }
+}
+
+#[tokio::test]
+async fn timeouts_block_bounds_a_slow_create() {
+    let svc = Provider::builder()
+        .resource(SlowResource)
+        .build()
+        .map(ProviderService::new)
+        .expect("provider builds");
+
+    // Use the resource's real reflected wire type so the encoding matches what the
+    // service decodes.
+    let resource =
+        terraform_reflect::reflect_resource::<SlowThing>("slow_thing").expect("reflects");
+    let ty = resource.block.cty_type();
+
+    let mut timeouts = std::collections::BTreeMap::new();
+    timeouts.insert(
+        "create".to_string(),
+        terraform_value::Value::String("50ms".into()),
+    );
+    for absent in ["read", "update", "delete"] {
+        timeouts.insert(absent.to_string(), terraform_value::Value::Null);
+    }
+    let mut obj = std::collections::BTreeMap::new();
+    obj.insert(
+        "name".to_string(),
+        terraform_value::Value::String("x".into()),
+    );
+    obj.insert(
+        "timeouts".to_string(),
+        terraform_value::Value::Object(timeouts),
+    );
+    let planned = tfplugin6::DynamicValue {
+        msgpack: terraform_codec::encode_msgpack(&terraform_value::Value::Object(obj), &ty)
+            .expect("encode planned"),
+        json: vec![],
+    };
+
+    let started = std::time::Instant::now();
+    let resp = svc
+        .apply_resource_change(Request::new(tfplugin6::apply_resource_change::Request {
+            type_name: "slow_thing".into(),
+            prior_state: None,
+            planned_state: Some(planned),
+            ..Default::default()
+        }))
+        .await
+        .expect("apply")
+        .into_inner();
+
+    // The 50ms deadline fires well before the handler's 30s sleep would finish.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the deadline should abort the slow handler promptly"
+    );
+    assert!(
+        resp.diagnostics
+            .iter()
+            .any(|d| d.summary.contains("create timed out")),
+        "expected a create-timeout diagnostic, got {:?}",
+        resp.diagnostics
     );
 }
 

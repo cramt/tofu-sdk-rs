@@ -16,13 +16,13 @@ mod function;
 pub mod handshake;
 mod log;
 // Semantic equality (roadmap 3.6): diff suppression derived from a field's
-// quotient type. Partial — explicit opt-in via `Resource::semantic_equality`;
-// reflection auto-harvest is deferred (see `normalize.rs`).
+// quotient type, auto-harvested from the model's `SHAPE` (see `normalize.rs`).
 mod normalize;
 mod plan;
 mod resource;
 mod serve;
 mod service;
+mod timeouts;
 mod tls;
 mod write_only;
 
@@ -37,6 +37,7 @@ pub use function::{Function, FunctionError, VariadicFunction};
 pub use normalize::{string_quotient, Canon};
 pub use resource::{Path, PathStep, PlanModifications, Resource, ResourceError};
 pub use serve::{serve, ServeError};
+pub use timeouts::Timeouts;
 
 /// The erased, `Value`-oriented handler traits and diagnostic types. These are
 /// the dynamic seam used by non-Rust frontends (paired with
