@@ -85,10 +85,17 @@ sees a facet-derived user type — `plan.rs` and `service.rs` operate purely on 
 / `dyn_ephemeral` (hand-built `Block` + erased handler) and `dyn_provider_config`
 / `dyn_configure`. The **Node binding** (`packages/tofu-sdk/native`) is built
 entirely on it — it builds the IR from a JS schema description and implements the
-erased traits (incl. `DynEphemeral`) by calling async JS handlers over
+erased traits (`DynResource`/`DynDataSource`/`DynEphemeral`/`DynConfigure`, plus
+`DynValidateConfig` for a provider-config `validate` hook and `DynFunction` for
+provider-defined functions) by calling async JS handlers over
 `ThreadsafeFunction<String, Promise<String>>`, marshalling `Value` ⇄ JSON through
-facet (never hand-rolled). All schema shaping (singular/plural data sources,
-search keys) stays in JS; Rust stays schema-agnostic. The ephemeral seam is the
+facet (never hand-rolled). Functions take a signature JSON (ordered cty `params`,
+optional `variadic`, `return`) and receive their already-decoded arguments as a
+positional JSON array. All schema shaping (singular/plural data sources, search
+keys, function signatures) stays in JS; Rust stays schema-agnostic. **Still
+unimplemented in the binding:** `DynListResource`, `DynStateStore`, resource
+identity (the `dyn_resource` seam carries `identity: None`), `modify_plan`/
+`move_state`, and the resource-handler `Ctx` (warnings/private/cancellation). The ephemeral seam is the
 one place the binding reaches the ambient `Ctx` (via the public `current_ctx()`):
 `open` returns `{ result, private?, renewAt? }` and the addon writes private/
 renewAt onto the ctx (the service reads them back), while `renew`/`close` receive
@@ -96,17 +103,46 @@ the private handle string. Build/test it with `pnpm build` / `pnpm test` inside 
 shell (it shells out to `cargo`, which needs `PROTOC`); `pnpm test` drives a real
 `tofu` through `examples/aws-provider.cjs`.
 
-Schemas in the TS layer (`ts/index.ts`) are **Zod** objects: `z.toJSONSchema` →
-cty (the structural derivation Standard Schema can't provide), `z.infer` gives
-the handler types, and `safeParse` validates handler output. The Terraform-only
-dispositions Zod can't express (`computed`/`forceNew`/`sensitive`/`blocks`) are
-arrays typed as `(keyof z.infer<S>)[]`, so a bad field name is a compile error.
-This is entirely TS-side; it compiles down to the same cty-JSON the addon takes.
-`blocks` names object/array-of-object fields to emit as nested **blocks** (the
-addon's `block_from_schema_json` now parses a `blocks` array into IR
-`NestedBlock`s; the TS `blockFromField` derives them from the Zod element). So
-the TS frontend gets HCL `name { … }` blocks without the facet `terraform::block`
-marker — see `examples/cloudflare-provider.ts`.
+Schemas in the TS layer are **Zod** objects, derived to cty by a **pure,
+native-free module** (`ts/schema.ts` — unit-tested via `dist/schema.js` in
+`test/schema.test.mjs`, no addon/engine needed): `z.infer` gives the handler
+types and `safeParse` validates handler output. The cty type is read **directly
+from the Zod type** via Zod 4 introspection (`_zod.def`), *not* `z.toJSONSchema`
+— deliberately, because `z.toJSONSchema` *throws* on the two constructs the
+design law uses: `z.set` ("Set cannot be represented in JSON Schema") and
+`.transform` ("Transforms cannot be represented…"). Reading the Zod type directly
+makes the **algebraic design law carry to the TS frontend**: **`z.set(T)` →
+cty `set` (unordered)**, the Zod analog of choosing `HashSet<T>` over `Vec<T>`
+(order-must-not-matter expressed by the type, so Terraform's structural diff is
+order-insensitive for free — no dedup code). A **scalar** `z.set` rides as a JS
+`Set` and is marshaled to/from the JSON array on the wire (`reviveSets` on input,
+`toWireJson`/`setReplacer` on output, applied at every handler boundary in
+`index.ts`); `z.set` of *objects* is rejected (a JS `Set` can't dedup by value).
+`z.array` stays an ordered `list`, `z.record` a `map`. **Dispositions live on the
+Zod field, not in out-of-band arrays** — the "algebraic types define everything"
+direction. Each field's `.meta({ computed/forceNew/sensitive/writeOnly/deprecated/
+block/set })` is read by `peel()` (which gathers `.meta()` across wrappers like
+`.optional()`) and typed by augmenting Zod's `GlobalMeta` with `TfMeta`, so a bad
+key is a compile error. The legacy `(keyof z.infer<S>)[]` disposition *arrays*
+(`computed: [...]`, `blocks: [...]`, …) still work and are merged in. `block`
+names object / array-of-object / set-marked-array fields to emit as nested
+**blocks** (`single` / `list` / `set` nesting; the addon's
+`block_from_schema_json` parses the `blocks` JSON into IR `NestedBlock`s). So the
+TS frontend gets HCL `name { … }` blocks without the facet `terraform::block`
+marker — see `examples/cloudflare-provider.ts` (every disposition on its field).
+- **Gap — quotient types / semantic equality don't reach TS yet.** The other
+  half of the design law (a *quotient* type whose constructor canonicalizes, so
+  `==` on the representative is the equality — `#[facet(opaque, proxy = String)]`
+  on the Rust side) has **no TS path**: `.transform`/`z.codec` (the natural Zod
+  expression of "parse, don't validate") throws in `z.toJSONSchema` *and*
+  `ctyFromZod` rejects it with a clear error, because suppressing the resulting
+  spurious diffs needs the runtime normalization seam (`normalize.rs`'s
+  `keep_prior`/`Canon`) which `DynResource::semantic_equality` only defaults for
+  the dynamic seam — the Node binding never builds a `Canon`. Wiring it would mean
+  letting the addon declare per-attribute canonicalizers (a `normalize`
+  disposition) and making the `keep_prior` pre-pass able to call an **async** JS
+  canonicalizer through the threadsafe-function seam. Deferred; tracked as a
+  follow-up.
 
 **Packaging is a single self-contained file.** A provider needs to be an
 executable named `terraform-provider-<name>`; for Node that's a shebang'd JS file

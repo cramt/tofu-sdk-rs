@@ -30,7 +30,8 @@
     "build": "pnpm run build:native && pnpm run build:ts",
     "build:native": "napi build --platform --release --manifest-path native/Cargo.toml --output-dir binding --js index.js --dts index.d.ts",
     "build:ts": "tsc -p tsconfig.json",
-    "test": "pnpm run build && node --test test/*.test.mjs"
+    "test": "pnpm run build && node --test test/*.test.mjs",
+    "test:unit": "pnpm run build:ts && node --test test/schema.test.mjs"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3",

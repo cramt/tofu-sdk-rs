@@ -24,11 +24,27 @@ const BucketLookup = z.object({
 });
 
 new Provider()
-  // Provider configuration: an optional `region`, stashed for the handlers.
+  // Provider configuration: an optional `region`, stashed for the handlers. The
+  // `validate` hook rejects an obviously-bad region before configure runs.
   .config({
     schema: z.object({ region: z.string().optional() }),
     async configure(config) {
       region = config.region || "us-east-1";
+    },
+    validate(config) {
+      if (config.region === "bad") {
+        return [{ severity: "error", summary: "invalid region", attribute: ["region"] }];
+      }
+      return [];
+    },
+  })
+  // A provider-defined function: `provider::aws::arn_for("my-bucket")`.
+  .function("arn_for", {
+    params: z.object({ name: z.string() }),
+    returns: z.string(),
+    summary: "Build an S3 ARN from a bucket name.",
+    async call({ name }) {
+      return `${ARN_PREFIX}${name}`;
     },
   })
   // A managed resource: `name` forces replacement; `arn`/`region` are computed.

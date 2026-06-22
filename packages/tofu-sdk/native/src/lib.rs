@@ -23,10 +23,11 @@ use napi_derive::napi;
 use std::time::{Duration, SystemTime};
 
 use terraform_codec::{decode_json, encode_json};
-use terraform_ir::{AttributeSchema, Block, NestedBlock, NestingMode};
+use terraform_ir::{AttributeSchema, Block, FunctionSignature, NestedBlock, NestingMode, Parameter};
 use terraform_runtime::{
     async_trait, current_ctx, serve as serve_provider, Diag, Diagnostics, DynConfigure,
-    DynDataSource, DynEphemeral, DynResource, Provider as RtProvider,
+    DynDataSource, DynEphemeral, DynFunction, DynResource, DynValidateConfig, FunctionError,
+    Provider as RtProvider,
 };
 use terraform_value::{Type, Value};
 
@@ -164,6 +165,77 @@ fn nested_block_from_value(value: &facet_value::Value) -> std::result::Result<Ne
         block,
         min_items: int("minItems").unwrap_or(0),
         max_items: int("maxItems").unwrap_or(0),
+    })
+}
+
+/// Decode a `cty` type constraint (itself JSON) by re-serializing it and reusing
+/// the canonical cty decoder — the same trick `block_from_schema_value` uses.
+fn cty_type_from(value: &facet_value::Value) -> std::result::Result<Type, String> {
+    let bytes = facet_json::to_string(value).map_err(|e| e.to_string())?;
+    Type::from_cty_json_bytes(bytes.as_bytes())
+}
+
+/// Build a [`FunctionSignature`] from the JS description:
+/// `{ "params": [ { "name", "type": <cty>, "allowNull"?, "description"? } ],
+///    "variadic"?: { … same … }, "return": <cty>, "summary"?, "description"? }`.
+fn function_signature_from_json(
+    name: String,
+    json: &str,
+) -> std::result::Result<FunctionSignature, String> {
+    let parsed: facet_value::Value =
+        facet_json::from_slice(json.as_bytes()).map_err(|e| e.to_string())?;
+    let obj = parsed.as_object().ok_or("function signature must be an object")?;
+
+    let parse_param = |p: &facet_value::Value| -> std::result::Result<Parameter, String> {
+        let po = p.as_object().ok_or("each parameter must be an object")?;
+        let pname = po
+            .get("name")
+            .and_then(|v| v.as_string())
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_default();
+        let ty = cty_type_from(
+            po.get("type")
+                .ok_or_else(|| format!("parameter `{pname}` is missing a `type`"))?,
+        )?;
+        Ok(Parameter {
+            name: pname,
+            ty,
+            allow_null: po.get("allowNull").and_then(|v| v.as_bool()).unwrap_or(false),
+            // Functions over an unknown argument default to an unknown result.
+            allow_unknown: false,
+            description: po
+                .get("description")
+                .and_then(|v| v.as_string())
+                .map(|s| s.as_str().to_string())
+                .unwrap_or_default(),
+        })
+    };
+
+    let parameters = match obj.get("params").and_then(|v| v.as_array()) {
+        Some(ps) => ps
+            .iter()
+            .map(&parse_param)
+            .collect::<std::result::Result<Vec<_>, String>>()?,
+        None => Vec::new(),
+    };
+    let variadic = obj.get("variadic").map(&parse_param).transpose()?;
+    let return_type = cty_type_from(
+        obj.get("return")
+            .ok_or("function signature is missing a `return` type")?,
+    )?;
+    let string_field = |key: &str| {
+        obj.get(key)
+            .and_then(|v| v.as_string())
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_default()
+    };
+    Ok(FunctionSignature {
+        name,
+        parameters,
+        variadic,
+        return_type,
+        summary: string_field("summary"),
+        description: string_field("description"),
     })
 }
 
@@ -458,6 +530,50 @@ impl DynConfigure for JsConfigure {
     }
 }
 
+/// A provider-config `validate` callback: one async JS handler returning a
+/// diagnostics array. Runs in `ValidateProviderConfig`, before `configure`.
+struct JsValidateConfig {
+    validate: Handler,
+}
+
+#[async_trait]
+impl DynValidateConfig for JsValidateConfig {
+    async fn validate(&self, config: Value) -> Diagnostics {
+        match call_handler(&self.validate, &config, "provider validate").await {
+            Ok(out) => parse_diagnostics(&out),
+            Err(diags) => diags,
+        }
+    }
+}
+
+/// A provider-defined function: one async JS handler over positional arguments.
+/// The service has already decoded each argument under its parameter's cty type;
+/// they arrive as a `Vec<Value>` and are marshalled to JS as a JSON array.
+struct JsFunction {
+    /// The function's cty return type, used to type the handler's result.
+    return_ty: Type,
+    call: Handler,
+}
+
+#[async_trait]
+impl DynFunction for JsFunction {
+    async fn call(&self, args: Vec<Value>) -> std::result::Result<Value, FunctionError> {
+        let jsons = args
+            .iter()
+            .map(value_to_json)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(FunctionError::new)?;
+        let input = format!("[{}]", jsons.join(","));
+        let promise = self
+            .call
+            .call_async(Ok(input))
+            .await
+            .map_err(|e| FunctionError::new(e.to_string()))?;
+        let out = promise.await.map_err(|e| FunctionError::new(e.to_string()))?;
+        json_to_value(&out, &self.return_ty).map_err(FunctionError::new)
+    }
+}
+
 // --- the JS-facing provider -------------------------------------------------
 
 /// A registered resource, ready to hand to the builder at serve time.
@@ -482,10 +598,18 @@ struct EphemeralReg {
     handler: Arc<dyn DynEphemeral>,
 }
 
-/// The provider-level config block and its configure handler.
+/// A registered provider-defined function.
+struct FunctionReg {
+    signature: FunctionSignature,
+    handler: Arc<dyn DynFunction>,
+}
+
+/// The provider-level config block, its configure handler, and an optional
+/// validate handler (run before configure).
 struct ProviderConfigReg {
     block: Block,
     handler: Arc<dyn DynConfigure>,
+    validate: Arc<dyn DynValidateConfig>,
 }
 
 /// The provider definition assembled from JS, then served over tfplugin6.
@@ -494,6 +618,7 @@ pub struct Provider {
     resources: Vec<ResourceReg>,
     data_sources: Vec<DataSourceReg>,
     ephemerals: Vec<EphemeralReg>,
+    functions: Vec<FunctionReg>,
     config: Option<ProviderConfigReg>,
 }
 
@@ -512,23 +637,48 @@ impl Provider {
             resources: Vec::new(),
             data_sources: Vec::new(),
             ephemerals: Vec::new(),
+            functions: Vec::new(),
             config: None,
         }
     }
 
-    /// Declare the provider's configuration block and the async `configure`
-    /// handler that receives it on `ConfigureProvider`. The handler typically
-    /// stores state the resource/data-source handlers close over.
+    /// Declare the provider's configuration block, the async `configure` handler
+    /// (run on `ConfigureProvider`), and a `validate` handler (run before it, in
+    /// `ValidateProviderConfig`). The configure handler typically stores state the
+    /// resource/data-source handlers close over; validate returns a diagnostics
+    /// array for a bad provider block.
     #[napi]
     pub fn config(
         &mut self,
         schema_json: String,
         configure: ThreadsafeFunction<String, Promise<String>>,
+        validate: ThreadsafeFunction<String, Promise<String>>,
     ) -> Result<()> {
         let block = block_from_schema_json(&schema_json).map_err(napi_err)?;
         self.config = Some(ProviderConfigReg {
             block,
             handler: Arc::new(JsConfigure { configure }),
+            validate: Arc::new(JsValidateConfig { validate }),
+        });
+        Ok(())
+    }
+
+    /// Register a provider-defined function: its `name`, a signature description
+    /// (`signature_json`: ordered `params`, an optional `variadic` parameter, and
+    /// the `return` type, all cty-typed), and a single async `call` handler that
+    /// receives the positional arguments as a JSON array and returns the result.
+    #[napi]
+    pub fn function(
+        &mut self,
+        name: String,
+        signature_json: String,
+        call: ThreadsafeFunction<String, Promise<String>>,
+    ) -> Result<()> {
+        let signature = function_signature_from_json(name, &signature_json).map_err(napi_err)?;
+        let return_ty = signature.return_type.clone();
+        self.functions.push(FunctionReg {
+            signature,
+            handler: Arc::new(JsFunction { return_ty, call }),
         });
         Ok(())
     }
@@ -631,7 +781,8 @@ impl Provider {
         if let Some(cfg) = &self.config {
             builder = builder
                 .dyn_provider_config(cfg.block.clone())
-                .dyn_configure(Arc::clone(&cfg.handler));
+                .dyn_configure(Arc::clone(&cfg.handler))
+                .dyn_validate_config(Arc::clone(&cfg.validate));
         }
         for r in &self.resources {
             builder = builder.dyn_resource(
@@ -648,6 +799,9 @@ impl Provider {
         for e in &self.ephemerals {
             builder =
                 builder.dyn_ephemeral(e.name.clone(), e.block.clone(), Arc::clone(&e.handler));
+        }
+        for f in &self.functions {
+            builder = builder.dyn_function(f.signature.clone(), Arc::clone(&f.handler));
         }
         let provider = builder.build().map_err(napi_err)?;
         serve_provider(provider).await.map_err(napi_err)

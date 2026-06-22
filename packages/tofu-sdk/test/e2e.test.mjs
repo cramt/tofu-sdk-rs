@@ -104,6 +104,10 @@ output "data_arn" {
 output "list_names" {
   value = data.aws_s3_buckets.many.results[*].name
 }
+
+output "fn_arn" {
+  value = provider::aws::arn_for("fn-bucket")
+}
 `,
     );
 
@@ -122,6 +126,11 @@ output "list_names" {
       outputs.list_names.value,
       ["team", "team-staging"],
       "plural data source returned the results list",
+    );
+    assert.equal(
+      outputs.fn_arn.value,
+      "arn:aws:s3:::fn-bucket",
+      "provider-defined function returned the computed arn",
     );
 
     // Renaming the force_new `name` must plan a replacement.

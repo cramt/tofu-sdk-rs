@@ -1,24 +1,28 @@
 /**
  * `@tofu-sdk/core` — write Terraform/OpenTofu providers in TypeScript.
  *
- * Schemas are [Zod](https://zod.dev) objects: you get runtime validation and
- * inferred handler types for free, and the cty schema Terraform needs is derived
- * from them. The Terraform-only dispositions that Zod can't express — `computed`,
- * `forceNew`, `sensitive` — are given as arrays of field names, and those arrays
- * are **type-checked against the schema** (a typo is a compile error).
+ * Schemas are [Zod](https://zod.dev) objects, and **the type defines everything**:
+ * structure, runtime validation, inferred handler types, *and* the Terraform
+ * dispositions. Each disposition (`computed`, `forceNew`, `sensitive`,
+ * `writeOnly`, `deprecated`, `block`, `set`) rides on its field via `.meta({ … })`
+ * (typed, so a bad key is a compile error). "Order must not matter" is just a
+ * `z.set` (an unordered cty `set`). The legacy out-of-band disposition *arrays*
+ * still work and are merged in.
  *
  * ```ts
  * import { z } from "zod";
  * import { Provider } from "@tofu-sdk/core";
  *
- * const Bucket = z.object({ name: z.string(), arn: z.string() });
+ * const Bucket = z.object({
+ *   name: z.string().meta({ forceNew: true }),
+ *   arn: z.string().meta({ computed: true }),
+ *   aliases: z.set(z.string()),            // unordered → cty set
+ * });
  *
  * await new Provider()
  *   .resource("aws_s3_bucket", {
  *     schema: Bucket,
- *     forceNew: ["name"],     // only "name" | "arn" type-checks here
- *     computed: ["arn"],
- *     async create(planned) { // planned: { name: string; arn: string }
+ *     async create(planned) { // planned.aliases is a Set<string>
  *       return { ...planned, arn: `arn:aws:s3:::${planned.name}` };
  *     },
  *   })
@@ -28,12 +32,30 @@
 
 import { z } from "zod";
 
+import {
+  type AttributeJson,
+  type CtyType,
+  ctyFromZod,
+  type Dispositions,
+  fieldCty,
+  type FieldName,
+  functionSignatureJson,
+  paramNames,
+  reviveSets,
+  schemaJson,
+  searchKeysOf,
+  type TfMeta,
+  toWireJson,
+} from "./schema";
+
+export type { CtyType, Dispositions, FieldName, TfMeta } from "./schema";
+
 // The native addon's generated loader, loaded at runtime and hand-typed (its
 // auto-generated `.d.ts` is intentionally not imported).
 type RawHandler = (err: Error | null, input: string) => Promise<string>;
 
 interface RawProvider {
-  config(schemaJson: string, configure: RawHandler): void;
+  config(schemaJson: string, configure: RawHandler, validate: RawHandler): void;
   resource(
     typeName: string,
     version: number,
@@ -55,6 +77,7 @@ interface RawProvider {
     close: RawHandler,
     validate: RawHandler,
   ): void;
+  function(name: string, signatureJson: string, call: RawHandler): void;
   serve(): Promise<void>;
 }
 
@@ -69,100 +92,10 @@ interface RawBinding {
 // relative to this compiled file, exactly as before.
 const native = require("../binding/index.js") as RawBinding;
 
-// --- schema derivation (Zod -> cty) -----------------------------------------
-
-/** A `cty` type constraint in its JSON form, the shape the native addon takes. */
-type CtyType =
-  | "string"
-  | "number"
-  | "bool"
-  | "dynamic"
-  | ["list", CtyType]
-  | ["set", CtyType]
-  | ["map", CtyType]
-  | ["object", Record<string, CtyType>]
-  | ["object", Record<string, CtyType>, string[]];
-
-type JsonSchema = {
-  type?: string | string[];
-  properties?: Record<string, JsonSchema>;
-  required?: string[];
-  items?: JsonSchema;
-  additionalProperties?: boolean | JsonSchema;
-  anyOf?: JsonSchema[];
-};
-
-/** Map a (Zod-produced) JSON Schema node to a `cty` type. */
-function jsonSchemaToCty(node: JsonSchema): CtyType {
-  // Nullable unwraps to the inner type (cty carries null at the value level).
-  if (node.anyOf) {
-    const inner = node.anyOf.find((s) => s.type !== "null") ?? node.anyOf[0];
-    return jsonSchemaToCty(inner);
-  }
-  const type = Array.isArray(node.type)
-    ? node.type.find((t) => t !== "null")
-    : node.type;
-
-  switch (type) {
-    case "string":
-      return "string";
-    case "number":
-    case "integer":
-      return "number";
-    case "boolean":
-      return "bool";
-    case "array":
-      return ["list", jsonSchemaToCty(node.items ?? {})];
-    case "object": {
-      const props = node.properties ?? {};
-      const names = Object.keys(props);
-      if (names.length > 0) {
-        const fields: Record<string, CtyType> = {};
-        for (const name of names) fields[name] = jsonSchemaToCty(props[name]);
-        const required = new Set(node.required ?? []);
-        const optional = names.filter((n) => !required.has(n));
-        return optional.length > 0 ? ["object", fields, optional] : ["object", fields];
-      }
-      if (node.additionalProperties && typeof node.additionalProperties === "object") {
-        return ["map", jsonSchemaToCty(node.additionalProperties)];
-      }
-      return ["object", {}];
-    }
-    default:
-      throw new Error(`unsupported schema type for cty: ${JSON.stringify(node.type)}`);
-  }
-}
-
-/** Field names of a Zod object schema, as a string-key union. */
-type FieldName<S extends z.ZodObject<z.ZodRawShape>> = keyof z.infer<S> & string;
-
-/** The Terraform dispositions Zod can't express, keyed to real schema fields. */
-interface Dispositions<S extends z.ZodObject<z.ZodRawShape>> {
-  /** Provider-computed (read-only) attributes. */
-  computed?: FieldName<S>[];
-  /** Attributes whose change forces the resource to be replaced. */
-  forceNew?: FieldName<S>[];
-  /** Attributes whose values should be redacted. */
-  sensitive?: FieldName<S>[];
-  /**
-   * Write-only attributes: supplied at apply time but never persisted to state
-   * (e.g. secrets). The provider runtime nulls them out of every returned state,
-   * so a handler reads the real value only from the apply-time config. Cannot be
-   * combined with `computed`.
-   */
-  writeOnly?: FieldName<S>[];
-  /** Attributes marked deprecated (a boolean notice; no message from here). */
-  deprecated?: FieldName<S>[];
-  /**
-   * Fields to render as nested **blocks** (`name { … }`) instead of object/list
-   * attributes (`name = …`). Each named field must be an object (a single block)
-   * or an array of objects (a repeatable block); on the wire a block is just an
-   * object/list, so handlers see the field unchanged. Inner attributes are
-   * derived from the element's shape (required follows the Zod schema; per-field
-   * `computed`/`sensitive` inside a block are not expressible here).
-   */
-  blocks?: FieldName<S>[];
-}
+// Schema derivation (Zod model → cty type) lives in `./schema` — a pure module
+// with no native dependency, so it can be unit-tested directly. It reads the Zod
+// type via Zod 4 introspection (not `z.toJSONSchema`, which throws on the very
+// constructs the design law uses: `z.set` and `.transform`).
 
 /** A validation diagnostic returned from a `validate` hook. */
 export interface Diagnostic {
@@ -183,116 +116,6 @@ export interface Diagnostic {
  * so guard before validating them.
  */
 type Validate<C> = (config: C) => Diagnostic[] | void | Promise<Diagnostic[] | void>;
-
-/** One cty attribute in the schema JSON the native addon consumes. */
-interface AttributeJson {
-  name: string;
-  type: CtyType;
-  required: boolean;
-  optional: boolean;
-  computed: boolean;
-  forceNew: boolean;
-  sensitive: boolean;
-  writeOnly: boolean;
-  deprecated: boolean;
-}
-
-/** One nested-block descriptor in the schema JSON. */
-interface BlockJson {
-  name: string;
-  nesting: "single" | "list" | "set" | "map";
-  minItems: number;
-  maxItems: number;
-  block: { attributes: AttributeJson[]; blocks: BlockJson[] };
-}
-
-/** Unwrap a nullable JSON Schema node (`anyOf` / `["T","null"]`) to its core. */
-function unwrapNullable(node: JsonSchema): JsonSchema {
-  if (node.anyOf) return node.anyOf.find((s) => s.type !== "null") ?? node.anyOf[0];
-  return node;
-}
-
-/** Derive plain cty attributes from an object node's properties (block contents). */
-function attributesFromObject(node: JsonSchema): AttributeJson[] {
-  const props = node.properties ?? {};
-  const required = new Set(node.required ?? []);
-  return Object.entries(props).map(([name, prop]) => ({
-    name,
-    type: jsonSchemaToCty(prop),
-    required: required.has(name),
-    optional: !required.has(name),
-    computed: false,
-    forceNew: false,
-    sensitive: false,
-    writeOnly: false,
-    deprecated: false,
-  }));
-}
-
-/**
- * Build a nested-block descriptor for `name` from its Zod-derived schema node.
- * An array field is a repeatable `list` block; a bare object is a `single` block
- * (required when the field itself is required).
- */
-function blockFromField(name: string, prop: JsonSchema, fieldRequired: boolean): BlockJson {
-  const node = unwrapNullable(prop);
-  const type = Array.isArray(node.type) ? node.type.find((t) => t !== "null") : node.type;
-  if (type === "array") {
-    const element = unwrapNullable(node.items ?? {});
-    return {
-      name,
-      nesting: "list",
-      minItems: 0,
-      maxItems: 0,
-      block: { attributes: attributesFromObject(element), blocks: [] },
-    };
-  }
-  return {
-    name,
-    nesting: "single",
-    minItems: fieldRequired ? 1 : 0,
-    maxItems: 1,
-    block: { attributes: attributesFromObject(node), blocks: [] },
-  };
-}
-
-/** Build the `{ attributes, blocks }` schema JSON the native addon consumes. */
-function schemaJson(
-  schema: z.ZodObject<z.ZodRawShape>,
-  dispositions: Dispositions<z.ZodObject<z.ZodRawShape>> = {},
-): string {
-  const json = z.toJSONSchema(schema) as JsonSchema;
-  const required = new Set(json.required ?? []);
-  const computed = new Set<string>(dispositions.computed ?? []);
-  const forceNew = new Set<string>(dispositions.forceNew ?? []);
-  const sensitive = new Set<string>(dispositions.sensitive ?? []);
-  const writeOnly = new Set<string>(dispositions.writeOnly ?? []);
-  const deprecated = new Set<string>(dispositions.deprecated ?? []);
-  const blockNames = new Set<string>(dispositions.blocks ?? []);
-
-  const attributes: AttributeJson[] = [];
-  const blocks: BlockJson[] = [];
-  for (const [name, prop] of Object.entries(json.properties ?? {})) {
-    if (blockNames.has(name)) {
-      blocks.push(blockFromField(name, prop, required.has(name)));
-      continue;
-    }
-    const isComputed = computed.has(name);
-    const isRequired = required.has(name) && !isComputed;
-    attributes.push({
-      name,
-      type: jsonSchemaToCty(prop),
-      required: isRequired,
-      optional: !isRequired && !isComputed,
-      computed: isComputed,
-      forceNew: forceNew.has(name),
-      sensitive: sensitive.has(name),
-      writeOnly: writeOnly.has(name),
-      deprecated: deprecated.has(name),
-    });
-  }
-  return JSON.stringify({ attributes, blocks });
-}
 
 /** Validate a handler's return value against its schema, surfacing failures. */
 function validateOut<S extends z.ZodType>(schema: S, value: unknown, ctx: string): z.infer<S> {
@@ -341,13 +164,16 @@ export interface DataSource<S extends z.ZodObject<z.ZodRawShape>> extends Dispos
 }
 
 /**
- * A plural read-only data source: a lookup by `searchKeys` resolving to a
- * `results` list. `schema` describes one element; `searchKeys` (type-checked
- * against the schema) names the element fields that are query inputs.
+ * A plural read-only data source: a lookup by search keys resolving to a
+ * `results` list. `schema` describes one element; the query-input fields are the
+ * ones tagged `.meta({ searchKey: true })` on the schema (preferred), or named in
+ * the optional `searchKeys` array (merged in for back-compat). At least one is
+ * required.
  */
 export interface DataSourceList<S extends z.ZodObject<z.ZodRawShape>> {
   schema: S;
-  searchKeys: FieldName<S>[];
+  /** Query-input field names. Optional — prefer `.meta({ searchKey: true })`. */
+  searchKeys?: FieldName<S>[];
   list(query: z.infer<S>): Promise<z.infer<S>[]>;
 }
 
@@ -398,23 +224,53 @@ export interface Ephemeral<S extends z.ZodObject<z.ZodRawShape>> extends Disposi
 export interface ProviderConfig<S extends z.ZodObject<z.ZodRawShape>> {
   schema: S;
   configure(config: z.infer<S>): Promise<void>;
+  /** Validate the provider block, returning diagnostics. Runs before `configure`. */
+  validate?: Validate<z.infer<S>>;
 }
 
-/** Adapt an async `A -> R` handler to the raw `(err, json) -> Promise<json>` form. */
-function adapt<A, R>(fn: (arg: A) => Promise<R>): RawHandler {
+/**
+ * A provider-defined function: pure, positional, called from HCL as
+ * `provider::<provider>::<name>(…)`. `params` is an **object** schema whose key
+ * order is the positional parameter order; `returns` is the result schema.
+ */
+export interface ProviderFunction<
+  P extends z.ZodObject<z.ZodRawShape>,
+  R extends z.ZodType,
+> {
+  params: P;
+  returns: R;
+  /** One-line summary, surfaced in docs. */
+  summary?: string;
+  /** Longer description. */
+  description?: string;
+  /** Compute the result from the named arguments. */
+  call(args: z.infer<P>): Promise<z.infer<R>>;
+}
+
+/**
+ * Adapt an async `A -> R` handler to the raw `(err, json) -> Promise<json>` form.
+ * When a `schema` is given the parsed input is revived (JSON arrays backing
+ * `z.set` fields become JS `Set`s, matching `z.infer`), and the result is encoded
+ * with {@link toWireJson} (any `Set` → its array wire form).
+ */
+function adapt<A, R>(fn: (arg: A) => Promise<R>, schema?: z.ZodType): RawHandler {
   return async (err, input) => {
     if (err) throw err;
-    const result = await fn(JSON.parse(input) as A);
-    return JSON.stringify(result ?? null);
+    const parsed = JSON.parse(input);
+    const arg = (schema ? reviveSets<A>(schema, parsed) : (parsed as A)) as A;
+    const result = await fn(arg);
+    return toWireJson(result);
   };
 }
 
 /** Adapt a `validate` hook to the raw form, returning a JSON diagnostics array. */
-function validateAdapter<C>(validate: Validate<C> | undefined): RawHandler {
+function validateAdapter<C>(validate: Validate<C> | undefined, schema?: z.ZodType): RawHandler {
   return async (err, input) => {
     if (err) throw err;
     if (!validate) return "[]";
-    const diagnostics = (await validate(JSON.parse(input) as C)) ?? [];
+    const parsed = JSON.parse(input);
+    const config = (schema ? reviveSets<C>(schema, parsed) : (parsed as C)) as C;
+    const diagnostics = (await validate(config)) ?? [];
     return JSON.stringify(diagnostics);
   };
 }
@@ -423,14 +279,43 @@ function validateAdapter<C>(validate: Validate<C> | undefined): RawHandler {
 export class Provider {
   private readonly raw: RawProvider = new native.Provider();
 
-  /** Declare the provider's configuration block and its `configure` handler. */
+  /** Declare the provider's configuration block, its `configure` handler, and an
+   * optional `validate` hook (run before configure). */
   config<S extends z.ZodObject<z.ZodRawShape>>(def: ProviderConfig<S>): this {
     this.raw.config(
       schemaJson(def.schema),
       adapt(async (cfg: z.infer<S>) => {
         await def.configure(cfg);
         return null;
+      }, def.schema),
+      validateAdapter(def.validate, def.schema),
+    );
+    return this;
+  }
+
+  /** Register a provider-defined function under `name`. */
+  function<P extends z.ZodObject<z.ZodRawShape>, R extends z.ZodType>(
+    name: string,
+    def: ProviderFunction<P, R>,
+  ): this {
+    const names = paramNames(def.params);
+    const call: RawHandler = async (err, input) => {
+      if (err) throw err;
+      // The addon delivers the (already cty-decoded) arguments positionally.
+      const argv = JSON.parse(input) as unknown[];
+      const obj: Record<string, unknown> = {};
+      names.forEach((n, i) => (obj[n] = argv[i]));
+      const args = reviveSets<z.infer<P>>(def.params, obj);
+      const result = await def.call(args);
+      return toWireJson(validateOut(def.returns, result, `function ${name}`));
+    };
+    this.raw.function(
+      name,
+      functionSignatureJson(def.params, def.returns, {
+        summary: def.summary,
+        description: def.description,
       }),
+      call,
     );
     return this;
   }
@@ -438,8 +323,10 @@ export class Provider {
   /** Register a managed resource under `typeName`. */
   resource<S extends z.ZodObject<z.ZodRawShape>>(typeName: string, def: Resource<S>): this {
     type M = z.infer<S>;
-    const create = adapt((planned: M) =>
-      def.create(planned).then((s) => validateOut(def.schema, s, `resource ${typeName} create`)),
+    const create = adapt(
+      (planned: M) =>
+        def.create(planned).then((s) => validateOut(def.schema, s, `resource ${typeName} create`)),
+      def.schema,
     );
     const read = adapt(async (current: M) => {
       if (!def.read) return current;
@@ -447,20 +334,22 @@ export class Provider {
       return refreshed === null
         ? null
         : validateOut(def.schema, refreshed, `resource ${typeName} read`);
-    });
+    }, def.schema);
     const update: RawHandler = async (err, input) => {
       if (err) throw err;
-      const { planned, prior } = JSON.parse(input) as { planned: M; prior: M };
+      const raw = JSON.parse(input) as { planned: unknown; prior: unknown };
       if (!def.update) {
         throw new Error(`resource "${typeName}" does not support in-place update`);
       }
+      const planned = reviveSets<M>(def.schema, raw.planned);
+      const prior = reviveSets<M>(def.schema, raw.prior);
       const next = await def.update(planned, prior);
-      return JSON.stringify(validateOut(def.schema, next, `resource ${typeName} update`));
+      return toWireJson(validateOut(def.schema, next, `resource ${typeName} update`));
     };
     const del = adapt(async (prior: M) => {
       if (def.delete) await def.delete(prior);
       return null;
-    });
+    }, def.schema);
     // The import handler's input is the raw ID string, not marshalled JSON.
     const imp: RawHandler = async (err, id) => {
       if (err) throw err;
@@ -468,7 +357,7 @@ export class Provider {
         throw new Error(`resource "${typeName}" does not support import`);
       }
       const imported = await def.import(id);
-      return JSON.stringify(validateOut(def.schema, imported, `resource ${typeName} import`));
+      return toWireJson(validateOut(def.schema, imported, `resource ${typeName} import`));
     };
     const upgrade: RawHandler = async (err, input) => {
       if (err) throw err;
@@ -482,7 +371,7 @@ export class Provider {
         );
       }
       const next = await def.upgrade(fromVersion, priorState);
-      return JSON.stringify(validateOut(def.schema, next, `resource ${typeName} upgrade`));
+      return toWireJson(validateOut(def.schema, next, `resource ${typeName} upgrade`));
     };
     this.raw.resource(
       typeName,
@@ -494,7 +383,7 @@ export class Provider {
       del,
       imp,
       upgrade,
-      validateAdapter(def.validate),
+      validateAdapter(def.validate, def.schema),
     );
     return this;
   }
@@ -504,16 +393,18 @@ export class Provider {
     this.raw.dataSource(
       typeName,
       schemaJson(def.schema, def),
-      adapt((config: z.infer<S>) =>
-        def.read(config).then((s) => validateOut(def.schema, s, `data source ${typeName} read`)),
+      adapt(
+        (config: z.infer<S>) =>
+          def.read(config).then((s) => validateOut(def.schema, s, `data source ${typeName} read`)),
+        def.schema,
       ),
-      validateAdapter(def.validate),
+      validateAdapter(def.validate, def.schema),
     );
     return this;
   }
 
   /**
-   * Register a plural read-only data source under `typeName`: the `searchKeys`
+   * Register a plural read-only data source under `typeName`: the search keys
    * are query inputs and the result is a computed `results` list of objects
    * matching `schema`.
    */
@@ -522,14 +413,19 @@ export class Provider {
     def: DataSourceList<S>,
   ): this {
     type M = z.infer<S>;
-    const element = z.toJSONSchema(def.schema) as JsonSchema;
-    const elementType = jsonSchemaToCty(element);
+    const elementType = ctyFromZod(def.schema);
+    // Query inputs: `.meta({ searchKey })` fields plus the legacy array, deduped.
+    const searchKeys = [...new Set([...searchKeysOf(def.schema), ...(def.searchKeys ?? [])])];
+    if (searchKeys.length === 0) {
+      throw new Error(
+        `data source list "${typeName}" needs at least one search key ` +
+          "(tag a field `.meta({ searchKey: true })` or pass `searchKeys`)",
+      );
+    }
     // The wrapper block: the search keys as optional inputs, plus `results`.
-    const attributes = def.searchKeys.map((key) => ({
+    const attributes: AttributeJson[] = searchKeys.map((key) => ({
       name: key,
-      type: (element.properties ?? {})[key]
-        ? jsonSchemaToCty((element.properties ?? {})[key])
-        : ("string" as CtyType),
+      type: fieldCty(def.schema, key),
       required: false,
       optional: true,
       computed: false,
@@ -552,14 +448,14 @@ export class Provider {
 
     const read: RawHandler = async (err, input) => {
       if (err) throw err;
-      const config = JSON.parse(input) as M;
+      const config = reviveSets<M>(def.schema, JSON.parse(input));
       const items = await def.list(config);
       const validated = items.map((item, i) =>
         validateOut(def.schema, item, `data source ${typeName} list[${i}]`),
       );
       const inputs: Record<string, unknown> = {};
-      for (const key of def.searchKeys) inputs[key] = (config as Record<string, unknown>)[key];
-      return JSON.stringify({ ...inputs, results: validated });
+      for (const key of searchKeys) inputs[key] = (config as Record<string, unknown>)[key];
+      return toWireJson({ ...inputs, results: validated });
     };
     this.raw.dataSource(typeName, JSON.stringify({ attributes }), read, validateAdapter(undefined));
     return this;
@@ -580,7 +476,7 @@ export class Provider {
         private: opened.private,
         renewAt: opened.renewAt,
       };
-    });
+    }, def.schema);
     // renew/close receive the raw private handle string, not marshalled JSON.
     const renew: RawHandler = async (err, handle) => {
       if (err) throw err;
@@ -598,7 +494,7 @@ export class Provider {
       open,
       renew,
       close,
-      validateAdapter(def.validate),
+      validateAdapter(def.validate, def.schema),
     );
     return this;
   }

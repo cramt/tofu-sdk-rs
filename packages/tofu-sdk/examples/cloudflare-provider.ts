@@ -60,30 +60,36 @@ import { Provider, type Diagnostic } from "../ts/index";
 
 // --- the model -------------------------------------------------------------
 
+// The whole schema — type, structure, *and* every Terraform disposition — lives
+// in the Zod model: the type defines everything. Dispositions ride on each field
+// via `.meta({ … })` (typed by the SDK), not out-of-band arrays. `z.enum` derives
+// to a cty `string` and hands the handlers the literal union for free.
+//
 // One policy = an effect over a set of resources, granted a set of permission
-// groups *by name*. Rendered as a repeatable `policy { … }` block (see
-// `blocks: ["policy"]` below). `z.enum` derives to a cty `string` (a JSON-Schema
-// `{ type: "string", enum: [...] }`) and gives the handlers the literal union for
-// free — so no casts when calling the Cloudflare SDK.
+// groups *by name*. `permission_groups` is a `z.set` — order does not matter, so
+// it derives to an unordered cty `set` and reordering never shows a spurious diff
+// (the design law: model "order-insensitive" as a set type, no dedup code).
 const Policy = z.object({
   effect: z.enum(["allow", "deny"]),
   // e.g. { "com.cloudflare.api.account.zone.*": "*" } — scope glob -> "*".
   resources: z.record(z.string(), z.string()),
-  // Permission-group names, e.g. ["DNS Write", "Zone Read"]; resolved to IDs.
-  permission_groups: z.array(z.string()),
+  // Permission-group names, e.g. {"DNS Write", "Zone Read"}; resolved to IDs.
+  permission_groups: z.set(z.string()),
 });
 
 const ApiToken = z.object({
   // Inputs.
   name: z.string(),
-  policy: z.array(Policy),
+  // A repeatable HCL `policy { … }` block, not a `policy = [...]` attribute.
+  policy: z.array(Policy).meta({ block: true }),
 
-  // Computed, filled by Cloudflare on create.
-  id: z.string(),
-  value: z.string(), // the secret — only ever returned at creation time
-  status: z.enum(["active", "disabled", "expired"]),
-  issued_on: z.string().optional(),
-  modified_on: z.string().optional(),
+  // Computed, filled by Cloudflare on create; the secret `value` is also sensitive
+  // so it never appears in plan output.
+  id: z.string().meta({ computed: true }),
+  value: z.string().meta({ computed: true, sensitive: true }),
+  status: z.enum(["active", "disabled", "expired"]).meta({ computed: true }),
+  issued_on: z.string().optional().meta({ computed: true }),
+  modified_on: z.string().optional().meta({ computed: true }),
 });
 
 type ApiToken = z.infer<typeof ApiToken>;
@@ -124,7 +130,8 @@ async function toApiPolicies(policies: ApiToken["policy"]): Promise<TokenPolicie
   return policies.map((p) => ({
     effect: p.effect,
     resources: p.resources,
-    permission_groups: p.permission_groups.map((name) => {
+    // `permission_groups` is a Set (z.set) — spread to map it.
+    permission_groups: [...p.permission_groups].map((name) => {
       const id = catalog.get(name);
       if (!id) throw new Error(`unknown permission group: "${name}"`);
       return { id };
@@ -150,11 +157,7 @@ new Provider()
   })
   .resource("cloudflare_api_token", {
     schema: ApiToken,
-    // `policy` is a repeatable HCL block, not a `policy = [...]` attribute.
-    blocks: ["policy"],
-    // The secret value is computed and must never appear in plan output.
-    computed: ["id", "value", "status", "issued_on", "modified_on"],
-    sensitive: ["value"],
+    // No disposition arrays — every disposition lives on the Zod fields above.
     async create(planned) {
       const created = await client().user.tokens.create({
         name: planned.name,
