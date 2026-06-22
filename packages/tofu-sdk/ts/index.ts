@@ -273,6 +273,29 @@ export interface ProviderFunction<
 }
 
 /**
+ * A **variadic** provider-defined function: fixed leading parameters plus zero or
+ * more trailing arguments of a single uniform type. The 1-to-1 of Rust's
+ * `VariadicFunction` (leading `Params` + a `VarArg` element type + `call(params,
+ * rest)`); the type system enforces "exactly one uniform trailing variadic"
+ * because `variadic` is a single schema and `rest` is its array.
+ */
+export interface VariadicFunction<
+  P extends z.ZodObject<z.ZodRawShape>,
+  V extends z.ZodType,
+  R extends z.ZodType,
+> {
+  /** The fixed leading parameters (object key order = positional order). */
+  params: P;
+  /** The uniform element type of the trailing arguments. */
+  variadic: V;
+  returns: R;
+  summary?: string;
+  description?: string;
+  /** Compute the result from the leading args and the variadic `rest`. */
+  call(args: z.infer<P>, rest: z.infer<V>[]): Promise<z.infer<R>>;
+}
+
+/**
  * Adapt an async `A -> R` handler to the raw `(err, json) -> Promise<json>` form.
  * When a `schema` is given the parsed input is revived (JSON arrays backing
  * `z.set` fields become JS `Set`s, matching `z.infer`), and the result is encoded
@@ -401,6 +424,38 @@ export class Provider {
       functionSignatureJson(def.params, def.returns, {
         summary: def.summary,
         description: def.description,
+      }),
+      call,
+    );
+    return this;
+  }
+
+  /** Register a **variadic** provider-defined function under `name`: fixed leading
+   * params (`params`) plus zero or more trailing args of `variadic`'s type. */
+  functionVariadic<
+    P extends z.ZodObject<z.ZodRawShape>,
+    V extends z.ZodType,
+    R extends z.ZodType,
+  >(name: string, def: VariadicFunction<P, V, R>): this {
+    const names = paramNames(def.params);
+    const call: RawHandler = async (err, input) => {
+      if (err) throw err;
+      // Positional args: the first `names.length` are the fixed params; the rest
+      // are the variadic tail (all of `variadic`'s type).
+      const argv = JSON.parse(input) as unknown[];
+      const obj: Record<string, unknown> = {};
+      names.forEach((n, i) => (obj[n] = argv[i]));
+      const args = reviveSets<z.infer<P>>(def.params, obj);
+      const rest = argv.slice(names.length).map((v) => reviveSets<z.infer<V>>(def.variadic, v));
+      const result = await def.call(args, rest);
+      return toWireJson(validateOut(def.returns, result, `function ${name}`));
+    };
+    this.raw.function(
+      name,
+      functionSignatureJson(def.params, def.returns, {
+        summary: def.summary,
+        description: def.description,
+        variadic: def.variadic,
       }),
       call,
     );

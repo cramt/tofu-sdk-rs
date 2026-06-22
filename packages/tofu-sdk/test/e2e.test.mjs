@@ -108,6 +108,10 @@ output "list_names" {
 output "fn_arn" {
   value = provider::aws::arn_for("fn-bucket")
 }
+
+output "fn_join" {
+  value = provider::aws::join("-", "a", "b", "c")
+}
 `,
     );
 
@@ -137,6 +141,11 @@ output "fn_arn" {
       outputs.fn_arn.value,
       "arn:aws:s3:::fn-bucket",
       "provider-defined function returned the computed arn",
+    );
+    assert.equal(
+      outputs.fn_join.value,
+      "a-b-c",
+      "variadic function joined the trailing args",
     );
 
     // Renaming the force_new `name` must plan a replacement.

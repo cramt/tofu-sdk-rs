@@ -124,8 +124,9 @@ are available for the Rust build.
 Early but functional. Resources (CRUD + `force_new` replacement + `import` +
 `version`/`upgrade` state migrations + a resource `validate` hook), provider
 configuration (`config`, with its own `validate` hook), **provider-defined
-functions** (`function` — pure, positional, called as `provider::p::name(…)`),
-both singular (`dataSource`) and plural (`dataSourceList`) data sources,
+functions** (`function`, and `functionVariadic` for a uniform trailing tail —
+pure, called as `provider::p::name(…)`), both singular (`dataSource`) and plural
+(`dataSourceList`) data sources,
 **ephemeral resources** (`ephemeral` — an `open`/`renew`/`close` lifecycle, never
 persisted to state), HCL nested **blocks**, and single-file packaging (the
 `@tofu-sdk/core/tsdown` preset) all work end-to-end against real OpenTofu — see
@@ -137,7 +138,7 @@ analog of Rust's `&mut Ctx`: `ctx.warn(...)` for success-path warnings,
 `ctx.cancelled` / `ctx.signal` for cancellation. Ignore it if unused.
 
 Not yet wired up (the Rust core supports these; the Node binding doesn't expose
-them yet): **list resources**, **state stores**, **resource identity**, variadic
-functions, `modify_plan` / `move_state`, and semantic-equality normalization.
-Also: prebuilt multi-platform addons (the preset inlines the addon for the
-platform you build on).
+them yet): **list resources**, **state stores**, **resource identity**,
+`modify_plan` / `move_state`, and semantic-equality normalization. Also: prebuilt
+multi-platform addons (the preset inlines the addon for the platform you build
+on).

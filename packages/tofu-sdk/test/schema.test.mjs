@@ -145,6 +145,17 @@ test("functionSignatureJson derives ordered params + return from a Zod params ob
   ]);
   assert.equal(sig.return, "string");
   assert.equal(sig.summary, "build it");
+  assert.equal(sig.variadic, undefined, "no variadic unless given");
+});
+
+test("functionSignatureJson emits a trailing variadic param when given", () => {
+  const sig = JSON.parse(
+    functionSignatureJson(z.object({ separator: z.string() }), z.string(), {
+      variadic: z.string(),
+    }),
+  );
+  assert.deepEqual(sig.params, [{ name: "separator", type: "string", allowNull: false }]);
+  assert.deepEqual(sig.variadic, { name: "varargs", type: "string", allowNull: false });
 });
 
 test("transforms throw a clear error (normalization not wired through the seam)", () => {

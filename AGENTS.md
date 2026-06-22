@@ -99,9 +99,12 @@ handler's `setPrivate`/`warn` are written back to it, and the JS call is raced
 against `CancellationToken::run_until_cancelled` so `StopProvider` aborts the
 dispatch — the TS analog of Rust's `&mut Ctx`. All schema shaping
 (singular/plural data sources, search keys, function signatures) stays in JS; Rust
-stays schema-agnostic. **Still unimplemented in the binding:** `DynListResource`,
-`DynStateStore`, resource identity (the `dyn_resource` seam carries
-`identity: None`), `modify_plan`/`move_state`, and variadic functions. The ephemeral seam is the
+stays schema-agnostic. Variadic functions register through the same `function`
+method with a `variadic` element in the signature JSON (the service decodes args
+past the fixed params with the variadic type; the JS wrapper splits the positional
+array into fixed params + the `rest` tail). **Still unimplemented in the binding:**
+`DynListResource`, `DynStateStore`, resource identity (the `dyn_resource` seam
+carries `identity: None`), and `modify_plan`/`move_state`. The ephemeral seam is the
 one place the binding reaches the ambient `Ctx` (via the public `current_ctx()`):
 `open` returns `{ result, private?, renewAt? }` and the addon writes private/
 renewAt onto the ctx (the service reads them back), while `renew`/`close` receive

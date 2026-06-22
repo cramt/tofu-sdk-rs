@@ -47,6 +47,17 @@ new Provider()
       return `${ARN_PREFIX}${name}`;
     },
   })
+  // A variadic function: `provider::aws::join("-", "a", "b", "c")`. Leading fixed
+  // params (`separator`) plus a uniform trailing tail (`rest: string[]`).
+  .functionVariadic("join", {
+    params: z.object({ separator: z.string() }),
+    variadic: z.string(),
+    returns: z.string(),
+    summary: "Join the variadic parts with the separator.",
+    async call({ separator }, parts) {
+      return parts.join(separator);
+    },
+  })
   // A managed resource: `name` forces replacement; `arn`/`region` are computed.
   .resource("aws_s3_bucket", {
     schema: Bucket,

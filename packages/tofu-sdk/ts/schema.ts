@@ -312,12 +312,14 @@ function allowsNull(t: z.ZodType): boolean {
 
 /**
  * Build the function-signature JSON the addon consumes, from a params **object**
- * (its key order is the positional parameter order) and a return schema.
+ * (its key order is the positional parameter order), a return schema, and an
+ * optional trailing **variadic** element type (a single uniform schema, mirroring
+ * Rust's `VariadicFunction::VarArg`).
  */
 export function functionSignatureJson(
   params: z.ZodObject<z.ZodRawShape>,
   returns: z.ZodType,
-  opts: { summary?: string; description?: string } = {},
+  opts: { summary?: string; description?: string; variadic?: z.ZodType } = {},
 ): string {
   const shape = zdef(params).shape ?? {};
   const paramList = Object.entries(shape).map(([name, ft]) => ({
@@ -327,6 +329,9 @@ export function functionSignatureJson(
   }));
   return JSON.stringify({
     params: paramList,
+    variadic: opts.variadic
+      ? { name: "varargs", type: ctyFromZod(opts.variadic), allowNull: allowsNull(opts.variadic) }
+      : undefined,
     return: ctyFromZod(returns),
     summary: opts.summary ?? "",
     description: opts.description ?? "",
