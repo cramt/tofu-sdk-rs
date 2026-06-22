@@ -53,7 +53,12 @@ new Provider()
     version: 1,
     forceNew: ["name"],
     computed: ["arn", "region"],
-    async create(planned) {
+    async create(planned, ctx) {
+      // `ctx` is the TS analog of Rust's `&mut Ctx`: success-path warnings,
+      // per-resource private state (`ctx.private`/`ctx.setPrivate`), and
+      // cancellation (`ctx.cancelled`/`ctx.signal`).
+      ctx.warn("bucket provisioned", `created ${planned.name} in ${region}`);
+      ctx.setPrivate(JSON.stringify({ createdRegion: region }));
       return { ...planned, arn: `${ARN_PREFIX}${planned.name}`, region };
     },
     async update(planned, _prior) {

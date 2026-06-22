@@ -91,11 +91,17 @@ provider-defined functions) by calling async JS handlers over
 `ThreadsafeFunction<String, Promise<String>>`, marshalling `Value` ⇄ JSON through
 facet (never hand-rolled). Functions take a signature JSON (ordered cty `params`,
 optional `variadic`, `return`) and receive their already-decoded arguments as a
-positional JSON array. All schema shaping (singular/plural data sources, search
-keys, function signatures) stays in JS; Rust stays schema-agnostic. **Still
-unimplemented in the binding:** `DynListResource`, `DynStateStore`, resource
-identity (the `dyn_resource` seam carries `identity: None`), `modify_plan`/
-`move_state`, and the resource-handler `Ctx` (warnings/private/cancellation). The ephemeral seam is the
+positional JSON array. The **handler `Ctx`** is threaded to resource/data-source
+handlers via a `{ ctx: { private, cancelled }, value }` request envelope and a
+`{ value, ctx: { private?, warnings? } }` response (`call_with_ctx` in the addon):
+incoming private/cancellation come from the ambient `current_ctx()`, the
+handler's `setPrivate`/`warn` are written back to it, and the JS call is raced
+against `CancellationToken::run_until_cancelled` so `StopProvider` aborts the
+dispatch — the TS analog of Rust's `&mut Ctx`. All schema shaping
+(singular/plural data sources, search keys, function signatures) stays in JS; Rust
+stays schema-agnostic. **Still unimplemented in the binding:** `DynListResource`,
+`DynStateStore`, resource identity (the `dyn_resource` seam carries
+`identity: None`), `modify_plan`/`move_state`, and variadic functions. The ephemeral seam is the
 one place the binding reaches the ambient `Ctx` (via the public `current_ctx()`):
 `open` returns `{ result, private?, renewAt? }` and the addon writes private/
 renewAt onto the ctx (the service reads them back), while `renew`/`close` receive

@@ -115,6 +115,12 @@ output "fn_arn" {
     // its own arn from the queried name.
     const apply = run(bin, ["apply", "-auto-approve"], cfg, env);
     assert.equal(apply.status, 0, `apply failed:\n${apply.stdout}\n${apply.stderr}`);
+    // The create handler emitted a success-path warning through its `ctx`.
+    assert.match(
+      `${apply.stdout}\n${apply.stderr}`,
+      /bucket provisioned/,
+      "ctx.warn surfaced a provider warning on apply",
+    );
 
     const out = run(bin, ["output", "-json"], cfg, env);
     assert.equal(out.status, 0, out.stderr);

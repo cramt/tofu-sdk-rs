@@ -298,6 +298,77 @@ async fn call_handler(
     promise.await.map_err(|e| handler_err(ctx, e))
 }
 
+/// Invoke a JS handler with the ambient handler [`Ctx`] threaded across the
+/// boundary. The handler receives
+/// `{ "ctx": { "private": <string|null>, "cancelled": <bool> }, "value": <value> }`
+/// and returns `{ "value": <result>, "ctx"?: { "private"?: <string>,
+/// "warnings"?: [ … ] } }`. Incoming private state and cancellation come from the
+/// ambient `Ctx`; the handler's new private state and success-path warnings are
+/// written back to it (the service reads them after the dispatch). The call is
+/// raced against cancellation so `StopProvider` aborts the dispatch promptly,
+/// matching the Rust `Ctx::cancelled` semantics. `value_json` is the handler's
+/// payload, already serialized; the returned string is the extracted `value`.
+async fn call_with_ctx(
+    handler: &Handler,
+    value_json: String,
+    op: &str,
+) -> std::result::Result<String, Diagnostics> {
+    let ctx = current_ctx();
+    let private = ctx.private();
+    let private_json = if private.is_empty() {
+        "null".to_string()
+    } else {
+        facet_json::to_string(&String::from_utf8_lossy(private).into_owned())
+            .map_err(|e| handler_err(op, e))?
+    };
+    let cancelled = ctx.is_cancelled();
+    let input =
+        format!(r#"{{"ctx":{{"private":{private_json},"cancelled":{cancelled}}},"value":{value_json}}}"#);
+
+    // Race the JS call against cancellation so `StopProvider` aborts the dispatch
+    // promptly (the JS handler keeps running but its result is abandoned),
+    // matching the Rust `Ctx::cancelled` semantics.
+    let cancel = ctx.cancellation();
+    let call = async {
+        let promise = handler.call_async(Ok(input)).await.map_err(|e| handler_err(op, e))?;
+        promise.await.map_err(|e| handler_err(op, e))
+    };
+    let out = match cancel.run_until_cancelled(call).await {
+        Some(res) => res?,
+        None => {
+            return Err(vec![Diag::error(
+                format!("{op} cancelled"),
+                "the provider received StopProvider".to_string(),
+            )]);
+        }
+    };
+
+    // Drain the handler's ctx side effects into the ambient context, then return
+    // its `value`. Clones of `current_ctx()` share the same sink, so these writes
+    // are read back by the service.
+    let parsed: facet_value::Value =
+        facet_json::from_slice(out.as_bytes()).map_err(|e| handler_err(op, e))?;
+    let obj = parsed
+        .as_object()
+        .ok_or_else(|| handler_err(op, "handler output must be a `{ value, ctx }` object"))?;
+    let mut sink = current_ctx();
+    if let Some(ctx_obj) = obj.get("ctx").and_then(|v| v.as_object()) {
+        if let Some(p) = ctx_obj.get("private").and_then(|v| v.as_string()) {
+            sink.set_private(p.as_str().as_bytes().to_vec());
+        }
+        if let Some(ws) = ctx_obj.get("warnings").filter(|v| v.as_array().is_some()) {
+            let ws_json = facet_json::to_string(ws).map_err(|e| handler_err(op, e))?;
+            for diag in parse_diagnostics(&ws_json) {
+                sink.warning(diag);
+            }
+        }
+    }
+    let value = obj
+        .get("value")
+        .ok_or_else(|| handler_err(op, "handler output is missing `value`"))?;
+    facet_json::to_string(value).map_err(|e| handler_err(op, e))
+}
+
 // --- erased handlers backed by JS ------------------------------------------
 
 /// A resource whose lifecycle is a set of async JS callbacks.
@@ -313,15 +384,21 @@ struct JsResource {
     validate: Handler,
 }
 
+/// Serialize a [`Value`] for a ctx-threaded handler call, mapping the codec error
+/// into diagnostics.
+fn value_json(value: &Value, op: &str) -> std::result::Result<String, Diagnostics> {
+    value_to_json(value).map_err(|e| handler_err(op, e))
+}
+
 #[async_trait]
 impl DynResource for JsResource {
     async fn create(&self, planned: Value) -> std::result::Result<Value, Diagnostics> {
-        let out = call_handler(&self.create, &planned, "create").await?;
+        let out = call_with_ctx(&self.create, value_json(&planned, "create")?, "create").await?;
         json_to_value(&out, &self.ty).map_err(|e| handler_err("create", e))
     }
 
     async fn read(&self, current: Value) -> std::result::Result<Option<Value>, Diagnostics> {
-        let out = call_handler(&self.read, &current, "read").await?;
+        let out = call_with_ctx(&self.read, value_json(&current, "read")?, "read").await?;
         // A JSON `null` result means the resource no longer exists.
         if out.trim() == "null" {
             return Ok(None);
@@ -345,24 +422,20 @@ impl DynResource for JsResource {
             .into_iter()
             .collect(),
         );
-        let out = call_handler(&self.update, &input, "update").await?;
+        let out = call_with_ctx(&self.update, value_json(&input, "update")?, "update").await?;
         json_to_value(&out, &self.ty).map_err(|e| handler_err("update", e))
     }
 
     async fn delete(&self, prior: Value) -> std::result::Result<(), Diagnostics> {
-        call_handler(&self.delete, &prior, "delete").await?;
+        call_with_ctx(&self.delete, value_json(&prior, "delete")?, "delete").await?;
         Ok(())
     }
 
     async fn import(&self, id: String) -> std::result::Result<Value, Diagnostics> {
-        // The import handler's input is the raw ID string (not a marshalled
-        // Value), so it is passed through directly.
-        let promise = self
-            .import
-            .call_async(Ok(id))
-            .await
-            .map_err(|e| handler_err("import", e))?;
-        let out = promise.await.map_err(|e| handler_err("import", e))?;
+        // The import handler's payload is the raw ID string; wrap it as the ctx
+        // envelope's `value` (a JSON string).
+        let id_json = facet_json::to_string(&id).map_err(|e| handler_err("import", e))?;
+        let out = call_with_ctx(&self.import, id_json, "import").await?;
         json_to_value(&out, &self.ty).map_err(|e| handler_err("import", e))
     }
 
@@ -381,7 +454,7 @@ impl DynResource for JsResource {
             .into_iter()
             .collect(),
         );
-        let out = call_handler(&self.upgrade, &input, "upgrade").await?;
+        let out = call_with_ctx(&self.upgrade, value_json(&input, "upgrade")?, "upgrade").await?;
         json_to_value(&out, &self.ty).map_err(|e| handler_err("upgrade", e))
     }
 
@@ -405,7 +478,8 @@ struct JsDataSource {
 #[async_trait]
 impl DynDataSource for JsDataSource {
     async fn read(&self, config: Value) -> std::result::Result<Value, Diagnostics> {
-        let out = call_handler(&self.read, &config, "data source read").await?;
+        let out = call_with_ctx(&self.read, value_json(&config, "data source read")?, "data source read")
+            .await?;
         json_to_value(&out, &self.ty).map_err(|e| handler_err("data source read", e))
     }
 

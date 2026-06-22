@@ -131,9 +131,13 @@ persisted to state), HCL nested **blocks**, and single-file packaging (the
 `@tofu-sdk/core/tsdown` preset) all work end-to-end against real OpenTofu — see
 `test/e2e.test.mjs`.
 
+Resource and data-source handlers receive a **`ctx`** (final argument) — the TS
+analog of Rust's `&mut Ctx`: `ctx.warn(...)` for success-path warnings,
+`ctx.private` / `ctx.setPrivate(...)` for per-resource private state, and
+`ctx.cancelled` / `ctx.signal` for cancellation. Ignore it if unused.
+
 Not yet wired up (the Rust core supports these; the Node binding doesn't expose
-them yet): **list resources**, **state stores**, **resource identity**,
-`modify_plan` / `move_state`, the handler `Ctx` (success-path warnings,
-per-resource private state, cancellation) on resource/data-source handlers, and
-semantic-equality normalization. Also: prebuilt multi-platform addons (the preset
-inlines the addon for the platform you build on).
+them yet): **list resources**, **state stores**, **resource identity**, variadic
+functions, `modify_plan` / `move_state`, and semantic-equality normalization.
+Also: prebuilt multi-platform addons (the preset inlines the addon for the
+platform you build on).
