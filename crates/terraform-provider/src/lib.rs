@@ -52,5 +52,5 @@ pub use terraform_value::TfValue;
 pub use terraform_reflect::{
     data_source_list_name, data_source_name, ephemeral_name, reflect_block, reflect_data_source,
     reflect_data_source_list, reflect_ephemeral, reflect_function, reflect_resource,
-    reflect_variadic_function, resource_name, PluralDataSource, ReflectError,
+    reflect_state_store, reflect_variadic_function, resource_name, PluralDataSource, ReflectError,
 };

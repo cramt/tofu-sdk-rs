@@ -65,7 +65,11 @@ pub fn emit_provider_schema(schema: &ProviderSchema) -> get_provider_schema::Res
             .iter()
             .map(|l| (l.name.clone(), emit_schema(&l.config, 0)))
             .collect(),
-        state_store_schemas: HashMap::new(),
+        state_store_schemas: schema
+            .state_stores
+            .iter()
+            .map(|s| (s.name.clone(), emit_schema(&s.block, 0)))
+            .collect(),
         action_schemas: HashMap::new(),
         diagnostics: Vec::new(),
         provider_meta: None,
@@ -155,7 +159,13 @@ pub fn emit_metadata(schema: &ProviderSchema) -> get_metadata::Response {
                 type_name: l.name.clone(),
             })
             .collect(),
-        state_stores: Vec::new(),
+        state_stores: schema
+            .state_stores
+            .iter()
+            .map(|s| get_metadata::StateStoreMetadata {
+                type_name: s.name.clone(),
+            })
+            .collect(),
         actions: Vec::new(),
     }
 }

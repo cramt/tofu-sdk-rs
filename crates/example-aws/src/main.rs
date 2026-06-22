@@ -17,12 +17,17 @@
 //! `data "aws_s3_bucket"` keyed by the unique `arn` (one object) and a plural
 //! `data "aws_s3_buckets"` keyed by the generic `name` (a `results` list).
 //!
-//! Finally it demonstrates an **ephemeral resource** `aws_session_token`: a
-//! short-lived credential minted for the duration of a run and never written to
-//! state, exercising the full `Open`/`Renew`/`Close` lifecycle.
+//! It demonstrates an **ephemeral resource** `aws_session_token`: a short-lived
+//! credential minted for the duration of a run and never written to state,
+//! exercising the full `Open`/`Renew`/`Close` lifecycle.
+//!
+//! Finally it demonstrates a **state store** `inmem`: a provider-defined Terraform
+//! backend that keeps each workspace's raw state bytes in memory, exercising
+//! `Configure`/`Read`/`Write`/`Lock`/`Unlock`/`GetStates`/`Delete`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use std::time::Duration;
 
@@ -31,7 +36,7 @@ use terraform_provider::terraform;
 use terraform_runtime::{
     async_trait, serve, Ctx, DataSource, DataSourceError, DataSourceList, Ephemeral,
     EphemeralError, Function, FunctionError, ListError, ListItem, ListResource, Provider, Resource,
-    ResourceError, VariadicFunction,
+    ResourceError, StateBackend, StateStore, StateStoreError, VariadicFunction,
 };
 
 /// Provider-level configuration.
@@ -391,6 +396,109 @@ impl Ephemeral for SessionTokenEphemeral {
     }
 }
 
+/// Configuration for the in-memory state store: an optional key prefix applied to
+/// every state id, so two store instances can share the process without clashing.
+#[derive(Facet)]
+#[allow(dead_code)]
+struct InMemConfig {
+    /// Namespace prepended to every state id. Optional; defaults to empty.
+    prefix: Option<String>,
+}
+
+/// The shared, process-global storage behind the `inmem` state store: state bytes
+/// and held locks, both keyed by the (prefixed) state id. Cloning shares the maps.
+#[derive(Clone, Default)]
+struct InMemStore {
+    states: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    locks: Arc<Mutex<HashMap<String, String>>>,
+}
+
+/// A connected [`InMemStore`] backend bound to a configured prefix.
+struct InMemBackend {
+    prefix: String,
+    store: InMemStore,
+}
+
+impl InMemBackend {
+    /// The storage key for a state id (the configured prefix plus the id).
+    fn key(&self, state_id: &str) -> String {
+        format!("{}{state_id}", self.prefix)
+    }
+}
+
+/// Monotonic source of lock identifiers (no `rand`/clock needed in the example).
+static LOCK_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[async_trait]
+impl StateStore for InMemStore {
+    type Config = InMemConfig;
+    type Backend = InMemBackend;
+
+    async fn configure(&self, config: InMemConfig) -> Result<InMemBackend, StateStoreError> {
+        Ok(InMemBackend {
+            prefix: config.prefix.unwrap_or_default(),
+            store: self.clone(),
+        })
+    }
+}
+
+#[async_trait]
+impl StateBackend for InMemBackend {
+    async fn read_state(&self, state_id: String) -> Result<Vec<u8>, StateStoreError> {
+        let states = self.store.states.lock().unwrap();
+        Ok(states
+            .get(&self.key(&state_id))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn write_state(&self, state_id: String, data: Vec<u8>) -> Result<(), StateStoreError> {
+        let mut states = self.store.states.lock().unwrap();
+        states.insert(self.key(&state_id), data);
+        Ok(())
+    }
+
+    async fn lock(&self, state_id: String, operation: String) -> Result<String, StateStoreError> {
+        let mut locks = self.store.locks.lock().unwrap();
+        let key = self.key(&state_id);
+        if let Some(held) = locks.get(&key) {
+            return Err(StateStoreError::new("state is already locked")
+                .with_detail(format!("`{state_id}` is held by lock {held}")));
+        }
+        let lock_id = format!("{operation}-{}", LOCK_SEQ.fetch_add(1, Ordering::Relaxed));
+        locks.insert(key, lock_id.clone());
+        Ok(lock_id)
+    }
+
+    async fn unlock(&self, state_id: String, lock_id: String) -> Result<(), StateStoreError> {
+        let mut locks = self.store.locks.lock().unwrap();
+        let key = self.key(&state_id);
+        match locks.get(&key) {
+            Some(held) if *held == lock_id => {
+                locks.remove(&key);
+                Ok(())
+            }
+            Some(held) => Err(StateStoreError::new("lock id mismatch")
+                .with_detail(format!("`{state_id}` is held by {held}, not {lock_id}"))),
+            None => Ok(()),
+        }
+    }
+
+    async fn states(&self) -> Result<Vec<String>, StateStoreError> {
+        let states = self.store.states.lock().unwrap();
+        Ok(states
+            .keys()
+            .filter_map(|k| k.strip_prefix(&self.prefix).map(str::to_string))
+            .collect())
+    }
+
+    async fn delete_state(&self, state_id: String) -> Result<(), StateStoreError> {
+        let mut states = self.store.states.lock().unwrap();
+        states.remove(&self.key(&state_id));
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let provider = Provider::builder()
@@ -408,6 +516,7 @@ async fn main() {
         .ephemeral_with(|client: Arc<AwsClient>| SessionTokenEphemeral { client })
         .function("arn_for", ArnFor)
         .function_variadic("join", Join)
+        .state_store("inmem", InMemStore::default())
         .build()
         .expect("provider definition is valid");
 

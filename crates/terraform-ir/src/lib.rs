@@ -32,6 +32,9 @@ pub struct ProviderSchema {
     /// List resources keyed by type name: a queryable enumeration of existing
     /// instances of the managed resource of the same name.
     pub list_resources: Vec<ListResourceSchema>,
+    /// State stores keyed by type name (e.g. `s3`): provider-defined Terraform
+    /// state backends that read/write raw state bytes and manage locks.
+    pub state_stores: Vec<StateStoreSchema>,
     /// Provider-defined functions, callable from HCL as `provider::<p>::<name>`.
     pub functions: Vec<FunctionSignature>,
 }
@@ -162,6 +165,22 @@ pub struct ListResourceSchema {
     /// The `cty` object type of the full resource, used to encode the optional
     /// `resource_object` of each result (the managed resource's object type).
     pub object_type: Type,
+}
+
+/// A provider-defined state store: a Terraform state backend implemented by the
+/// provider.
+///
+/// Structurally just a name plus a config [`Block`] (the settable backend
+/// configuration — bucket, region, credentials, …), like a [`DataSourceSchema`].
+/// The byte-level read/write/lock operations are runtime behavior, not schema, so
+/// they do not appear here — only the configuration the host validates and passes
+/// to `ConfigureStateStore`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StateStoreSchema {
+    /// Fully-qualified type name, e.g. `s3`.
+    pub name: String,
+    /// The state store's configuration block.
+    pub block: Block,
 }
 
 /// A configuration block: a flat set of attributes plus any nested blocks.

@@ -239,6 +239,15 @@ plus data sources, functions, nested blocks, a handler context, and lossless
   Close = delete) — for cheap, reversible resources only (no renewal; a created
   object leaks if the run is interrupted).
 
+- **State stores ✅** — provider-defined Terraform *backends*. Implement the
+  `StateStore` trait (`configure(config) -> Backend`, reflecting a `Config` block)
+  to connect a `StateBackend` whose methods read/write the raw state bytes and
+  manage locks per workspace (`read_state`/`write_state`/`lock`/`unlock`/`states`/
+  `delete_state`), registered with `ProviderBuilder::state_store` /
+  `state_store_with` (or the `dyn_state_store` seam). The runtime drives the full
+  eight-RPC protocol — chunked `ReadStateBytes`/`WriteStateBytes`,
+  lock/unlock/list/delete — over whole byte vectors. See the `inmem` example.
+
 ### Not yet implemented
 
 There is no dedicated

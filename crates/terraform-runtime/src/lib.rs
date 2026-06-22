@@ -23,6 +23,7 @@ mod plan;
 mod resource;
 mod serve;
 mod service;
+mod state_store;
 mod timeouts;
 mod tls;
 mod write_only;
@@ -39,6 +40,7 @@ pub use list::{ListError, ListItem, ListResource};
 pub use normalize::{string_quotient, Canon};
 pub use resource::{Path, PathStep, PlanModifications, Resource, ResourceError};
 pub use serve::{serve, ServeError};
+pub use state_store::{StateBackend, StateStore, StateStoreError};
 pub use timeouts::Timeouts;
 
 /// The erased, `Value`-oriented handler traits and diagnostic types. These are
@@ -52,6 +54,7 @@ pub use function::DynFunction;
 pub use list::{DynListItem, DynListResource};
 pub use resource::{Diag, Diagnostics, DynResource, Severity};
 pub use service::{current_cancellation, ProviderService};
+pub use state_store::{DynStateBackend, DynStateStore};
 
 /// Re-export of `tokio_util`'s [`CancellationToken`](tokio_util::sync::CancellationToken)
 /// so handlers can type the token returned by [`current_cancellation`] (e.g. to

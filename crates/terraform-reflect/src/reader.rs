@@ -5,7 +5,7 @@ use terraform_attrs::Attr as TfAttr;
 use terraform_ir::{
     AttributeSchema, Block, DataSourceSchema, EphemeralSchema, FunctionSignature,
     IdentityAttribute, IdentitySchema, ListResourceSchema, NestedBlock, NestingMode, Parameter,
-    ResourceSchema,
+    ResourceSchema, StateStoreSchema,
 };
 use terraform_value::{Number, ObjectAttr, Type, Value};
 
@@ -325,6 +325,21 @@ pub fn reflect_ephemeral<T: Facet<'static>>(
     name: impl Into<String>,
 ) -> Result<EphemeralSchema, ReflectError> {
     Ok(EphemeralSchema {
+        name: name.into(),
+        block: reflect_block::<T>()?,
+    })
+}
+
+/// Reflect a Rust type into a [`StateStoreSchema`]. The state store's config type
+/// has no search-key or computed-result projection: its block is the model's
+/// fields as declared (all settable backend configuration — bucket, region,
+/// credentials, …). The `name` is supplied at registration (like a function),
+/// since a state store's type name is the backend name, not tied to a model
+/// identity.
+pub fn reflect_state_store<T: Facet<'static>>(
+    name: impl Into<String>,
+) -> Result<StateStoreSchema, ReflectError> {
+    Ok(StateStoreSchema {
         name: name.into(),
         block: reflect_block::<T>()?,
     })
@@ -1494,6 +1509,32 @@ mod tests {
         assert!(
             token.computed && token.sensitive,
             "computed sensitive result"
+        );
+    }
+
+    #[derive(Facet)]
+    #[allow(dead_code)]
+    struct StateStoreConfig {
+        /// A required input.
+        bucket: String,
+        /// An optional input.
+        region: Option<String>,
+    }
+
+    #[test]
+    fn reflect_state_store_projects_config_block() {
+        let store = reflect_state_store::<StateStoreConfig>("s3").expect("reflects");
+        assert_eq!(store.name, "s3");
+
+        let bucket = attr(&store.block, "bucket");
+        assert!(
+            bucket.required && !bucket.computed,
+            "plain field is a required config input"
+        );
+        let region = attr(&store.block, "region");
+        assert!(
+            region.optional && !region.required,
+            "Option field is an optional config input"
         );
     }
 

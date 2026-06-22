@@ -568,5 +568,31 @@ All are stubbed in `service.rs` (`unimplemented_unary!` or streaming stubs).
   plan-omits-while-unknown), and the real `tofu test` suite (`aws_locker` now
   declares `name` as its identity and applies/destroys cleanly, so OpenTofu
   validates the planned/new identity consistency).
-- **State store** (`ReadStateBytes`/`WriteStateBytes`/`Lock`/`Unlock`/…, streaming).
+- ~~**State store**~~ ✅ **DONE** — provider-defined Terraform backends. A
+  **two-trait split** mirroring provider config → meta: the typed `StateStore`
+  trait (`type Config` → published config block; `configure(config) -> Backend`)
+  builds a connected `StateBackend` on `ConfigureStateStore`, and `StateBackend`
+  holds the byte/lock operations keyed by `state_id`
+  (`read_state`/`write_state`/`lock`/`unlock`/`states`/`delete_state`). Erased
+  behind `DynStateStore`/`DynStateBackend`; new IR `StateStoreSchema`
+  (`ProviderSchema.state_stores`), `reflect_state_store` (config block only, like
+  `reflect_ephemeral`; name supplied at registration like a function),
+  `emit.rs` publishes `state_store_schemas` (GetProviderSchema) + `state_stores`
+  (GetMetadata). `service.rs` implements all eight RPCs:
+  `ValidateStateStoreConfig`/`ConfigureStateStore`, the streaming
+  `ReadStateBytes` (whole state read then chunked at the negotiated `chunk_size`)
+  / `WriteStateBytes` (chunks reassembled — body in the testable
+  `write_state_stream` since `tonic::Streaming` has no public constructor),
+  `LockState`/`UnlockState`, `GetStates`/`DeleteState`. The connected backend is
+  stored at runtime per type name in `ProviderService.state_backends` (an
+  `RwLock<HashMap>`), populated by `ConfigureStateStore` — separate from
+  `ConfigureProvider`'s meta. Registered with `ProviderBuilder::state_store` /
+  `state_store_with` / `dyn_state_store`. Example: `example-aws`'s `inmem` store.
+  **Verified** by direct service tests (`state_store_*` in
+  `terraform-runtime/tests/service.rs`: full lifecycle, chunked read, validate
+  rejection, read-before-configure, unknown-type, schema/metadata publication), a
+  reflect unit test, and the protocol schema-contract assertion. **Engine layer
+  deferred:** OpenTofu 1.12.1's `providers schema -json` drops
+  `state_store_schemas` (too new to drive `tofu`), so the protocol assertion
+  against our own `GetProviderSchema` stands in — like list resources.
 - **Actions** (`PlanAction`/`InvokeAction`/`ValidateActionConfig`).

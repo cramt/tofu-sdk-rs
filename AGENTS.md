@@ -448,6 +448,45 @@ published as the list's own schema). Registered with
   list resources — verification is the direct service-call tests plus a
   protocol-level `GetProviderSchema` assertion (as with `MoveResourceState`).
 
+**State stores** (`state_store.rs`) are provider-defined Terraform *backends* — a
+separate primitive again, with their own IR (`StateStoreSchema`,
+`ProviderSchema.state_stores`), schema slot (`state_store_schemas` +
+`GetMetadata.state_stores`), and eight RPCs. They are modeled as a **two-trait
+split** that mirrors provider config → meta: an author implements the typed
+`StateStore` trait (`type Config` reflects the published config block;
+`configure(config) -> Backend`) which, on `ConfigureStateStore`, builds a
+connected `StateBackend` holding the byte/lock operations
+(`read_state`/`write_state`/`lock`/`unlock`/`states`/`delete_state`), each keyed
+by a `state_id`. `reflect_state_store` projects only the config block (like
+`reflect_ephemeral`); the **type name is supplied at registration** (like a
+function — a state store's name is the backend name, not a model identity), so the
+config model is a plain `#[derive(Facet)]` struct with no name marker and the
+`terraform-attrs` grammar is untouched. Registered with
+`ProviderBuilder::state_store` / `state_store_with` / `dyn_state_store`. Gotchas:
+- **The connected backend lives on `ProviderService`, not `Provider`.** A state
+  store is configured by its *own* RPC (`ConfigureStateStore`), separate from
+  `ConfigureProvider`, so the `Backend` is stored at runtime in
+  `ProviderService.state_backends` (an `Arc<RwLock<HashMap<name, backend>>>`),
+  populated on configure and read by the byte/lock RPCs. A read/lock before
+  configure yields a "not configured" diagnostic (vs "unknown" for an
+  unregistered type — see `state_store_unavailable`).
+- **`ReadStateBytes`/`WriteStateBytes` stream, but the handler sees whole bytes.**
+  Reads materialize the full state then chunk it at the negotiated `chunk_size`
+  (`ConfigureStateStore` echoes the host's suggested size, else a 4 MiB default);
+  writes reassemble all chunks (the first carries `meta` with `type_name`/
+  `state_id`) before one `write_state` call. State files are bounded, so this is
+  fine — the same trade-off list resources make.
+- **`write_state_bytes`'s body lives in `ProviderService::write_state_stream`**
+  (a `pub` method taking an `impl Stream`) because a `tonic::Streaming` has no
+  public constructor — tests drive the core with `tokio_stream::iter`.
+- **Both traits erase to `DynStateStore`/`DynStateBackend`** (the value seam);
+  `dyn_state_store` lets a non-Rust frontend register one. The Node binding
+  doesn't implement them yet — the new erased traits don't churn it.
+- **Engine layer deferred** for the same reason as list resources: OpenTofu
+  1.12.1's `providers schema -json` drops `state_store_schemas`, so verification
+  is the direct service-call tests (`state_store_*`) plus the protocol-level
+  `GetProviderSchema`/`GetMetadata` assertion.
+
 ## Testing approach
 
 Three layers, deliberately:

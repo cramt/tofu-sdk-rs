@@ -13,7 +13,8 @@ use terraform_attrs as terraform;
 use terraform_runtime::{
     async_trait, ConfigureError, Ctx, DataSource, DataSourceError, DataSourceList, Diag, Ephemeral,
     EphemeralError, EphemeralFromResource, ListError, ListItem, ListResource, Path,
-    PlanModifications, Provider, ProviderService, Resource, ResourceError, Timeouts,
+    PlanModifications, Provider, ProviderService, Resource, ResourceError, StateBackend,
+    StateStore, StateStoreError, Timeouts,
 };
 use terraform_tfplugin6::tfplugin6::{self, provider_server::Provider as _};
 use tonic::codegen::tokio_stream::StreamExt as _;
@@ -2970,5 +2971,388 @@ async fn list_resource_unknown_type_yields_diagnostic_event() {
     assert!(
         !events[0].diagnostic.is_empty(),
         "an unknown list resource streams an error diagnostic"
+    );
+}
+
+// --- State stores ----------------------------------------------------------
+
+/// Configuration for the test in-memory state store: an optional key prefix.
+#[derive(Facet)]
+#[allow(dead_code)]
+struct LockerConfig {
+    prefix: Option<String>,
+}
+
+/// Shared in-memory storage for the `vault` state store.
+#[derive(Clone, Default)]
+struct Locker {
+    states: Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>,
+    locks: Arc<std::sync::Mutex<HashMap<String, String>>>,
+}
+
+/// A configured [`Locker`] backend bound to a prefix.
+struct LockerBackend {
+    prefix: String,
+    vault: Locker,
+}
+
+impl LockerBackend {
+    fn key(&self, id: &str) -> String {
+        format!("{}{id}", self.prefix)
+    }
+}
+
+#[async_trait]
+impl StateStore for Locker {
+    type Config = LockerConfig;
+    type Backend = LockerBackend;
+
+    async fn configure(&self, config: LockerConfig) -> Result<LockerBackend, StateStoreError> {
+        Ok(LockerBackend {
+            prefix: config.prefix.unwrap_or_default(),
+            vault: self.clone(),
+        })
+    }
+
+    async fn validate(&self, config: LockerConfig) -> Vec<Diag> {
+        match config.prefix.as_deref() {
+            Some("bad") => vec![Diag::error("invalid prefix", "`bad` is reserved")],
+            _ => Vec::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl StateBackend for LockerBackend {
+    async fn read_state(&self, state_id: String) -> Result<Vec<u8>, StateStoreError> {
+        let states = self.vault.states.lock().unwrap();
+        Ok(states
+            .get(&self.key(&state_id))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn write_state(&self, state_id: String, data: Vec<u8>) -> Result<(), StateStoreError> {
+        self.vault
+            .states
+            .lock()
+            .unwrap()
+            .insert(self.key(&state_id), data);
+        Ok(())
+    }
+
+    async fn lock(&self, state_id: String, operation: String) -> Result<String, StateStoreError> {
+        let mut locks = self.vault.locks.lock().unwrap();
+        let key = self.key(&state_id);
+        if locks.contains_key(&key) {
+            return Err(StateStoreError::new("state is already locked"));
+        }
+        let lock_id = format!("{operation}-lock");
+        locks.insert(key, lock_id.clone());
+        Ok(lock_id)
+    }
+
+    async fn unlock(&self, state_id: String, _lock_id: String) -> Result<(), StateStoreError> {
+        self.vault
+            .locks
+            .lock()
+            .unwrap()
+            .remove(&self.key(&state_id));
+        Ok(())
+    }
+
+    async fn states(&self) -> Result<Vec<String>, StateStoreError> {
+        let states = self.vault.states.lock().unwrap();
+        Ok(states
+            .keys()
+            .filter_map(|k| k.strip_prefix(&self.prefix).map(str::to_string))
+            .collect())
+    }
+
+    async fn delete_state(&self, state_id: String) -> Result<(), StateStoreError> {
+        self.vault
+            .states
+            .lock()
+            .unwrap()
+            .remove(&self.key(&state_id));
+        Ok(())
+    }
+}
+
+fn state_store_service() -> ProviderService {
+    let provider = Provider::builder()
+        .state_store("vault", Locker::default())
+        .build()
+        .expect("provider builds");
+    ProviderService::new(provider)
+}
+
+/// Drive `ConfigureStateStore` for `vault` with an empty config (no prefix).
+async fn configure_vault(svc: &ProviderService) {
+    let resp = svc
+        .configure_state_store(Request::new(tfplugin6::configure_state_store::Request {
+            type_name: "vault".into(),
+            config: None,
+            capabilities: None,
+        }))
+        .await
+        .expect("configure state store")
+        .into_inner();
+    assert!(resp.diagnostics.is_empty(), "{:?}", resp.diagnostics);
+    // Without a host suggestion, the server picks its default chunk size.
+    assert!(resp.capabilities.unwrap().chunk_size > 0);
+}
+
+/// Collect a `ReadStateBytes` stream into the reassembled bytes, asserting no
+/// error diagnostics arrived.
+async fn read_vault(svc: &ProviderService, state_id: &str) -> Vec<u8> {
+    let mut stream = svc
+        .read_state_bytes(Request::new(tfplugin6::read_state_bytes::Request {
+            type_name: "vault".into(),
+            state_id: state_id.into(),
+        }))
+        .await
+        .expect("read state")
+        .into_inner();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("chunk");
+        assert!(chunk.diagnostics.is_empty(), "{:?}", chunk.diagnostics);
+        bytes.extend_from_slice(&chunk.bytes);
+    }
+    bytes
+}
+
+/// Write `data` to `state_id` through the chunk-reassembly path.
+async fn write_vault(svc: &ProviderService, state_id: &str, data: Vec<u8>) {
+    let chunk = tfplugin6::write_state_bytes::RequestChunk {
+        meta: Some(tfplugin6::RequestChunkMeta {
+            type_name: "vault".into(),
+            state_id: state_id.into(),
+        }),
+        bytes: data,
+        total_length: 0,
+        range: None,
+    };
+    let stream = tonic::codegen::tokio_stream::iter(vec![Ok(chunk)]);
+    let resp = svc.write_state_stream(stream).await;
+    assert!(resp.diagnostics.is_empty(), "{:?}", resp.diagnostics);
+}
+
+#[tokio::test]
+async fn state_store_full_lifecycle() {
+    let svc = state_store_service();
+    configure_vault(&svc).await;
+
+    // A fresh state reads back empty.
+    assert!(read_vault(&svc, "default").await.is_empty());
+
+    // Write then read round-trips the bytes.
+    write_vault(&svc, "default", b"hello-state".to_vec()).await;
+    assert_eq!(read_vault(&svc, "default").await, b"hello-state");
+
+    // GetStates lists the written workspace.
+    let states = svc
+        .get_states(Request::new(tfplugin6::get_states::Request {
+            type_name: "vault".into(),
+        }))
+        .await
+        .expect("get states")
+        .into_inner();
+    assert!(states.diagnostics.is_empty(), "{:?}", states.diagnostics);
+    assert_eq!(states.state_id, vec!["default".to_string()]);
+
+    // Lock succeeds and yields a lock id; a second lock conflicts.
+    let lock = svc
+        .lock_state(Request::new(tfplugin6::lock_state::Request {
+            type_name: "vault".into(),
+            state_id: "default".into(),
+            operation: "apply".into(),
+        }))
+        .await
+        .expect("lock")
+        .into_inner();
+    assert!(lock.diagnostics.is_empty(), "{:?}", lock.diagnostics);
+    assert_eq!(lock.lock_id, "apply-lock");
+
+    let conflict = svc
+        .lock_state(Request::new(tfplugin6::lock_state::Request {
+            type_name: "vault".into(),
+            state_id: "default".into(),
+            operation: "plan".into(),
+        }))
+        .await
+        .expect("lock")
+        .into_inner();
+    assert!(
+        !conflict.diagnostics.is_empty(),
+        "a second lock on a held state errors"
+    );
+
+    // Unlock releases it; deleting the state then empties GetStates.
+    let unlock = svc
+        .unlock_state(Request::new(tfplugin6::unlock_state::Request {
+            type_name: "vault".into(),
+            state_id: "default".into(),
+            lock_id: lock.lock_id,
+        }))
+        .await
+        .expect("unlock")
+        .into_inner();
+    assert!(unlock.diagnostics.is_empty(), "{:?}", unlock.diagnostics);
+
+    let del = svc
+        .delete_state(Request::new(tfplugin6::delete_state::Request {
+            type_name: "vault".into(),
+            state_id: "default".into(),
+        }))
+        .await
+        .expect("delete")
+        .into_inner();
+    assert!(del.diagnostics.is_empty(), "{:?}", del.diagnostics);
+    assert!(read_vault(&svc, "default").await.is_empty());
+}
+
+#[tokio::test]
+async fn state_store_read_splits_into_chunks() {
+    let svc = state_store_service();
+
+    // Negotiate a tiny chunk size so a modest payload spans several chunks.
+    let cfg = svc
+        .configure_state_store(Request::new(tfplugin6::configure_state_store::Request {
+            type_name: "vault".into(),
+            config: None,
+            capabilities: Some(tfplugin6::StateStoreClientCapabilities { chunk_size: 8 }),
+        }))
+        .await
+        .expect("configure")
+        .into_inner();
+    assert_eq!(
+        cfg.capabilities.unwrap().chunk_size,
+        8,
+        "host suggestion honored"
+    );
+
+    let payload: Vec<u8> = (0..50u8).collect();
+    write_vault(&svc, "default", payload.clone()).await;
+
+    // Read and assert the stream really arrived in multiple bounded chunks.
+    let mut stream = svc
+        .read_state_bytes(Request::new(tfplugin6::read_state_bytes::Request {
+            type_name: "vault".into(),
+            state_id: "default".into(),
+        }))
+        .await
+        .expect("read")
+        .into_inner();
+    let mut chunks = 0;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("chunk");
+        assert!(
+            chunk.bytes.len() <= 8,
+            "each chunk respects the negotiated size"
+        );
+        assert_eq!(chunk.total_length, 50);
+        bytes.extend_from_slice(&chunk.bytes);
+        chunks += 1;
+    }
+    assert!(
+        chunks > 1,
+        "a 50-byte state with an 8-byte chunk size spans many chunks"
+    );
+    assert_eq!(bytes, payload, "reassembled bytes match what was written");
+}
+
+#[tokio::test]
+async fn state_store_validate_rejects_bad_config() {
+    use terraform_value::{ObjectAttr, Type, Value};
+    let svc = state_store_service();
+
+    let ty = Type::Object(vec![ObjectAttr {
+        name: "prefix".into(),
+        ty: Type::String,
+        optional: true,
+    }]);
+    let mut fields = std::collections::BTreeMap::new();
+    fields.insert("prefix".to_string(), Value::String("bad".into()));
+    let dv = tfplugin6::DynamicValue {
+        msgpack: terraform_codec::encode_msgpack(&Value::Object(fields), &ty).unwrap(),
+        json: vec![],
+    };
+    let resp = svc
+        .validate_state_store_config(Request::new(tfplugin6::validate_state_store::Request {
+            type_name: "vault".into(),
+            config: Some(dv),
+        }))
+        .await
+        .expect("validate")
+        .into_inner();
+    assert!(
+        !resp.diagnostics.is_empty(),
+        "a reserved prefix is rejected with a diagnostic"
+    );
+}
+
+#[tokio::test]
+async fn state_store_read_before_configure_errors() {
+    let svc = state_store_service();
+    // No ConfigureStateStore: the backend is unavailable.
+    let mut stream = svc
+        .read_state_bytes(Request::new(tfplugin6::read_state_bytes::Request {
+            type_name: "vault".into(),
+            state_id: "default".into(),
+        }))
+        .await
+        .expect("read")
+        .into_inner();
+    let first = stream.next().await.expect("one response").expect("ok");
+    assert!(
+        !first.diagnostics.is_empty(),
+        "reading before configure yields a not-configured diagnostic"
+    );
+}
+
+#[tokio::test]
+async fn state_store_unknown_type_errors() {
+    let svc = state_store_service();
+    let resp = svc
+        .configure_state_store(Request::new(tfplugin6::configure_state_store::Request {
+            type_name: "nope".into(),
+            config: None,
+            capabilities: None,
+        }))
+        .await
+        .expect("configure")
+        .into_inner();
+    assert!(resp.capabilities.is_none());
+    assert!(
+        !resp.diagnostics.is_empty(),
+        "an unknown state store type is rejected"
+    );
+}
+
+#[tokio::test]
+async fn state_store_published_in_schema_and_metadata() {
+    let svc = state_store_service();
+
+    let schema = svc
+        .get_provider_schema(Request::new(tfplugin6::get_provider_schema::Request {}))
+        .await
+        .expect("schema")
+        .into_inner();
+    assert!(
+        schema.state_store_schemas.contains_key("vault"),
+        "the state store appears in GetProviderSchema.state_store_schemas"
+    );
+
+    let metadata = svc
+        .get_metadata(Request::new(tfplugin6::get_metadata::Request {}))
+        .await
+        .expect("metadata")
+        .into_inner();
+    assert!(
+        metadata.state_stores.iter().any(|s| s.type_name == "vault"),
+        "the state store appears in GetMetadata.state_stores"
     );
 }

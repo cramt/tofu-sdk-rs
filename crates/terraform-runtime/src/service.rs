@@ -6,18 +6,23 @@
 //! reads (`ReadDataSource`), the ephemeral resource lifecycle
 //! (`Open`/`Renew`/`Close`/`ValidateEphemeralResourceConfig`), import
 //! (`ImportResourceState`), provider-defined functions
-//! (`GetFunctions`/`CallFunction`), and list resources (`ListResource`,
-//! server-streaming) by dispatching to the registered handlers through the value
-//! codec. RPCs for features the SDK does not yet support (state stores, actions)
-//! still return `Unimplemented`.
+//! (`GetFunctions`/`CallFunction`), list resources (`ListResource`,
+//! server-streaming), and provider-defined state stores
+//! (`ValidateStateStoreConfig`/`ConfigureStateStore`, `ReadStateBytes`/
+//! `WriteStateBytes`, `LockState`/`UnlockState`, `GetStates`/`DeleteState`) by
+//! dispatching to the registered handlers through the value codec. RPCs for
+//! features the SDK does not yet support (actions) still return `Unimplemented`.
 
+use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use terraform_codec::{decode_json, decode_json_value, decode_msgpack, encode_msgpack, CodecError};
 use terraform_tfplugin6::{
     emit_functions, emit_identity_schemas, emit_metadata, emit_provider_schema, tfplugin6,
 };
 use terraform_value::{Type, Value};
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tonic::codegen::tokio_stream::Stream;
 use tonic::{Request, Response, Status};
@@ -26,6 +31,7 @@ use crate::builder::Provider;
 use crate::ctx::{with_ctx, Ctx, CtxOutputs};
 use crate::plan::plan;
 use crate::resource::{Diag, Diagnostics, Severity};
+use crate::state_store::DynStateBackend;
 
 /// A boxed server-streaming response of `T`. Used only to satisfy the trait's
 /// associated stream types for the not-yet-implemented streaming RPCs.
@@ -46,12 +52,25 @@ pub fn current_cancellation() -> Option<CancellationToken> {
     CANCEL.try_with(|token| token.clone()).ok()
 }
 
+/// The default state-byte chunk size (4 MiB) when the host suggests none.
+const DEFAULT_STATE_CHUNK_SIZE: i64 = 4 * 1024 * 1024;
+
+/// A state store's configured backend plus the negotiated transfer chunk size.
+struct ConfiguredBackend {
+    backend: Arc<dyn DynStateBackend>,
+    chunk_size: usize,
+}
+
 /// Adapts a [`Provider`] to the generated gRPC service trait.
 #[derive(Clone)]
 pub struct ProviderService {
     provider: Provider,
     /// Tripped by `StopProvider`; cloned into each handler dispatch's task-local.
     cancel: CancellationToken,
+    /// State store backends connected by `ConfigureStateStore`, keyed by type
+    /// name. Populated at runtime (not build time) because a state store is
+    /// configured by its own RPC, separately from `ConfigureProvider`.
+    state_backends: Arc<RwLock<HashMap<String, ConfiguredBackend>>>,
 }
 
 impl ProviderService {
@@ -60,6 +79,98 @@ impl ProviderService {
         Self {
             provider,
             cancel: CancellationToken::new(),
+            state_backends: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// The connected backend (and its negotiated chunk size) for state store
+    /// `type_name`, if it has been configured via `ConfigureStateStore`.
+    async fn state_backend(&self, type_name: &str) -> Option<(Arc<dyn DynStateBackend>, usize)> {
+        let guard = self.state_backends.read().await;
+        guard
+            .get(type_name)
+            .map(|c| (Arc::clone(&c.backend), c.chunk_size))
+    }
+
+    /// Diagnostic for a state store that is either unknown or not yet configured.
+    fn state_store_unavailable(&self, name: &str) -> Vec<tfplugin6::Diagnostic> {
+        if self.provider.state_store_handler(name).is_some() {
+            error_diag(
+                "state store not configured",
+                format!("`{name}` must be configured via ConfigureStateStore before use"),
+            )
+        } else {
+            error_diag(
+                "unknown state store type",
+                format!("the provider has no state store named `{name}`"),
+            )
+        }
+    }
+
+    /// The reassemble-and-write core of `WriteStateBytes`: drain the chunk stream
+    /// (the first chunk carries the `meta` with `type_name`/`state_id`),
+    /// concatenate the bytes, and hand the whole state to the configured backend.
+    /// Kept separate from the trait method so tests can drive it with an ordinary
+    /// stream (a `tonic::Streaming` has no public constructor).
+    pub async fn write_state_stream<S>(
+        &self,
+        mut stream: S,
+    ) -> tfplugin6::write_state_bytes::Response
+    where
+        S: Stream<Item = Result<tfplugin6::write_state_bytes::RequestChunk, Status>> + Unpin,
+    {
+        use tfplugin6::write_state_bytes::Response as Resp;
+        use tonic::codegen::tokio_stream::StreamExt as _;
+
+        let mut type_name: Option<String> = None;
+        let mut state_id: Option<String> = None;
+        let mut data: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(status) => {
+                    return Resp {
+                        diagnostics: error_diag(
+                            "failed to receive state bytes",
+                            status.message().to_string(),
+                        ),
+                    }
+                }
+            };
+            if let Some(meta) = chunk.meta {
+                type_name = Some(meta.type_name);
+                state_id = Some(meta.state_id);
+            }
+            data.extend_from_slice(&chunk.bytes);
+        }
+
+        let (Some(type_name), Some(state_id)) = (type_name, state_id) else {
+            return Resp {
+                diagnostics: error_diag(
+                    "missing write metadata",
+                    "the first WriteStateBytes chunk carried no type_name/state_id",
+                ),
+            };
+        };
+        tracing::debug!(%type_name, %state_id, bytes = data.len(), "WriteStateBytes");
+
+        let Some((backend, _)) = self.state_backend(&type_name).await else {
+            return Resp {
+                diagnostics: self.state_store_unavailable(&type_name),
+            };
+        };
+        let (res, outs) = self
+            .run(
+                "write state",
+                Vec::new(),
+                backend.write_state(state_id, data),
+            )
+            .await;
+        Resp {
+            diagnostics: match res {
+                Ok(()) => pb_diagnostics(outs.warnings),
+                Err(diags) => diags_with_warnings(diags, outs),
+            },
         }
     }
 
@@ -1138,12 +1249,6 @@ impl tfplugin6::provider_server::Provider for ProviderService {
     unimplemented_unary! {
         generate_resource_config => generate_resource_config,
         validate_list_resource_config => validate_list_resource_config,
-        validate_state_store_config => validate_state_store,
-        configure_state_store => configure_state_store,
-        lock_state => lock_state,
-        unlock_state => unlock_state,
-        get_states => get_states,
-        delete_state => delete_state,
         plan_action => plan_action,
         validate_action_config => validate_action_config,
     }
@@ -1260,14 +1365,233 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         Ok(Response::new(Default::default()))
     }
 
+    // --- State stores ------------------------------------------------------
+
+    async fn validate_state_store_config(
+        &self,
+        request: Request<tfplugin6::validate_state_store::Request>,
+    ) -> Result<Response<tfplugin6::validate_state_store::Response>, Status> {
+        use tfplugin6::validate_state_store::Response as Resp;
+        let req = request.into_inner();
+        tracing::debug!(type_name = %req.type_name, "ValidateStateStoreConfig");
+
+        let Some(ty) = self.provider.state_store_cty(&req.type_name) else {
+            return Ok(Response::new(Resp {
+                diagnostics: self.state_store_unavailable(&req.type_name),
+            }));
+        };
+        let Some(handler) = self.provider.state_store_handler(&req.type_name) else {
+            return Ok(Response::new(Resp::default()));
+        };
+        let config = match decode_dynamic(&req.config, &ty) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to decode state store config", e.to_string()),
+                }))
+            }
+        };
+        let (diags, outs) = self
+            .run_diags("validate state store config", handler.validate(config))
+            .await;
+        Ok(Response::new(Resp {
+            diagnostics: diags_with_warnings(diags, outs),
+        }))
+    }
+
+    async fn configure_state_store(
+        &self,
+        request: Request<tfplugin6::configure_state_store::Request>,
+    ) -> Result<Response<tfplugin6::configure_state_store::Response>, Status> {
+        use tfplugin6::configure_state_store::Response as Resp;
+        let req = request.into_inner();
+        tracing::debug!(type_name = %req.type_name, "ConfigureStateStore");
+
+        let Some(ty) = self.provider.state_store_cty(&req.type_name) else {
+            return Ok(Response::new(Resp {
+                diagnostics: self.state_store_unavailable(&req.type_name),
+                capabilities: None,
+            }));
+        };
+        let Some(handler) = self.provider.state_store_handler(&req.type_name) else {
+            return Ok(Response::new(Resp {
+                diagnostics: self.state_store_unavailable(&req.type_name),
+                capabilities: None,
+            }));
+        };
+        let config = match decode_dynamic(&req.config, &ty) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to decode state store config", e.to_string()),
+                    capabilities: None,
+                }))
+            }
+        };
+
+        let (res, outs) = self
+            .run(
+                "configure state store",
+                Vec::new(),
+                handler.configure(config),
+            )
+            .await;
+        match res {
+            Ok(backend) => {
+                // Negotiate the transfer chunk size: honor the host's suggestion
+                // when positive, else fall back to our default.
+                let suggested = req
+                    .capabilities
+                    .map(|c| c.chunk_size)
+                    .filter(|&c| c > 0)
+                    .unwrap_or(DEFAULT_STATE_CHUNK_SIZE);
+                self.state_backends.write().await.insert(
+                    req.type_name.clone(),
+                    ConfiguredBackend {
+                        backend,
+                        chunk_size: suggested as usize,
+                    },
+                );
+                Ok(Response::new(Resp {
+                    diagnostics: pb_diagnostics(outs.warnings),
+                    capabilities: Some(tfplugin6::StateStoreServerCapabilities {
+                        chunk_size: suggested,
+                    }),
+                }))
+            }
+            Err(diags) => Ok(Response::new(Resp {
+                diagnostics: diags_with_warnings(diags, outs),
+                capabilities: None,
+            })),
+        }
+    }
+
+    async fn lock_state(
+        &self,
+        request: Request<tfplugin6::lock_state::Request>,
+    ) -> Result<Response<tfplugin6::lock_state::Response>, Status> {
+        use tfplugin6::lock_state::Response as Resp;
+        let req = request.into_inner();
+        tracing::debug!(type_name = %req.type_name, state_id = %req.state_id, "LockState");
+
+        let Some((backend, _)) = self.state_backend(&req.type_name).await else {
+            return Ok(Response::new(Resp {
+                lock_id: String::new(),
+                diagnostics: self.state_store_unavailable(&req.type_name),
+            }));
+        };
+        let (res, outs) = self
+            .run(
+                "lock state",
+                Vec::new(),
+                backend.lock(req.state_id, req.operation),
+            )
+            .await;
+        match res {
+            Ok(lock_id) => Ok(Response::new(Resp {
+                lock_id,
+                diagnostics: pb_diagnostics(outs.warnings),
+            })),
+            Err(diags) => Ok(Response::new(Resp {
+                lock_id: String::new(),
+                diagnostics: diags_with_warnings(diags, outs),
+            })),
+        }
+    }
+
+    async fn unlock_state(
+        &self,
+        request: Request<tfplugin6::unlock_state::Request>,
+    ) -> Result<Response<tfplugin6::unlock_state::Response>, Status> {
+        use tfplugin6::unlock_state::Response as Resp;
+        let req = request.into_inner();
+        tracing::debug!(type_name = %req.type_name, state_id = %req.state_id, "UnlockState");
+
+        let Some((backend, _)) = self.state_backend(&req.type_name).await else {
+            return Ok(Response::new(Resp {
+                diagnostics: self.state_store_unavailable(&req.type_name),
+            }));
+        };
+        let (res, outs) = self
+            .run(
+                "unlock state",
+                Vec::new(),
+                backend.unlock(req.state_id, req.lock_id),
+            )
+            .await;
+        Ok(Response::new(Resp {
+            diagnostics: match res {
+                Ok(()) => pb_diagnostics(outs.warnings),
+                Err(diags) => diags_with_warnings(diags, outs),
+            },
+        }))
+    }
+
+    async fn get_states(
+        &self,
+        request: Request<tfplugin6::get_states::Request>,
+    ) -> Result<Response<tfplugin6::get_states::Response>, Status> {
+        use tfplugin6::get_states::Response as Resp;
+        let req = request.into_inner();
+        tracing::debug!(type_name = %req.type_name, "GetStates");
+
+        let Some((backend, _)) = self.state_backend(&req.type_name).await else {
+            return Ok(Response::new(Resp {
+                state_id: Vec::new(),
+                diagnostics: self.state_store_unavailable(&req.type_name),
+            }));
+        };
+        let (res, outs) = self.run("get states", Vec::new(), backend.states()).await;
+        match res {
+            Ok(state_id) => Ok(Response::new(Resp {
+                state_id,
+                diagnostics: pb_diagnostics(outs.warnings),
+            })),
+            Err(diags) => Ok(Response::new(Resp {
+                state_id: Vec::new(),
+                diagnostics: diags_with_warnings(diags, outs),
+            })),
+        }
+    }
+
+    async fn delete_state(
+        &self,
+        request: Request<tfplugin6::delete_state::Request>,
+    ) -> Result<Response<tfplugin6::delete_state::Response>, Status> {
+        use tfplugin6::delete_state::Response as Resp;
+        let req = request.into_inner();
+        tracing::debug!(type_name = %req.type_name, state_id = %req.state_id, "DeleteState");
+
+        let Some((backend, _)) = self.state_backend(&req.type_name).await else {
+            return Ok(Response::new(Resp {
+                diagnostics: self.state_store_unavailable(&req.type_name),
+            }));
+        };
+        let (res, outs) = self
+            .run(
+                "delete state",
+                Vec::new(),
+                backend.delete_state(req.state_id),
+            )
+            .await;
+        Ok(Response::new(Resp {
+            diagnostics: match res {
+                Ok(()) => pb_diagnostics(outs.warnings),
+                Err(diags) => diags_with_warnings(diags, outs),
+            },
+        }))
+    }
+
     // Client-streaming request, unary response — does not fit the macro shape.
+    // The body lives in [`write_state_stream`](Self::write_state_stream) so it can
+    // be driven by a plain stream in tests (a `tonic::Streaming` cannot be hand
+    // constructed).
     async fn write_state_bytes(
         &self,
-        _request: Request<tonic::Streaming<tfplugin6::write_state_bytes::RequestChunk>>,
+        request: Request<tonic::Streaming<tfplugin6::write_state_bytes::RequestChunk>>,
     ) -> Result<Response<tfplugin6::write_state_bytes::Response>, Status> {
-        Err(Status::unimplemented(
-            "write_state_bytes is not implemented yet",
-        ))
+        let resp = self.write_state_stream(request.into_inner()).await;
+        Ok(Response::new(resp))
     }
 
     type ListResourceStream = BoxStream<tfplugin6::list_resource::Event>;
@@ -1371,11 +1695,39 @@ impl tfplugin6::provider_server::Provider for ProviderService {
     type ReadStateBytesStream = BoxStream<tfplugin6::read_state_bytes::Response>;
     async fn read_state_bytes(
         &self,
-        _request: Request<tfplugin6::read_state_bytes::Request>,
+        request: Request<tfplugin6::read_state_bytes::Request>,
     ) -> Result<Response<Self::ReadStateBytesStream>, Status> {
-        Err(Status::unimplemented(
-            "read_state_bytes is not implemented yet",
-        ))
+        use tfplugin6::read_state_bytes::Response as Resp;
+        let req = request.into_inner();
+        tracing::debug!(type_name = %req.type_name, state_id = %req.state_id, "ReadStateBytes");
+
+        let Some((backend, chunk_size)) = self.state_backend(&req.type_name).await else {
+            return Ok(Response::new(read_state_stream(vec![Resp {
+                diagnostics: self.state_store_unavailable(&req.type_name),
+                ..Default::default()
+            }])));
+        };
+        let (res, outs) = self
+            .run("read state", Vec::new(), backend.read_state(req.state_id))
+            .await;
+        let responses = match res {
+            Ok(bytes) => {
+                let mut responses = chunk_state(&bytes, chunk_size);
+                // Surface success-path warnings as a trailing diagnostic-only chunk.
+                if !outs.warnings.is_empty() {
+                    responses.push(Resp {
+                        diagnostics: pb_diagnostics(outs.warnings),
+                        ..Default::default()
+                    });
+                }
+                responses
+            }
+            Err(diags) => vec![Resp {
+                diagnostics: diags_with_warnings(diags, outs),
+                ..Default::default()
+            }],
+        };
+        Ok(Response::new(read_state_stream(responses)))
     }
 
     type InvokeActionStream = BoxStream<tfplugin6::invoke_action::Event>;
@@ -1568,6 +1920,48 @@ fn event_stream(
 ) -> BoxStream<tfplugin6::list_resource::Event> {
     use futures_util::stream::StreamExt;
     futures_util::stream::iter(events.into_iter().map(Ok)).boxed()
+}
+
+/// Box a materialized vector of `ReadStateBytes` chunks into the server-streaming
+/// response (the whole state is read into memory, then chunked).
+fn read_state_stream(
+    chunks: Vec<tfplugin6::read_state_bytes::Response>,
+) -> BoxStream<tfplugin6::read_state_bytes::Response> {
+    use futures_util::stream::StreamExt;
+    futures_util::stream::iter(chunks.into_iter().map(Ok)).boxed()
+}
+
+/// Split the full state `bytes` into `ReadStateBytes` chunks of at most
+/// `chunk_size`, each carrying the running [`StateRange`](tfplugin6::StateRange)
+/// and the overall `total_length`. An empty state yields a single zero-length
+/// chunk so the host always receives a well-formed response.
+fn chunk_state(bytes: &[u8], chunk_size: usize) -> Vec<tfplugin6::read_state_bytes::Response> {
+    use tfplugin6::read_state_bytes::Response as Resp;
+    let total = bytes.len() as i64;
+    if bytes.is_empty() {
+        return vec![Resp {
+            bytes: Vec::new(),
+            total_length: 0,
+            range: Some(tfplugin6::StateRange { start: 0, end: 0 }),
+            diagnostics: Vec::new(),
+        }];
+    }
+    let cs = chunk_size.max(1);
+    let mut start = 0i64;
+    bytes
+        .chunks(cs)
+        .map(|chunk| {
+            let s = start;
+            let e = s + chunk.len() as i64;
+            start = e;
+            Resp {
+                bytes: chunk.to_vec(),
+                total_length: total,
+                range: Some(tfplugin6::StateRange { start: s, end: e }),
+                diagnostics: Vec::new(),
+            }
+        })
+        .collect()
 }
 
 /// Convert a [`SystemTime`](std::time::SystemTime) into the protocol's
