@@ -30,7 +30,8 @@ use facet::Facet;
 use terraform_provider::terraform;
 use terraform_runtime::{
     async_trait, serve, Ctx, DataSource, DataSourceError, DataSourceList, Ephemeral,
-    EphemeralError, Function, FunctionError, Provider, Resource, ResourceError, VariadicFunction,
+    EphemeralError, Function, FunctionError, ListError, ListItem, ListResource, Provider, Resource,
+    ResourceError, VariadicFunction,
 };
 
 /// Provider-level configuration.
@@ -174,6 +175,52 @@ impl Resource for LockerResource {
     ) -> Result<Locker, ResourceError> {
         planned.has_secret = planned.secret.as_deref().is_some_and(|s| !s.is_empty());
         Ok(planned)
+    }
+}
+
+/// Query inputs for the `aws_locker` list resource: an optional name-prefix
+/// filter. A list resource's config block is a *separate* type from the resource
+/// model — it holds query parameters, not resource attributes.
+#[derive(Facet)]
+#[allow(dead_code)]
+struct LockerFilter {
+    /// Only return lockers whose name starts with this prefix (all when unset).
+    name_prefix: Option<String>,
+}
+
+/// The `aws_locker` list resource: enumerate existing lockers, optionally filtered
+/// by name prefix. It shares the `Locker` model with the managed resource, so each
+/// result projects into the resource's `name` identity by construction.
+struct LockerList;
+
+#[async_trait]
+impl ListResource for LockerList {
+    type Model = Locker;
+    type Config = LockerFilter;
+
+    async fn list(
+        &self,
+        _ctx: &mut Ctx,
+        config: LockerFilter,
+    ) -> Result<Vec<ListItem<Locker>>, ListError> {
+        // A real provider would enumerate the remote API; synthesize a fixed set
+        // so the suite stays deterministic and self-contained.
+        let prefix = config.name_prefix.unwrap_or_default();
+        Ok(["alpha", "beta", "gamma"]
+            .into_iter()
+            .filter(|name| name.starts_with(&prefix))
+            .map(|name| {
+                ListItem::new(
+                    format!("locker {name}"),
+                    Locker {
+                        name: name.to_string(),
+                        secret: None,
+                        has_secret: false,
+                        legacy_name: None,
+                    },
+                )
+            })
+            .collect())
     }
 }
 
@@ -355,6 +402,7 @@ async fn main() {
         })
         .resource_with(|client: Arc<AwsClient>| BucketResource { client })
         .resource(LockerResource)
+        .list_resource(LockerList)
         .data_source_with(|client: Arc<AwsClient>| BucketByArn { client })
         .data_source_list_with(|client: Arc<AwsClient>| BucketsByName { client })
         .ephemeral_with(|client: Arc<AwsClient>| SessionTokenEphemeral { client })

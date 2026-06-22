@@ -14,6 +14,7 @@ mod data_source;
 mod ephemeral;
 mod function;
 pub mod handshake;
+mod list;
 mod log;
 // Semantic equality (roadmap 3.6): diff suppression derived from a field's
 // quotient type, auto-harvested from the model's `SHAPE` (see `normalize.rs`).
@@ -34,6 +35,7 @@ pub use ctx::Ctx;
 pub use data_source::{DataSource, DataSourceError, DataSourceList};
 pub use ephemeral::{Ephemeral, EphemeralError, EphemeralFromResource};
 pub use function::{Function, FunctionError, VariadicFunction};
+pub use list::{ListError, ListItem, ListResource};
 pub use normalize::{string_quotient, Canon};
 pub use resource::{Path, PathStep, PlanModifications, Resource, ResourceError};
 pub use serve::{serve, ServeError};
@@ -47,6 +49,7 @@ pub use ctx::current_ctx;
 pub use data_source::DynDataSource;
 pub use ephemeral::DynEphemeral;
 pub use function::DynFunction;
+pub use list::{DynListItem, DynListResource};
 pub use resource::{Diag, Diagnostics, DynResource, Severity};
 pub use service::{current_cancellation, ProviderService};
 

@@ -265,8 +265,38 @@ it; keep it static. The preset is exposed via the package.json `exports` subpath
   round-trip via `Partial::alloc_shape`). So a quotient model field needs no code;
   override only to add canonicalizers reflection can't see. The `Canon` is built
   once in `ResourceAdapter::erased` and cloned per plan. `keep_prior` + `harvest`
-  recurse into **single** nested blocks (`Struct`/`Option<Struct>`); repeated
-  (list/set) blocks need element matching and are the remaining follow-up.
+  recurse into **single** nested blocks (`Struct`/`Option<Struct>`). Repeated
+  (list/set) blocks are deliberately NOT handled with bespoke matching — see the
+  **"Equality is `PartialEq`"** law below. The right answer is never "write code
+  to align/dedup elements"; it is that the element is a quotient type and the
+  collection is the data structure whose `PartialEq` already means what the author
+  intends (a `HashSet` when order must not matter, a `Vec` when it must). If we
+  ever close this, do it by canonicalizing through the model `SHAPE` at the
+  whole-value level + one `PartialEq`, never by hand-rolled element matching.
+- **DESIGN LAW — Equality is `PartialEq`; the author's types are the source of
+  truth.** This is an algebraic-data-types codebase, not a Go one. If two values
+  should compare equal, that must fall out of `PartialEq` on a well-chosen type —
+  never from a bespoke comparison function, element-matching loop, dedup pass, or
+  "ignore the order" helper. If you catch yourself writing matching logic, you
+  picked the wrong data structure. **And the SDK must never *impose* a semantic
+  the author didn't ask for:** the provider declares meaning through its data
+  types, and the runtime honors that faithfully. Had we matched repeated blocks
+  positionally or set-wise in the runtime, an author who legitimately needs
+  *ordered* blocks (firewall rules, pipeline stages, route priority — modeled
+  `Vec<Block>` exactly to make order load-bearing) would be silently broken with
+  no way to opt out. Whether order matters is the author's call, expressed by
+  `Vec` vs `HashSet` — not ours to decide. Worked examples:
+  - **Order must not matter → `HashSet<T>`, not `Vec<T>`.** Two repeated blocks
+    `someblock { a = "a" }` / `someblock { a = "b" }` whose order is irrelevant
+    are modeled `HashSet<SomeBlock>`; `PartialEq` on the set is then order-
+    insensitive for free. Reaching for `Vec` and then writing code to ignore
+    order is the anti-pattern.
+  - **"Semantically equal" strings → a quotient newtype** (`#[facet(opaque,
+    proxy = String)]` with a canonicalizing `TryFrom`), so `==` on the
+    representative is the equality. **Parse, don't validate**: do the
+    canonicalization at the parse boundary and equality is already correct.
+  Encode the invariant in the type; reach for the type system before reaching for
+  imperative logic.
 - **Numbers are `Value::Number(Number)` where `Number` is `I64 | U64 | F64`**
   (`terraform-value`). The full signed+unsigned 64-bit integer range round-trips
   losslessly through msgpack and cty JSON; only truly arbitrary precision (beyond
@@ -385,6 +415,38 @@ meta-backed factory + dynamic seam). Gotchas worth knowing before touching this:
   model into private state (via `facet_json`) so `close` can reconstruct it for
   `delete`. No renew; the created object leaks on interrupt — for cheap,
   reversible resources only.
+
+**List resources** (`list.rs`) are another separate primitive: a queryable
+enumeration of existing instances of the managed resource of the **same type
+name**. They have their own IR (`ListResourceSchema`,
+`ProviderSchema.list_resources`), schema slot (`list_resource_schemas` +
+`GetMetadata.list_resources`), and the server-streaming `ListResource` RPC
+(`service.rs::list_resource`). An author implements the typed `ListResource` trait
+(`list(ctx, config) -> Vec<ListItem<Model>>`); the coupling to the managed
+resource is **type-level, not stringly-typed** — `type Model` is the *same* model
+the resource is registered with, so `reflect_list_resource` harvests the type name
+(`resource_name::<Model>()`), the identity schema, and the full object type from
+it, while `type Config` supplies the `list {}` query block (the only thing
+published as the list's own schema). Registered with
+`ProviderBuilder::list_resource` / `list_resource_with` / `dyn_list_resource`
+(mirroring the others). Gotchas:
+- **The `Model` must declare a `#[facet(terraform::identity)]`** — a list resource
+  produces resource identities; a model without one is a
+  `ReflectError::ListResourceWithoutIdentity`. Each result is projected via
+  `known_identity_data` (omitted, with a per-event diagnostic, if a key is
+  unknown/null — but a real listed instance has concrete identity).
+- **`resource_object` is encoded only when the host sets `include_resource_object`**,
+  and the stream is truncated to `limit` (0 = unbounded). The handler returns a
+  `Vec` (materialized), which `service.rs::event_stream` boxes into the response —
+  fine for the bounded result sets list resources return.
+- **The dynamic seam (`dyn_list_resource`) takes the identity + object type
+  explicitly** (a hand-built frontend has no `Model` to harvest them from). The
+  Node binding doesn't implement `DynListResource` yet — adding the new erased
+  trait doesn't churn it (it just doesn't register list resources).
+- **Engine can't see it yet:** OpenTofu 1.12.1's `providers schema -json` drops
+  `list_resource_schemas`, so there is no `tofu test`/schema-contract layer for
+  list resources — verification is the direct service-call tests plus a
+  protocol-level `GetProviderSchema` assertion (as with `MoveResourceState`).
 
 ## Testing approach
 

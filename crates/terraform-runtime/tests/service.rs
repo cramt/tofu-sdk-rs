@@ -12,10 +12,11 @@ use facet::Facet;
 use terraform_attrs as terraform;
 use terraform_runtime::{
     async_trait, ConfigureError, Ctx, DataSource, DataSourceError, DataSourceList, Diag, Ephemeral,
-    EphemeralError, EphemeralFromResource, Path, PlanModifications, Provider, ProviderService,
-    Resource, ResourceError, Timeouts,
+    EphemeralError, EphemeralFromResource, ListError, ListItem, ListResource, Path,
+    PlanModifications, Provider, ProviderService, Resource, ResourceError, Timeouts,
 };
 use terraform_tfplugin6::tfplugin6::{self, provider_server::Provider as _};
+use tonic::codegen::tokio_stream::StreamExt as _;
 use tonic::{Code, Request};
 
 #[derive(Facet)]
@@ -108,6 +109,109 @@ fn service() -> ProviderService {
         .build()
         .expect("provider builds");
     ProviderService::new(provider)
+}
+
+/// A managed resource whose `id` is its identity — the model a list resource
+/// enumerates. `region` is a plain computed attribute carried in `resource_object`.
+#[derive(Facet)]
+#[facet(terraform::resource("aws_vault"))]
+#[allow(dead_code)]
+struct Vault {
+    #[facet(terraform::identity)]
+    id: String,
+    #[facet(terraform::computed)]
+    region: String,
+}
+
+struct VaultResource;
+
+#[async_trait]
+impl Resource for VaultResource {
+    type Model = Vault;
+    async fn create(&self, _ctx: &mut Ctx, planned: Vault) -> Result<Vault, ResourceError> {
+        Ok(planned)
+    }
+}
+
+/// The list resource's query config — an optional `prefix` filter.
+#[derive(Facet)]
+#[allow(dead_code)]
+struct VaultFilter {
+    prefix: Option<String>,
+}
+
+/// Lists `aws_vault`s, filtered by id prefix. Shares the `Vault` model, so each
+/// result projects into the resource's `id` identity.
+struct VaultList;
+
+#[async_trait]
+impl ListResource for VaultList {
+    type Model = Vault;
+    type Config = VaultFilter;
+
+    async fn list(
+        &self,
+        _ctx: &mut Ctx,
+        config: VaultFilter,
+    ) -> Result<Vec<ListItem<Vault>>, ListError> {
+        let prefix = config.prefix.unwrap_or_default();
+        Ok(["w-alpha", "w-beta", "x-gamma"]
+            .into_iter()
+            .filter(|id| id.starts_with(&prefix))
+            .map(|id| {
+                ListItem::new(
+                    format!("vault {id}"),
+                    Vault {
+                        id: id.to_string(),
+                        region: "us-east-1".to_string(),
+                    },
+                )
+            })
+            .collect())
+    }
+}
+
+fn vault_service() -> ProviderService {
+    let provider = Provider::builder()
+        .resource(VaultResource)
+        .list_resource(VaultList)
+        .build()
+        .expect("provider builds");
+    ProviderService::new(provider)
+}
+
+/// Encode a `{prefix = ...}` list config as a `DynamicValue`. The config type
+/// mirrors `VaultFilter`: a single optional `prefix` string.
+fn vault_filter_dv(prefix: Option<&str>) -> tfplugin6::DynamicValue {
+    use terraform_value::{ObjectAttr, Type, Value};
+    let ty = Type::Object(vec![ObjectAttr {
+        name: "prefix".to_string(),
+        ty: Type::String,
+        optional: true,
+    }]);
+    let mut obj = std::collections::BTreeMap::new();
+    obj.insert(
+        "prefix".to_string(),
+        prefix.map_or(Value::Null, |p| Value::String(p.to_string())),
+    );
+    tfplugin6::DynamicValue {
+        msgpack: terraform_codec::encode_msgpack(&Value::Object(obj), &ty).expect("encode"),
+        json: Vec::new(),
+    }
+}
+
+/// Drain a `ListResource` event stream into a vector.
+async fn collect_events(
+    resp: tonic::Response<
+        <ProviderService as tfplugin6::provider_server::Provider>::ListResourceStream,
+    >,
+) -> Vec<tfplugin6::list_resource::Event> {
+    let mut stream = resp.into_inner();
+    let mut events = Vec::new();
+    while let Some(item) = stream.next().await {
+        events.push(item.expect("stream item is Ok"));
+    }
+    events
 }
 
 #[tokio::test]
@@ -2715,5 +2819,156 @@ async fn get_resource_identity_schemas_reports_declared_identity() {
     assert!(
         identity.identity_attributes[0].required_for_import,
         "identity attribute is required for import"
+    );
+}
+
+#[tokio::test]
+async fn list_resource_is_published_in_schema_and_metadata() {
+    // OpenTofu 1.12.1 drops `list_resource_schemas` from `providers schema -json`
+    // (the surface is too new), so this protocol-level assertion is the schema
+    // contract for list resources — it checks what *we* emit over the wire.
+    let svc = vault_service();
+
+    let schema = svc
+        .get_provider_schema(Request::new(tfplugin6::get_provider_schema::Request {}))
+        .await
+        .expect("get_provider_schema ok")
+        .into_inner();
+    let list = schema
+        .list_resource_schemas
+        .get("aws_vault")
+        .expect("aws_vault published in list_resource_schemas");
+    let block = list.block.as_ref().expect("list schema has a block");
+    assert!(
+        block.attributes.iter().any(|a| a.name == "prefix"),
+        "the list config block carries the `prefix` filter"
+    );
+
+    let metadata = svc
+        .get_metadata(Request::new(tfplugin6::get_metadata::Request {}))
+        .await
+        .expect("get_metadata ok")
+        .into_inner();
+    assert!(
+        metadata
+            .list_resources
+            .iter()
+            .any(|l| l.type_name == "aws_vault"),
+        "aws_vault listed in GetMetadata.list_resources"
+    );
+}
+
+#[tokio::test]
+async fn list_resource_streams_filtered_results_with_identity() {
+    let svc = vault_service();
+    let resp = svc
+        .list_resource(Request::new(tfplugin6::list_resource::Request {
+            type_name: "aws_vault".to_string(),
+            config: Some(vault_filter_dv(Some("w-"))),
+            include_resource_object: false,
+            limit: 0,
+        }))
+        .await
+        .expect("list_resource ok");
+
+    let events = collect_events(resp).await;
+    // The "w-" prefix matches w-alpha and w-beta, not x-gamma.
+    assert_eq!(events.len(), 2, "two vaults match the prefix");
+
+    let ids: Vec<String> = events
+        .iter()
+        .map(|e| identity_id(e.identity.as_ref().expect("event carries identity")))
+        .collect();
+    assert_eq!(ids, vec!["w-alpha", "w-beta"]);
+
+    assert_eq!(events[0].display_name, "vault w-alpha");
+    assert!(
+        events.iter().all(|e| e.resource_object.is_none()),
+        "resource_object omitted unless requested"
+    );
+    assert!(
+        events.iter().all(|e| e.diagnostic.is_empty()),
+        "no diagnostics on a clean list"
+    );
+}
+
+#[tokio::test]
+async fn list_resource_includes_resource_object_when_requested() {
+    let svc = vault_service();
+    let resp = svc
+        .list_resource(Request::new(tfplugin6::list_resource::Request {
+            type_name: "aws_vault".to_string(),
+            config: Some(vault_filter_dv(Some("w-alpha"))),
+            include_resource_object: true,
+            limit: 0,
+        }))
+        .await
+        .expect("list_resource ok");
+
+    let events = collect_events(resp).await;
+    assert_eq!(events.len(), 1);
+
+    let obj_ty = terraform_value::Type::Object(vec![
+        terraform_value::ObjectAttr {
+            name: "id".into(),
+            ty: terraform_value::Type::String,
+            optional: false,
+        },
+        terraform_value::ObjectAttr {
+            name: "region".into(),
+            ty: terraform_value::Type::String,
+            optional: true,
+        },
+    ]);
+    let dv = events[0]
+        .resource_object
+        .as_ref()
+        .expect("resource_object present when requested");
+    let value = terraform_codec::decode_msgpack(&dv.msgpack, &obj_ty).expect("decode object");
+    let terraform_value::Value::Object(fields) = value else {
+        panic!("resource object should be an object");
+    };
+    assert_eq!(
+        fields["region"],
+        terraform_value::Value::String("us-east-1".into()),
+        "the full resource object carries the computed region"
+    );
+}
+
+#[tokio::test]
+async fn list_resource_respects_limit() {
+    let svc = vault_service();
+    let resp = svc
+        .list_resource(Request::new(tfplugin6::list_resource::Request {
+            type_name: "aws_vault".to_string(),
+            config: Some(vault_filter_dv(None)),
+            include_resource_object: false,
+            limit: 1,
+        }))
+        .await
+        .expect("list_resource ok");
+
+    let events = collect_events(resp).await;
+    assert_eq!(events.len(), 1, "the host's limit caps the stream");
+}
+
+#[tokio::test]
+async fn list_resource_unknown_type_yields_diagnostic_event() {
+    let svc = vault_service();
+    let resp = svc
+        .list_resource(Request::new(tfplugin6::list_resource::Request {
+            type_name: "aws_nonexistent".to_string(),
+            config: Some(vault_filter_dv(None)),
+            include_resource_object: false,
+            limit: 0,
+        }))
+        .await
+        .expect("list_resource ok");
+
+    let events = collect_events(resp).await;
+    assert_eq!(events.len(), 1);
+    assert!(
+        !events[0].diagnostic.is_empty(),
+        "an unknown list resource streams an error diagnostic"
     );
 }

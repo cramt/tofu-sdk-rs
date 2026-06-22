@@ -5,10 +5,11 @@
 //! `PlanResourceChange`, `ReadResource`, `ApplyResourceChange`), and data source
 //! reads (`ReadDataSource`), the ephemeral resource lifecycle
 //! (`Open`/`Renew`/`Close`/`ValidateEphemeralResourceConfig`), import
-//! (`ImportResourceState`), and provider-defined functions
-//! (`GetFunctions`/`CallFunction`) by dispatching to the registered handlers
-//! through the value codec. RPCs for features the SDK does not yet support
-//! (identity, state stores, actions, move) still return `Unimplemented`.
+//! (`ImportResourceState`), provider-defined functions
+//! (`GetFunctions`/`CallFunction`), and list resources (`ListResource`,
+//! server-streaming) by dispatching to the registered handlers through the value
+//! codec. RPCs for features the SDK does not yet support (state stores, actions)
+//! still return `Unimplemented`.
 
 use std::pin::Pin;
 
@@ -1269,15 +1270,102 @@ impl tfplugin6::provider_server::Provider for ProviderService {
         ))
     }
 
-    // Server-streaming RPCs: declare the stream type and refuse for now.
     type ListResourceStream = BoxStream<tfplugin6::list_resource::Event>;
     async fn list_resource(
         &self,
-        _request: Request<tfplugin6::list_resource::Request>,
+        request: Request<tfplugin6::list_resource::Request>,
     ) -> Result<Response<Self::ListResourceStream>, Status> {
-        Err(Status::unimplemented(
-            "list_resource is not implemented yet",
-        ))
+        use tfplugin6::list_resource::Event;
+        let req = request.into_inner();
+        tracing::debug!(type_name = %req.type_name, "ListResource");
+
+        let (Some(schema), Some(handler)) = (
+            self.provider.list_resource_schema(&req.type_name),
+            self.provider.list_resource_handler(&req.type_name),
+        ) else {
+            return Ok(Response::new(event_stream(vec![Event {
+                diagnostic: unknown_list_resource(&req.type_name),
+                ..Default::default()
+            }])));
+        };
+
+        // Extract everything owned before re-borrowing `self` for dispatch.
+        let config_ty = schema.config.cty_type();
+        let identity = schema.identity.clone();
+        let object_type = schema.object_type.clone();
+        let include_object = req.include_resource_object;
+        let limit = req.limit;
+
+        let config = match decode_dynamic(&req.config, &config_ty) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::new(event_stream(vec![Event {
+                    diagnostic: error_diag("failed to decode list config", e.to_string()),
+                    ..Default::default()
+                }])))
+            }
+        };
+
+        let (outcome, outs) = self
+            .run("list resource", Vec::new(), handler.list(config))
+            .await;
+
+        let mut events: Vec<Event> = Vec::new();
+        match outcome {
+            Ok(mut items) => {
+                // Honor the host's result cap (`limit <= 0` means unbounded).
+                if limit > 0 && items.len() as i64 > limit {
+                    items.truncate(limit as usize);
+                }
+                for item in items {
+                    let identity_data = known_identity_data(&item.object, &identity);
+                    let mut diagnostic = if identity_data.is_none() {
+                        error_diag(
+                            "list result is missing identity data",
+                            format!(
+                                "the listed instance \"{}\" did not yield all identity attributes",
+                                item.display_name
+                            ),
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    let resource_object = if include_object {
+                        match encode_dynamic(&item.object, &object_type) {
+                            Ok(dv) => Some(dv),
+                            Err(e) => {
+                                diagnostic.extend(error_diag(
+                                    "failed to encode list resource object",
+                                    e.to_string(),
+                                ));
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    events.push(Event {
+                        identity: identity_data,
+                        display_name: item.display_name,
+                        resource_object,
+                        diagnostic,
+                    });
+                }
+                // Surface success-path warnings as a trailing diagnostic-only event.
+                if !outs.warnings.is_empty() {
+                    events.push(Event {
+                        diagnostic: pb_diagnostics(outs.warnings),
+                        ..Default::default()
+                    });
+                }
+            }
+            Err(diags) => events.push(Event {
+                diagnostic: diags_with_warnings(diags, outs),
+                ..Default::default()
+            }),
+        }
+
+        Ok(Response::new(event_stream(events)))
     }
 
     type ReadStateBytesStream = BoxStream<tfplugin6::read_state_bytes::Response>;
@@ -1463,6 +1551,23 @@ fn unknown_ephemeral(name: &str) -> Vec<tfplugin6::Diagnostic> {
         "unknown ephemeral resource type",
         format!("the provider has no ephemeral resource named `{name}`"),
     )
+}
+
+fn unknown_list_resource(name: &str) -> Vec<tfplugin6::Diagnostic> {
+    error_diag(
+        "unknown list resource type",
+        format!("the provider has no list resource named `{name}`"),
+    )
+}
+
+/// Box a materialized vector of `ListResource` events into the server-streaming
+/// response. The handler returns a `Vec` (bounded by the host's `limit`), so the
+/// result is streamed from memory rather than produced incrementally.
+fn event_stream(
+    events: Vec<tfplugin6::list_resource::Event>,
+) -> BoxStream<tfplugin6::list_resource::Event> {
+    use futures_util::stream::StreamExt;
+    futures_util::stream::iter(events.into_iter().map(Ok)).boxed()
 }
 
 /// Convert a [`SystemTime`](std::time::SystemTime) into the protocol's

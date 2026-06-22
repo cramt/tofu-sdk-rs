@@ -4,7 +4,8 @@ use facet::{Def, Facet, Field, PrimitiveType, Shape, Type as FType, UserType};
 use terraform_attrs::Attr as TfAttr;
 use terraform_ir::{
     AttributeSchema, Block, DataSourceSchema, EphemeralSchema, FunctionSignature,
-    IdentityAttribute, IdentitySchema, NestedBlock, NestingMode, Parameter, ResourceSchema,
+    IdentityAttribute, IdentitySchema, ListResourceSchema, NestedBlock, NestingMode, Parameter,
+    ResourceSchema,
 };
 use terraform_value::{Number, ObjectAttr, Type, Value};
 
@@ -45,6 +46,12 @@ pub enum ReflectError {
         /// The offending field's name.
         field: String,
     },
+    /// A list resource's model declared no `#[facet(terraform::identity)]` fields.
+    /// A list resource produces resource identities, so its model must have one.
+    ListResourceWithoutIdentity {
+        /// The list resource's type name.
+        name: String,
+    },
 }
 
 impl core::fmt::Display for ReflectError {
@@ -68,6 +75,11 @@ impl core::fmt::Display for ReflectError {
             ReflectError::WriteOnlyComputed { field } => write!(
                 f,
                 "field `{field}` cannot be both `write_only` and `computed`"
+            ),
+            ReflectError::ListResourceWithoutIdentity { name } => write!(
+                f,
+                "list resource `{name}` has no `#[facet(terraform::identity)]` \
+                 field; a list resource must produce resource identities"
             ),
         }
     }
@@ -315,6 +327,30 @@ pub fn reflect_ephemeral<T: Facet<'static>>(
     Ok(EphemeralSchema {
         name: name.into(),
         block: reflect_block::<T>()?,
+    })
+}
+
+/// Reflect a list resource from the managed resource's `Model` and the list
+/// query/filter `Config`. The published schema is `Config`'s block; the identity
+/// and full-object type are taken from `Model` (the same model as the managed
+/// resource of this `name`), so a listed instance projects into the resource's
+/// identity and object by construction. `Model` must declare at least one
+/// `#[facet(terraform::identity)]` field — a list resource produces identities.
+pub fn reflect_list_resource<Model, Config>(
+    name: impl Into<String>,
+) -> Result<ListResourceSchema, ReflectError>
+where
+    Model: Facet<'static>,
+    Config: Facet<'static>,
+{
+    let name = name.into();
+    let identity = identity_from_shape(Model::SHAPE)?
+        .ok_or_else(|| ReflectError::ListResourceWithoutIdentity { name: name.clone() })?;
+    Ok(ListResourceSchema {
+        name,
+        config: reflect_block::<Config>()?,
+        identity,
+        object_type: reflect_block::<Model>()?.cty_type(),
     })
 }
 
@@ -1459,5 +1495,41 @@ mod tests {
             token.computed && token.sensitive,
             "computed sensitive result"
         );
+    }
+
+    #[derive(Facet)]
+    #[allow(dead_code)]
+    struct ListFilter {
+        prefix: Option<String>,
+    }
+
+    #[test]
+    fn reflect_list_resource_uses_config_block_and_model_identity() {
+        let list =
+            reflect_list_resource::<IdentityModel, ListFilter>("identity_model").expect("reflects");
+        assert_eq!(list.name, "identity_model");
+        // The published schema is the *config* type, not the model.
+        assert_eq!(list.config.attributes.len(), 1);
+        assert_eq!(list.config.attributes[0].name, "prefix");
+        // Identity is the model's (a list resource produces resource identities).
+        assert_eq!(list.identity.attributes.len(), 1);
+        assert_eq!(list.identity.attributes[0].name, "arn");
+        // The object type is the managed resource's full object (name + arn).
+        let Type::Object(attrs) = &list.object_type else {
+            panic!("object type should be an object");
+        };
+        assert!(attrs.iter().any(|a| a.name == "name"));
+        assert!(attrs.iter().any(|a| a.name == "arn"));
+    }
+
+    #[test]
+    fn reflect_list_resource_requires_model_identity() {
+        // `SessionToken` declares no identity field — a list resource needs one.
+        let err = reflect_list_resource::<SessionToken, ListFilter>("aws_session_token")
+            .expect_err("must reject a model without identity");
+        assert!(matches!(
+            err,
+            ReflectError::ListResourceWithoutIdentity { .. }
+        ));
     }
 }

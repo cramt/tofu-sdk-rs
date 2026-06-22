@@ -27,12 +27,13 @@ use std::sync::Arc;
 use facet::Facet;
 use terraform_codec::from_value;
 use terraform_ir::{
-    Block, DataSourceSchema, EphemeralSchema, FunctionSignature, ProviderSchema, ResourceSchema,
+    Block, DataSourceSchema, EphemeralSchema, FunctionSignature, ListResourceSchema,
+    ProviderSchema, ResourceSchema,
 };
 use terraform_reflect::{
     data_source_list_name, data_source_name, ephemeral_name, reflect_block, reflect_data_source,
-    reflect_data_source_list, reflect_ephemeral, reflect_function, reflect_resource,
-    reflect_variadic_function, resource_name, PluralDataSource, ReflectError,
+    reflect_data_source_list, reflect_ephemeral, reflect_function, reflect_list_resource,
+    reflect_resource, reflect_variadic_function, resource_name, PluralDataSource, ReflectError,
 };
 use terraform_value::{Type, Value};
 use tokio::sync::OnceCell;
@@ -46,6 +47,7 @@ use crate::ephemeral::{DynEphemeral, Ephemeral, EphemeralAdapter};
 use crate::function::{
     DynFunction, Function, FunctionAdapter, VariadicFunction, VariadicFunctionAdapter,
 };
+use crate::list::{DynListResource, ListResource, ListResourceAdapter};
 use crate::resource::{Diag, Diagnostics, DynResource, Resource, ResourceAdapter};
 
 /// An erased provider-configure callback, the dynamic-seam counterpart to
@@ -171,6 +173,9 @@ type DataSourceMap = HashMap<String, Arc<dyn DynDataSource>>;
 /// The set of ephemeral resource handlers keyed by type name.
 type EphemeralMap = HashMap<String, Arc<dyn DynEphemeral>>;
 
+/// The set of list resource handlers keyed by type name.
+type ListResourceMap = HashMap<String, Arc<dyn DynListResource>>;
+
 /// The set of function handlers keyed by name. Functions are pure (no provider
 /// meta), so they are always eager.
 type FunctionMap = HashMap<String, Arc<dyn DynFunction>>;
@@ -181,6 +186,7 @@ struct Configured {
     resources: ResourceMap,
     data_sources: DataSourceMap,
     ephemerals: EphemeralMap,
+    list_resources: ListResourceMap,
 }
 
 /// Builds the shared meta `Arc<M>` from the decoded provider config value.
@@ -197,6 +203,10 @@ type DataSourceFactory<M> = Box<dyn Fn(Arc<M>) -> Arc<dyn DynDataSource> + Send 
 /// Builds one ephemeral resource handler from the shared meta. Stored per
 /// registered `ephemeral_with` until the meta exists at configure time.
 type EphemeralFactory<M> = Box<dyn Fn(Arc<M>) -> Arc<dyn DynEphemeral> + Send + Sync>;
+
+/// Builds one list resource handler from the shared meta. Stored per registered
+/// `list_resource_with` until the meta exists at configure time.
+type ListResourceFactory<M> = Box<dyn Fn(Arc<M>) -> Arc<dyn DynListResource> + Send + Sync>;
 
 /// The fully-erased configure step: decode-and-build the meta, then construct
 /// every meta-backed handler. `M` has been erased away by this point.
@@ -232,6 +242,8 @@ pub struct Provider {
     eager_data: Arc<DataSourceMap>,
     /// Ephemeral resource handlers that need no provider meta; available now.
     eager_ephemeral: Arc<EphemeralMap>,
+    /// List resource handlers that need no provider meta; available now.
+    eager_list: Arc<ListResourceMap>,
     /// Function handlers (pure; always available, even before configure).
     functions: Arc<FunctionMap>,
     /// The `cty` type of the provider config block, for decoding `ConfigureProvider`.
@@ -291,6 +303,23 @@ impl Provider {
             }
         }
         self.eager_ephemeral.get(name).map(Arc::clone)
+    }
+
+    /// The handler for list resource type `name`, if registered. Configured
+    /// (meta-backed) handlers take precedence over eager ones.
+    pub(crate) fn list_resource_handler(&self, name: &str) -> Option<Arc<dyn DynListResource>> {
+        if let Some(configured) = self.configured.get() {
+            if let Some(handler) = configured.list_resources.get(name) {
+                return Some(Arc::clone(handler));
+            }
+        }
+        self.eager_list.get(name).map(Arc::clone)
+    }
+
+    /// The reflected schema of list resource type `name` (its config block,
+    /// identity, and object type), if registered.
+    pub(crate) fn list_resource_schema(&self, name: &str) -> Option<&ListResourceSchema> {
+        self.schema.list_resources.iter().find(|l| l.name == name)
     }
 
     /// The handler for function `name`, if registered.
@@ -392,10 +421,12 @@ pub struct ProviderBuilder<M = ()> {
     resources: ResourceMap,
     data_sources: DataSourceMap,
     ephemerals: EphemeralMap,
+    list_resources: ListResourceMap,
     functions: FunctionMap,
     factories: Vec<(String, ResourceFactory<M>)>,
     data_factories: Vec<(String, DataSourceFactory<M>)>,
     ephemeral_factories: Vec<(String, EphemeralFactory<M>)>,
+    list_factories: Vec<(String, ListResourceFactory<M>)>,
     configure: Option<MetaFn<M>>,
     dyn_configure: Option<Arc<dyn DynConfigure>>,
     validate_config: Option<Arc<dyn DynValidateConfig>>,
@@ -410,10 +441,12 @@ impl<M> Default for ProviderBuilder<M> {
             resources: HashMap::new(),
             data_sources: HashMap::new(),
             ephemerals: HashMap::new(),
+            list_resources: HashMap::new(),
             functions: HashMap::new(),
             factories: Vec::new(),
             data_factories: Vec::new(),
             ephemeral_factories: Vec::new(),
+            list_factories: Vec::new(),
             configure: None,
             dyn_configure: None,
             validate_config: None,
@@ -626,6 +659,54 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
         self
     }
 
+    /// Register a list resource type with its `handler`. Use this for list
+    /// resources that need no provider configuration; for ones that need the
+    /// configured meta, use [`ProviderBuilder::list_resource_with`].
+    ///
+    /// The type name comes from the handler's `Model` (the managed resource's
+    /// model — an explicit `#[facet(terraform::resource("name"))]`, or `snake_case`
+    /// of the struct identifier), so the list resource and the managed resource it
+    /// enumerates share a name by construction. The `Model` must declare an
+    /// identity (`#[facet(terraform::identity)]`); building without one is a
+    /// [`BuildError::Reflect`].
+    pub fn list_resource<L: ListResource>(mut self, handler: L) -> Self {
+        let name = resource_name::<L::Model>();
+        match reflect_list_resource::<L::Model, L::Config>(name.clone()) {
+            Ok(list) => {
+                self.schema.list_resources.push(list);
+                self.list_resources
+                    .insert(name, ListResourceAdapter::erased(handler));
+            }
+            Err(source) => self.record(name, source),
+        }
+        self
+    }
+
+    /// Register a list resource whose handler is built from the configured provider
+    /// meta. `factory` receives the shared `Arc<M>` produced by
+    /// [`ProviderBuilder::configure`] and returns the list handler.
+    ///
+    /// The type name comes from the `Model` (see [`ProviderBuilder::list_resource`]).
+    /// Requires a [`ProviderBuilder::configure`] step (which fixes `M`); building
+    /// without one is a [`BuildError::MissingConfigure`].
+    pub fn list_resource_with<L, F>(mut self, factory: F) -> Self
+    where
+        L: ListResource,
+        F: Fn(Arc<M>) -> L + Send + Sync + 'static,
+    {
+        let name = resource_name::<L::Model>();
+        match reflect_list_resource::<L::Model, L::Config>(name.clone()) {
+            Ok(list) => {
+                self.schema.list_resources.push(list);
+                let make: ListResourceFactory<M> =
+                    Box::new(move |meta: Arc<M>| ListResourceAdapter::erased(factory(meta)));
+                self.list_factories.push((name, make));
+            }
+            Err(source) => self.record(name, source),
+        }
+        self
+    }
+
     // --- Dynamic seam ------------------------------------------------------
     //
     // The methods above are the facet *frontend*: a Rust `Model` is reflected
@@ -742,6 +823,29 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
         self
     }
 
+    /// Register a list resource from a hand-built schema, bypassing facet
+    /// reflection (the dynamic seam for non-Rust frontends). The `config` block is
+    /// the published list schema; `identity` and `object_type` describe how each
+    /// result is projected (they must match the managed resource of the same name).
+    pub fn dyn_list_resource(
+        mut self,
+        name: impl Into<String>,
+        config: Block,
+        identity: terraform_ir::IdentitySchema,
+        object_type: Type,
+        handler: Arc<dyn DynListResource>,
+    ) -> Self {
+        let name = name.into();
+        self.schema.list_resources.push(ListResourceSchema {
+            name: name.clone(),
+            config,
+            identity,
+            object_type,
+        });
+        self.list_resources.insert(name, handler);
+        self
+    }
+
     /// Register a provider-defined function under `name` with its `handler`.
     /// Functions are pure (no provider configuration or state), so this needs no
     /// `configure` step. The signature is reflected from the handler's `Params`
@@ -805,11 +909,13 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
                 let factories = Arc::new(self.factories);
                 let data_factories = Arc::new(self.data_factories);
                 let ephemeral_factories = Arc::new(self.ephemeral_factories);
+                let list_factories = Arc::new(self.list_factories);
                 let configure: Arc<ConfigureFn> = Arc::new(move |config: Value| {
                     let meta_fn = Arc::clone(&meta_fn);
                     let factories = Arc::clone(&factories);
                     let data_factories = Arc::clone(&data_factories);
                     let ephemeral_factories = Arc::clone(&ephemeral_factories);
+                    let list_factories = Arc::clone(&list_factories);
                     Box::pin(async move {
                         let meta = meta_fn(config).await?;
                         let mut resources = ResourceMap::with_capacity(factories.len());
@@ -824,10 +930,16 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
                         for (name, make) in ephemeral_factories.iter() {
                             ephemerals.insert(name.clone(), make(Arc::clone(&meta)));
                         }
+                        let mut list_resources =
+                            ListResourceMap::with_capacity(list_factories.len());
+                        for (name, make) in list_factories.iter() {
+                            list_resources.insert(name.clone(), make(Arc::clone(&meta)));
+                        }
                         Ok(Configured {
                             resources,
                             data_sources,
                             ephemerals,
+                            list_resources,
                         })
                     }) as BoxFuture<Result<Configured, Diagnostics>>
                 });
@@ -837,7 +949,8 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
             // their meta — a programming error worth surfacing at build time.
             None if !self.factories.is_empty()
                 || !self.data_factories.is_empty()
-                || !self.ephemeral_factories.is_empty() =>
+                || !self.ephemeral_factories.is_empty()
+                || !self.list_factories.is_empty() =>
             {
                 return Err(BuildError::MissingConfigure)
             }
@@ -849,6 +962,7 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
             eager: Arc::new(self.resources),
             eager_data: Arc::new(self.data_sources),
             eager_ephemeral: Arc::new(self.ephemerals),
+            eager_list: Arc::new(self.list_resources),
             functions: Arc::new(self.functions),
             config_ty,
             configure,
@@ -908,10 +1022,12 @@ impl ProviderBuilder<()> {
             resources: self.resources,
             data_sources: self.data_sources,
             ephemerals: self.ephemerals,
+            list_resources: self.list_resources,
             functions: self.functions,
             factories: Vec::new(),
             data_factories: Vec::new(),
             ephemeral_factories: Vec::new(),
+            list_factories: Vec::new(),
             configure: Some(meta_fn),
             dyn_configure: self.dyn_configure,
             validate_config: self.validate_config,

@@ -472,13 +472,18 @@ via `terraform_runtime::current_cancellation()` (re-exports `CancellationToken`)
   there is no per-plan `SHAPE` walk.
 - **Single nested-block recursion — ✅ DONE.** `harvest` + `keep_prior` recurse
   into a single nested struct/block (`Struct`/`Option<Struct>`) so a quotient inside
-  a config block is suppressed too (`single_struct_inner` gates it). **Repeated**
-  (list/set) blocks are still not recursed — element matching across a reordered
-  collection is the remaining gap.
+  a config block is suppressed too (`single_struct_inner` gates it).
+- **Repeated (list/set) blocks — NOT a "do element matching" item.** Element
+  matching / multiset comparison is the wrong altitude — it re-introduces the
+  bespoke equality function this whole design deletes. Equality must reduce to
+  `PartialEq` on a well-chosen type (see the **"Equality is `PartialEq`"** design
+  law in AGENTS.md): order-must-not-matter → the author models it `HashSet<T>`,
+  not `Vec<T>`, and the element is a quotient type. If we ever suppress repeated
+  blocks, do it by canonicalizing the whole value through the model `SHAPE`
+  (parse → typed → re-encode) + one `PartialEq`, never hand-rolled matching.
 - **Deferred (promotion follow-ups, see `normalize.rs` docs):**
   1. `TryFrom<&str>`/`Cow` to avoid the per-call string clone.
-  2. Recurse into **repeated** (list/set) blocks — needs element matching.
-  3. Meta-backed resources skip suppression until ConfigureProvider (configure
+  2. Meta-backed resources skip suppression until ConfigureProvider (configure
      precedes plan in the normal workflow, so this only affects a pre-configure
      partial plan).
 - **Out of scope (needs `modify_plan`):** *server-authoritative* normalization,
@@ -528,7 +533,28 @@ All are stubbed in `service.rs` (`unimplemented_unary!` or streaming stubs).
   renew; leaks on interrupt). Verified by direct service tests (open/renew/close,
   private round-trip, the wrapper) and the schema contract test. Example:
   `example-aws`'s `aws_session_token`.
-- **List resources** (`ListResource`, streaming).
+- ~~**List resources** (`ListResource`, streaming).~~ ✅ **DONE** — typed
+  `ListResource` trait (`list.rs`): `type Model` (the managed resource's model,
+  reused so identity + object type line up by construction) + `type Config` (the
+  `list {}` query block) → `list(ctx, config) -> Vec<ListItem<Model>>`. Erased
+  behind `DynListResource`/`ListResourceAdapter`; `reflect_list_resource` builds
+  the `ListResourceSchema` IR (config block published as the list schema, identity
+  + object type harvested from `Model`; a model with no `#[facet(terraform::
+  identity)]` is a `ReflectError::ListResourceWithoutIdentity`). `emit.rs`
+  publishes `list_resource_schemas` (GetProviderSchema) + `list_resources`
+  (GetMetadata); `service.rs::list_resource` decodes the config, dispatches, and
+  streams one `Event` per result (projecting identity via `known_identity_data`,
+  encoding the full object into `resource_object` only when the host sets
+  `include_resource_object`, honoring `limit`). Registered with
+  `ProviderBuilder::list_resource` / `list_resource_with` / `dyn_list_resource`.
+  Example: `example-aws`'s `aws_locker` list resource. **Verified** at the direct
+  service-call layer (`list_resource_*` tests in `terraform-runtime/tests/
+  service.rs`: filtered stream + identity, `resource_object` on request, `limit`,
+  unknown-type diagnostic) and a protocol schema-contract test
+  (`list_resource_is_published_in_schema_and_metadata`). **Engine layers (2/3)
+  deferred:** OpenTofu 1.12.1's `providers schema -json` drops `list_resource_
+  schemas` entirely (the surface is too new to drive `tofu`), so the protocol
+  assertion against our own `GetProviderSchema` stands in — like `MoveResourceState`.
 - ~~**Resource identity**~~ ✅ **DONE** (`GetResourceIdentitySchemas` /
   `UpgradeResourceIdentity`). Type-driven: a model marks identity fields with
   `#[facet(terraform::identity)]` and `reflect_resource` projects them into an

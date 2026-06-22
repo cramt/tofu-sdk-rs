@@ -29,6 +29,9 @@ pub struct ProviderSchema {
     /// Ephemeral resources keyed by type name (e.g. `aws_session_token`): values
     /// produced for the duration of a single operation and never persisted.
     pub ephemeral_resources: Vec<EphemeralSchema>,
+    /// List resources keyed by type name: a queryable enumeration of existing
+    /// instances of the managed resource of the same name.
+    pub list_resources: Vec<ListResourceSchema>,
     /// Provider-defined functions, callable from HCL as `provider::<p>::<name>`.
     pub functions: Vec<FunctionSignature>,
 }
@@ -135,6 +138,30 @@ pub struct EphemeralSchema {
     pub name: String,
     /// The ephemeral resource's attribute/block structure.
     pub block: Block,
+}
+
+/// A list resource type: a queryable enumeration of existing instances of the
+/// managed resource of the **same type name**.
+///
+/// Unlike a data source, a list resource produces resource *identities* (and
+/// optionally the full resource object) rather than an arbitrary read result. It
+/// reuses the managed resource's [`IdentitySchema`] and object type by
+/// construction — the runtime projects each listed instance into an identity and,
+/// when the host requests it, the full resource object. Only the `config` block
+/// (the query/filter inputs) is published as the list resource's own schema; the
+/// identity schema is the managed resource's, already known to the host.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListResourceSchema {
+    /// Fully-qualified type name, matching the managed resource it lists.
+    pub name: String,
+    /// The query/filter configuration block (the `list {}` schema).
+    pub config: Block,
+    /// The identity each listed instance is projected into — the managed
+    /// resource's identity schema (a list resource always produces identities).
+    pub identity: IdentitySchema,
+    /// The `cty` object type of the full resource, used to encode the optional
+    /// `resource_object` of each result (the managed resource's object type).
+    pub object_type: Type,
 }
 
 /// A configuration block: a flat set of attributes plus any nested blocks.
