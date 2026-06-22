@@ -289,14 +289,16 @@ handles the whole plugin protocol. A TS provider is just a `node` script named
 import { z } from "zod";
 import { Provider } from "@tofu-sdk/core";
 
-const Bucket = z.object({ name: z.string(), arn: z.string() });
+const Bucket = z.object({
+  name: z.string().meta({ forceNew: true }),   // disposition rides on the field
+  arn: z.string().meta({ computed: true }),
+  aliases: z.set(z.string()),                  // unordered → a cty set
+});
 
 await new Provider()
   .resource("aws_s3_bucket", {
     schema: Bucket,            // Zod → validation + inferred handler types + cty schema
-    forceNew: ["name"],        // type-checked against the schema's fields
-    computed: ["arn"],
-    async create(planned) {
+    async create(planned) {    // planned.aliases is a Set<string>
       return { ...planned, arn: `arn:aws:s3:::${planned.name}` };
     },
     // read defaults to passthrough; update/delete/import are optional.
@@ -304,12 +306,13 @@ await new Provider()
   .serve();
 ```
 
-The Terraform-only dispositions Zod can't express (`computed` / `forceNew` /
-`sensitive`, and which object fields render as HCL **blocks**) are arrays of
-field names — and they're typed `(keyof Schema)[]`, so a typo is a compile error.
-Here's a fuller provider: a `configure` step that builds an API client, a
-repeatable nested `policy { … }` block, a computed+sensitive secret, and a data
-source.
+**The Zod type defines everything** — structure, validation, handler types, *and*
+the Terraform dispositions. Each one rides on its field via typed `.meta({ … })`
+(`computed` / `forceNew` / `sensitive` / `writeOnly` / `deprecated` / `block` /
+`set`), so a bad key is a compile error and "order must not matter" is just a
+`z.set`. Here's a fuller provider: a `configure` step that builds an API client, a
+repeatable nested `policy { … }` block, a computed+sensitive secret, a provider-
+defined function, and a data source.
 
 ```ts
 import { z } from "zod";
@@ -317,17 +320,20 @@ import { Provider, type Diagnostic } from "@tofu-sdk/core";
 
 const Policy = z.object({
   effect: z.string(),
-  permission_groups: z.array(z.string()),
+  permission_groups: z.set(z.string()),     // unordered → cty set
 });
 
 const ApiToken = z.object({
   name: z.string(),
-  policy: z.array(Policy),  // rendered as repeatable `policy { … }` blocks
-  id: z.string(),
-  value: z.string(),        // the secret — computed + sensitive
+  policy: z.array(Policy).meta({ block: true }),     // HCL `policy { … }` blocks
+  id: z.string().meta({ computed: true }),
+  value: z.string().meta({ computed: true, sensitive: true }),  // the secret
 });
 
-const TokenLookup = z.object({ id: z.string(), name: z.string() });
+const TokenLookup = z.object({
+  id: z.string(),                           // the input…
+  name: z.string().meta({ computed: true }), // …the computed output
+});
 
 let client: ApiClient;
 
@@ -340,11 +346,9 @@ await new Provider()
   })
   .resource("example_api_token", {
     schema: ApiToken,
-    blocks: ["policy"],                    // HCL `policy { … }`, not `policy = [...]`
-    computed: ["id", "value"],
-    sensitive: ["value"],
-    async create(planned) {
+    async create(planned, ctx) {            // ctx: warnings / private state / cancel
       const created = await client.tokens.create(planned);
+      ctx.warn("token minted", `id ${created.id}`);
       return { ...planned, id: created.id, value: created.secret };
     },
     validate(config): Diagnostic[] {
@@ -353,9 +357,14 @@ await new Provider()
         : [];
     },
   })
+  // A provider-defined function: `provider::example::token_arn("id")`.
+  .function("token_arn", {
+    params: z.object({ id: z.string() }),
+    returns: z.string(),
+    async call({ id }) { return `arn:example:token:${id}`; },
+  })
   .dataSource("example_api_token", {
-    schema: TokenLookup,                   // { id, name }: `id` is the input…
-    computed: ["name"],                    // …`name` is the computed output
+    schema: TokenLookup,
     async read(query) {
       const token = await client.tokens.get(query.id);
       return { ...query, name: token.name };
@@ -364,11 +373,16 @@ await new Provider()
   .serve();
 ```
 
-Covered today: resources (full lifecycle + `upgrade`/`import`/`validate`),
-singular and plural data sources (`dataSource` / `dataSourceList`), provider
-config, nested blocks, and sensitive/computed/force-new dispositions. (Provider-
-defined functions are currently Rust-only.) A complete, *real-backend* example —
-a Cloudflare provider talking to the live `cloudflare` SDK — is in
+Covered today, at parity with the Rust frontend: resources (full lifecycle +
+`upgrade`/`import`/`validate` + `modifyPlan`), singular and plural data sources
+(`dataSource` / `dataSourceList`), provider config (with its own `validate`),
+**ephemeral resources**, **provider-defined functions** (`function` /
+`functionVariadic`), nested blocks, sets, every disposition via `.meta()`, the
+handler `ctx` (warnings / private state / cancellation), and semantic-equality
+normalization (a `z.transform` quotient field auto-suppresses diffs). Not yet
+wired to the Node binding: list resources, state stores, resource identity, and
+`moveState`. A complete, *real-backend* example — a Cloudflare provider talking to
+the live `cloudflare` SDK — is in
 [`packages/tofu-sdk/examples/cloudflare-provider.ts`](packages/tofu-sdk/examples/cloudflare-provider.ts).
 Build and test with `pnpm build` / `pnpm test` (drives a real `tofu`).
 

@@ -595,4 +595,45 @@ All are stubbed in `service.rs` (`unimplemented_unary!` or streaming stubs).
   deferred:** OpenTofu 1.12.1's `providers schema -json` drops
   `state_store_schemas` (too new to drive `tofu`), so the protocol assertion
   against our own `GetProviderSchema` stands in — like list resources.
-- **Actions** (`PlanAction`/`InvokeAction`/`ValidateActionConfig`).
+- **Actions** (`PlanAction`/`InvokeAction`/`ValidateActionConfig`). The last
+  unimplemented protocol surface — Terraform's imperative-action primitive. Its
+  own IR + RPCs, like state stores; defer unless wanted.
+
+---
+
+## TypeScript frontend (`@tofu-sdk/core`) — Rust parity
+
+The Node binding (`packages/tofu-sdk/native`) is a thin napi-rs bridge over the
+dynamic seam; the TS wrapper (`packages/tofu-sdk/ts`) is the author API. The
+guiding rule mirrors the Rust one: **the hard part stays in Rust**, and **the Zod
+type defines everything** (structure, validation, handler types, *and* dispositions
+via `.meta({…})`). Schema derivation reads the Zod type directly (`ts/schema.ts`,
+a pure native-free module unit-tested via `dist/schema.js`), not `z.toJSONSchema`.
+
+**At parity (verified end-to-end against real `tofu` in `test/e2e.test.mjs`):**
+resources (CRUD + `import` + `version`/`upgrade` + `validate` + `modifyPlan`),
+provider config + `configure` + `validate`, singular/plural data sources,
+ephemeral resources, **provider-defined functions** (`function` /
+`functionVariadic`), all attribute dispositions via field `.meta()`, nested blocks
+(single/list/set), **unordered sets** (`z.set` scalar + the `set` disposition,
+with JS `Set`⇄array marshaling), the handler **`ctx`** (success-path warnings,
+private state, cancellation — threaded via a `{ctx, value}` envelope +
+`run_until_cancelled`), and **semantic-equality normalization** (a `z.transform`
+quotient field auto-suppresses diffs through `modifyPlan`'s `keepPrior`, the TS
+mirror of `Canon::harvest`).
+
+**Still unimplemented in the binding** (the Rust core supports each; in suggested
+order):
+1. **State stores** + **list resources** — new primitives over `dyn_state_store` /
+   `dyn_list_resource` (addon + TS; the seams exist).
+2. **Resource identity** — needs a small Rust seam change: `dyn_resource` currently
+   hardcodes `identity: None`, so the seam must learn to carry an identity schema
+   (then addon + TS).
+3. **`moveState`** (cross-type `moved {}`) — the defaulted `DynResource::move_state`
+   seam, implementable in the addon.
+
+**Normalization caveat:** diff suppression via `keepPrior` is cleanest for
+computed / diff-stable values; for a plain required input, Terraform core's
+plan-consistency check still compares the planned value to config (a Terraform-core
+boundary, the same on the Rust side, which ships normalization with service-level
+tests).
