@@ -41,15 +41,18 @@ import {
   type FieldName,
   functionSignatureJson,
   paramNames,
+  type Path,
+  type PlanModificationResult,
   reviveSets,
   schemaJson,
   searchKeysOf,
   setReplacer,
   type TfMeta,
   toWireJson,
+  transformFields,
 } from "./schema";
 
-export type { CtyType, Dispositions, FieldName, TfMeta } from "./schema";
+export type { CtyType, Dispositions, FieldName, Path, PlanModificationResult, TfMeta } from "./schema";
 
 // The native addon's generated loader, loaded at runtime and hand-typed (its
 // auto-generated `.d.ts` is intentionally not imported).
@@ -68,6 +71,7 @@ interface RawProvider {
     imp: RawHandler,
     upgrade: RawHandler,
     validate: RawHandler,
+    modifyPlan: RawHandler,
   ): void;
   dataSource(typeName: string, schemaJson: string, read: RawHandler, validate: RawHandler): void;
   ephemeral(
@@ -178,6 +182,18 @@ export interface Resource<S extends z.ZodObject<z.ZodRawShape>> extends Disposit
   upgrade?(fromVersion: number, prior: unknown, ctx: HandlerCtx): Promise<z.infer<S>>;
   /** Validate the configuration, returning diagnostics (or nothing). */
   validate?: Validate<z.infer<S>>;
+  /**
+   * Adjust the mechanically-produced plan: return attribute paths to
+   * force-replace, mark unknown, or reset to the prior value (`keepPrior`, diff
+   * suppression). The Rust analog of `Resource::modify_plan`. Beyond whatever this
+   * returns, **quotient fields auto-suppress**: a field modeled as a `z.transform`
+   * (parse-don't-validate) keeps its prior value when the new value canonicalizes
+   * equal — no code needed. `prior` is `null` on create.
+   */
+  modifyPlan?(
+    prior: z.infer<S> | null,
+    proposed: z.infer<S>,
+  ): Promise<PlanModificationResult | void>;
 }
 
 /** A singular read-only data source: given a config, produce a state. */
@@ -510,6 +526,41 @@ export class Provider {
         );
       },
     );
+    // The plan hook: the author's `modifyPlan` plus **automatic** diff suppression
+    // for quotient (`z.transform`) fields — keep the prior value when the new one
+    // canonicalizes equal (the TS mirror of Rust's `Canon::harvest`).
+    const quotients = transformFields(def.schema);
+    const modifyPlan: RawHandler = async (err, input) => {
+      if (err) throw err;
+      const { prior, proposed } = JSON.parse(input) as {
+        prior: Record<string, unknown> | null;
+        proposed: Record<string, unknown> | null;
+      };
+      const replace: Path[] = [];
+      const unknown: Path[] = [];
+      const keepPrior: Path[] = [];
+      if (def.modifyPlan) {
+        const mods =
+          (await def.modifyPlan(prior as z.infer<S> | null, proposed as z.infer<S>)) ?? {};
+        replace.push(...(mods.replace ?? []));
+        unknown.push(...(mods.unknown ?? []));
+        keepPrior.push(...(mods.keepPrior ?? []));
+      }
+      // Auto-harvest: a field is "unchanged" when its quotient canonicalization
+      // matches, even if the raw text differs (e.g. case, whitespace).
+      if (prior && proposed) {
+        for (const { name, schema } of quotients) {
+          const p = prior[name];
+          if (p === undefined || p === null) continue;
+          const cp = schema.safeParse(p);
+          const cq = schema.safeParse(proposed[name]);
+          if (cp.success && cq.success && JSON.stringify(cp.data) === JSON.stringify(cq.data)) {
+            keepPrior.push([name]);
+          }
+        }
+      }
+      return JSON.stringify({ replace, unknown, keepPrior });
+    };
     this.raw.resource(
       typeName,
       def.version ?? 0,
@@ -521,6 +572,7 @@ export class Provider {
       imp,
       upgrade,
       validateAdapter(def.validate, def.schema),
+      modifyPlan,
     );
     return this;
   }

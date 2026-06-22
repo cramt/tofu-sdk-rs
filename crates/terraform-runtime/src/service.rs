@@ -572,12 +572,12 @@ impl tfplugin6::provider_server::Provider for ProviderService {
                 .run(
                     "modify_plan",
                     planned_private.clone(),
-                    handler.modify_plan(prior, plan.planned.clone()),
+                    handler.modify_plan(prior.clone(), plan.planned.clone()),
                 )
                 .await;
             match outcome {
                 Ok(mods) => {
-                    crate::plan::apply_modifications(&mut plan, mods);
+                    crate::plan::apply_modifications(&mut plan, mods, &prior);
                     let CtxOutputs {
                         warnings: w,
                         private_out,

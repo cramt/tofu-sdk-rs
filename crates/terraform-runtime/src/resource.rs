@@ -246,6 +246,13 @@ pub struct PlanModifications {
     /// Attribute paths to mark unknown in the planned state (a value the provider
     /// will compute by rule during apply).
     pub unknown: Vec<Path>,
+    /// Attribute paths whose planned value should be reset to the **prior** value
+    /// — diff suppression ("keep prior"). This is the value-level lever behind
+    /// semantic equality: when a proposed value is semantically equal to the prior
+    /// one, plan the prior so Terraform sees no spurious change. The typed path
+    /// derives this from a quotient type ([`Resource::semantic_equality`]); a
+    /// dynamic frontend (e.g. the Node binding) can request it directly here.
+    pub keep_prior: Vec<Path>,
 }
 
 impl PlanModifications {
@@ -265,6 +272,13 @@ impl PlanModifications {
     /// top-level attribute; build a [`Path`] to target a nested one.
     pub fn unknown(mut self, path: impl Into<Path>) -> Self {
         self.unknown.push(path.into());
+        self
+    }
+
+    /// Reset the attribute at `path` to its prior value (diff suppression). A bare
+    /// name targets a top-level attribute; build a [`Path`] to target a nested one.
+    pub fn keep_prior(mut self, path: impl Into<Path>) -> Self {
+        self.keep_prior.push(path.into());
         self
     }
 }

@@ -16,6 +16,7 @@ import {
   schemaJson,
   searchKeysOf,
   toWireJson,
+  transformFields,
 } from "../dist/schema.js";
 
 const attrs = (schema, dispositions) => JSON.parse(schemaJson(schema, dispositions)).attributes;
@@ -158,9 +159,23 @@ test("functionSignatureJson emits a trailing variadic param when given", () => {
   assert.deepEqual(sig.variadic, { name: "varargs", type: "string", allowNull: false });
 });
 
-test("transforms throw a clear error (normalization not wired through the seam)", () => {
-  assert.throws(
-    () => ctyFromZod(z.string().transform((s) => s.toLowerCase())),
-    /transforms \/ codecs are not yet supported/,
+test("a transform (quotient type) derives its cty from the input type", () => {
+  // The transform canonicalizes (parse-don't-validate); its structural cty is the
+  // input type, and the canonicalization drives diff suppression in the plan hook.
+  assert.equal(ctyFromZod(z.string().transform((s) => s.toLowerCase())), "string");
+  assert.equal(ctyFromZod(z.string().transform((s) => s.length)), "string");
+});
+
+test("transformFields finds quotient fields and their canonicalizer", () => {
+  const schema = z.object({
+    id: z.string().transform((s) => s.toLowerCase()),
+    name: z.string(),
+  });
+  const fields = transformFields(schema);
+  assert.deepEqual(
+    fields.map((f) => f.name),
+    ["id"],
   );
+  // parse() runs the transform = canonicalize; differently-cased inputs match.
+  assert.equal(fields[0].schema.parse("ARN"), fields[0].schema.parse("arn"));
 });

@@ -26,8 +26,8 @@ use terraform_codec::{decode_json, encode_json};
 use terraform_ir::{AttributeSchema, Block, FunctionSignature, NestedBlock, NestingMode, Parameter};
 use terraform_runtime::{
     async_trait, current_ctx, serve as serve_provider, Diag, Diagnostics, DynConfigure,
-    DynDataSource, DynEphemeral, DynFunction, DynResource, DynValidateConfig, FunctionError,
-    Provider as RtProvider,
+    DynDataSource, DynEphemeral, DynFunction, DynResource, DynValidateConfig, FunctionError, Path,
+    PlanModifications, Provider as RtProvider,
 };
 use terraform_value::{Type, Value};
 
@@ -243,6 +243,44 @@ fn handler_err(ctx: &str, e: impl std::fmt::Display) -> Diagnostics {
     vec![Diag::error(format!("{ctx} handler failed"), e.to_string())]
 }
 
+/// Parse an attribute path — a JSON array of steps, each a string (attribute
+/// name) or a number (list/set index) — into a [`Path`].
+fn parse_path(value: &facet_value::Value) -> Path {
+    let mut path = Path::root();
+    if let Some(steps) = value.as_array() {
+        for step in steps {
+            if let Some(name) = step.as_string() {
+                path = path.attribute(name.as_str());
+            } else if let Some(index) = step.as_number().and_then(|n| n.to_i64()) {
+                path = path.index(index);
+            }
+        }
+    }
+    path
+}
+
+/// Parse a `modify_plan` handler's JSON result —
+/// `{ "replace"?: [[…paths]], "unknown"?: [[…]], "keepPrior"?: [[…]] }` — into
+/// [`PlanModifications`].
+fn parse_plan_modifications(json: &str) -> std::result::Result<PlanModifications, String> {
+    let parsed: facet_value::Value =
+        facet_json::from_slice(json.as_bytes()).map_err(|e| e.to_string())?;
+    let obj = parsed
+        .as_object()
+        .ok_or("modify_plan output must be an object")?;
+    let paths = |key: &str| -> Vec<Path> {
+        obj.get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().map(parse_path).collect())
+            .unwrap_or_default()
+    };
+    Ok(PlanModifications {
+        require_replace: paths("replace"),
+        unknown: paths("unknown"),
+        keep_prior: paths("keepPrior"),
+    })
+}
+
 /// Parse a validate handler's JSON result — an array of
 /// `{ severity, summary, detail?, attribute? }` — into [`Diagnostics`].
 fn parse_diagnostics(json: &str) -> Diagnostics {
@@ -382,6 +420,7 @@ struct JsResource {
     import: Handler,
     upgrade: Handler,
     validate: Handler,
+    modify_plan: Handler,
 }
 
 /// Serialize a [`Value`] for a ctx-threaded handler call, mapping the codec error
@@ -463,6 +502,25 @@ impl DynResource for JsResource {
             Ok(out) => parse_diagnostics(&out),
             Err(diags) => diags,
         }
+    }
+
+    async fn modify_plan(
+        &self,
+        prior: Value,
+        proposed: Value,
+    ) -> std::result::Result<PlanModifications, Diagnostics> {
+        // The handler sees `{ prior, proposed }` and returns
+        // `{ replace?, unknown?, keepPrior? }` paths.
+        let input = Value::Object(
+            [
+                ("prior".to_string(), prior),
+                ("proposed".to_string(), proposed),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let out = call_handler(&self.modify_plan, &input, "modify_plan").await?;
+        parse_plan_modifications(&out).map_err(|e| handler_err("modify_plan", e))
     }
 }
 
@@ -773,6 +831,7 @@ impl Provider {
         import: ThreadsafeFunction<String, Promise<String>>,
         upgrade: ThreadsafeFunction<String, Promise<String>>,
         validate: ThreadsafeFunction<String, Promise<String>>,
+        modify_plan: ThreadsafeFunction<String, Promise<String>>,
     ) -> Result<()> {
         let block = block_from_schema_json(&schema_json).map_err(napi_err)?;
         let ty = block.cty_type();
@@ -789,6 +848,7 @@ impl Provider {
                 import,
                 upgrade,
                 validate,
+                modify_plan,
             }),
         });
         Ok(())

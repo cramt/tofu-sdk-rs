@@ -102,9 +102,18 @@ dispatch — the TS analog of Rust's `&mut Ctx`. All schema shaping
 stays schema-agnostic. Variadic functions register through the same `function`
 method with a `variadic` element in the signature JSON (the service decodes args
 past the fixed params with the variadic type; the JS wrapper splits the positional
-array into fixed params + the `rest` tail). **Still unimplemented in the binding:**
-`DynListResource`, `DynStateStore`, resource identity (the `dyn_resource` seam
-carries `identity: None`), and `modify_plan`/`move_state`. The ephemeral seam is the
+array into fixed params + the `rest` tail). **`modify_plan`** is wired
+(`JsResource::modify_plan` → a JS `modifyPlan` returning `{ replace, unknown,
+keepPrior }` paths). To support the keep-prior lever for the dynamic seam,
+`PlanModifications` gained a `keep_prior: Vec<Path>` (a typed author can use it
+too) and `apply_modifications` now takes `&prior` to reset those paths.
+**Semantic equality** then rides `modify_plan`: a TS `z.transform` field is a
+quotient type whose cty derives from its input (`ctyFromZod` follows the `pipe`'s
+`in`), and the TS `resource()` wrapper auto-harvests it — running the transform on
+prior vs proposed and adding equal fields to `keepPrior` (the TS mirror of
+`Canon::harvest`; the canonicalizer stays in JS, no async hop). **Still
+unimplemented in the binding:** `DynListResource`, `DynStateStore`, resource
+identity (the `dyn_resource` seam carries `identity: None`), and `move_state`. The ephemeral seam is the
 one place the binding reaches the ambient `Ctx` (via the public `current_ctx()`):
 `open` returns `{ result, private?, renewAt? }` and the addon writes private/
 renewAt onto the ctx (the service reads them back), while `renew`/`close` receive

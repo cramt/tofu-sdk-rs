@@ -138,6 +138,7 @@ interface ZodDef {
   valueType?: z.ZodType;
   shape?: Record<string, z.ZodType>;
   values?: unknown[];
+  in?: z.ZodType;
 }
 
 /** Read a Zod type's internal def (Zod 4 exposes it at `_zod.def`). */
@@ -248,11 +249,15 @@ export function ctyFromZod(t: z.ZodType): CtyType {
       return optional.length > 0 ? ["object", fields, optional] : ["object", fields];
     }
     case "pipe":
+      // A transform / codec is a **quotient type** (parse-don't-validate): its
+      // structural cty is its *input* type, and the canonicalization it performs
+      // drives diff suppression in the plan hook (`keepPrior`), not the schema.
+      return ctyFromZod(d.in ?? z.unknown());
     case "transform":
     case "codec":
       throw new Error(
-        "transforms / codecs are not yet supported in a provider schema " +
-          "(semantic-equality normalization is not wired through the dynamic seam yet)",
+        `a bare ${d.type} has no input type to derive a cty from; ` +
+          "use it as the tail of a pipe (e.g. z.string().transform(...))",
       );
     default:
       throw new Error(`unsupported Zod type for cty: ${d.type}`);
@@ -294,6 +299,35 @@ export function searchKeysOf(schema: z.ZodObject<z.ZodRawShape>): string[] {
 /** Ordered field names of a params object (positional parameter order). */
 export function paramNames(params: z.ZodObject<z.ZodRawShape>): string[] {
   return Object.keys(zdef(params).shape ?? {});
+}
+
+/**
+ * Top-level fields that are **quotient types** — a transform / codec (a `pipe`)
+ * whose constructor canonicalizes (parse-don't-validate). Returns each field's
+ * name and full schema; `schema.parse(rawValue)` yields the canonical form, used
+ * to suppress spurious diffs ("keep prior" when canonical forms match).
+ */
+export function transformFields(
+  schema: z.ZodObject<z.ZodRawShape>,
+): { name: string; schema: z.ZodType }[] {
+  const shape = zdef(schema).shape ?? {};
+  return Object.entries(shape)
+    .filter(([, ft]) => ["pipe", "transform", "codec"].includes(zdef(peel(ft).core).type))
+    .map(([name, ft]) => ({ name, schema: ft }));
+}
+
+/** An attribute path: a sequence of attribute names and list/set indices. */
+export type Path = (string | number)[];
+
+/** What a `modifyPlan` hook returns: attribute paths to force-replace, mark
+ * unknown, or reset to the prior value (diff suppression). */
+export interface PlanModificationResult {
+  /** Paths whose change should force the resource to be replaced. */
+  replace?: Path[];
+  /** Paths to mark unknown (computed-by-rule, known after apply). */
+  unknown?: Path[];
+  /** Paths to reset to the prior value (suppress a spurious diff). */
+  keepPrior?: Path[];
 }
 
 /** Whether a Zod type admits null (`.optional()` / `.nullable()` / `.default()`). */

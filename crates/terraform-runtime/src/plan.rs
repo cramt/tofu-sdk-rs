@@ -149,9 +149,15 @@ fn mark_block_computed_unknown(
 }
 
 /// Apply a resource's [`PlanModifications`] to the mechanically-produced plan:
-/// mark the targeted attributes unknown (walking into nested blocks/collections)
-/// and add `require_replace` paths (deduped against the mechanical ones).
-pub fn apply_modifications(plan: &mut Plan, mods: PlanModifications) {
+/// reset `keep_prior` attributes to their `prior` value (diff suppression), mark
+/// the targeted attributes unknown (walking into nested blocks/collections), and
+/// add `require_replace` paths (deduped against the mechanical ones).
+pub fn apply_modifications(plan: &mut Plan, mods: PlanModifications, prior: &Value) {
+    for path in &mods.keep_prior {
+        if let Some(prior_value) = get_at_path(prior, &path.0) {
+            set_at_path(&mut plan.planned, &path.0, prior_value);
+        }
+    }
     for path in &mods.unknown {
         set_at_path(&mut plan.planned, &path.0, Value::Unknown);
     }
@@ -160,6 +166,24 @@ pub fn apply_modifications(plan: &mut Plan, mods: PlanModifications) {
         if !plan.requires_replace.contains(&attribute_path) {
             plan.requires_replace.push(attribute_path);
         }
+    }
+}
+
+/// Walk `value` along `steps` and return a clone of the addressed leaf, or `None`
+/// if a step doesn't resolve (mirroring [`set_at_path`]'s tolerance).
+fn get_at_path(value: &Value, steps: &[PathStep]) -> Option<Value> {
+    let Some((step, rest)) = steps.split_first() else {
+        return Some(value.clone());
+    };
+    match (step, value) {
+        (PathStep::Attribute(name), Value::Object(fields)) => {
+            get_at_path(fields.get(name)?, rest)
+        }
+        (PathStep::Index(index), Value::List(items) | Value::Set(items)) => {
+            get_at_path(items.get(usize::try_from(*index).ok()?)?, rest)
+        }
+        (PathStep::Key(key), Value::Map(entries)) => get_at_path(entries.get(key)?, rest),
+        _ => None,
     }
 }
 
@@ -449,7 +473,7 @@ mod tests {
             ]),
             &block(),
         );
-        apply_modifications(&mut plan, PlanModifications::new().unknown("arn"));
+        apply_modifications(&mut plan, PlanModifications::new().unknown("arn"), &Value::Null);
         assert!(fields(&plan.planned)["arn"].is_unknown());
     }
 
@@ -470,6 +494,7 @@ mod tests {
             &mut plan,
             PlanModifications::new()
                 .unknown(Path::root().attribute("settings").index(0).attribute("id")),
+            &Value::Null,
         );
 
         let Value::List(items) = &fields(&plan.planned)["settings"] else {
@@ -500,6 +525,7 @@ mod tests {
             PlanModifications::new()
                 .unknown(Path::root().attribute("name").index(3))
                 .unknown("does_not_exist"),
+            &Value::Null,
         );
         assert_eq!(
             plan.planned, before,
@@ -518,6 +544,7 @@ mod tests {
             &mut plan,
             PlanModifications::new()
                 .require_replace(Path::root().attribute("settings").index(0).attribute("id")),
+            &Value::Null,
         );
         assert_eq!(plan.requires_replace.len(), 1);
         let steps = &plan.requires_replace[0].steps;
@@ -552,11 +579,37 @@ mod tests {
         let mut plan = plan(&prior, proposed, &block());
         assert_eq!(plan.requires_replace.len(), 1);
         // The author also asks to replace on `name`: deduped, not doubled.
-        apply_modifications(&mut plan, PlanModifications::new().require_replace("name"));
+        apply_modifications(
+            &mut plan,
+            PlanModifications::new().require_replace("name"),
+            &prior,
+        );
         assert_eq!(
             plan.requires_replace.len(),
             1,
             "duplicate path not added twice"
+        );
+    }
+
+    #[test]
+    fn modification_keep_prior_resets_to_the_prior_value() {
+        let prior = obj(&[
+            ("name", Value::String("a".into())),
+            ("arn", Value::String("arn:lower".into())),
+            ("note", Value::Null),
+        ]);
+        // A case-only change to `arn` the rule deems semantically equal.
+        let proposed = obj(&[
+            ("name", Value::String("a".into())),
+            ("arn", Value::String("ARN:LOWER".into())),
+            ("note", Value::Null),
+        ]);
+        let mut plan = plan(&prior, proposed, &block());
+        apply_modifications(&mut plan, PlanModifications::new().keep_prior("arn"), &prior);
+        assert_eq!(
+            fields(&plan.planned)["arn"],
+            Value::String("arn:lower".into()),
+            "keep_prior resets the attribute to its prior value"
         );
     }
 

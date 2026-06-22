@@ -76,8 +76,14 @@ variable "bucket_name" {
   default = "e2e-bucket"
 }
 
+variable "tier" {
+  type    = string
+  default = "silver"
+}
+
 resource "aws_s3_bucket" "test" {
   name = var.bucket_name
+  tier = var.tier
   tags = { env = "test" }
 }
 
@@ -146,6 +152,15 @@ output "fn_join" {
       outputs.fn_join.value,
       "a-b-c",
       "variadic function joined the trailing args",
+    );
+
+    // modifyPlan force-replace-by-rule: upgrading `tier` to "gold" must replace.
+    const tierPlan = run(bin, ["plan", "-no-color", "-var", "tier=gold"], cfg, env);
+    assert.equal(tierPlan.status, 0, tierPlan.stderr);
+    assert.match(
+      tierPlan.stdout,
+      /forces replacement/,
+      `modifyPlan should force replacement on tier=gold:\n${tierPlan.stdout}`,
     );
 
     // Renaming the force_new `name` must plan a replacement.

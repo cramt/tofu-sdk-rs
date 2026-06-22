@@ -137,8 +137,16 @@ analog of Rust's `&mut Ctx`: `ctx.warn(...)` for success-path warnings,
 `ctx.private` / `ctx.setPrivate(...)` for per-resource private state, and
 `ctx.cancelled` / `ctx.signal` for cancellation. Ignore it if unused.
 
+Resources also get **`modifyPlan(prior, proposed)`** (Rust's `modify_plan`) —
+return attribute paths to `replace`, mark `unknown`, or `keepPrior` (reset to the
+prior value, suppressing a spurious diff). On top of it, a field modeled as a
+**`z.transform`** (a *quotient type* — parse-don't-validate) **auto-suppresses**:
+its prior value is kept when the new value canonicalizes equal, no code needed —
+the TS mirror of Rust's quotient + `Canon::harvest`. (Diff suppression is cleanest
+for computed / diff-stable values; for a plain required input, Terraform's
+plan-consistency check still compares the planned value to config.)
+
 Not yet wired up (the Rust core supports these; the Node binding doesn't expose
-them yet): **list resources**, **state stores**, **resource identity**,
-`modify_plan` / `move_state`, and semantic-equality normalization. Also: prebuilt
-multi-platform addons (the preset inlines the addon for the platform you build
-on).
+them yet): **list resources**, **state stores**, **resource identity**, and
+`move_state`. Also: prebuilt multi-platform addons (the preset inlines the addon
+for the platform you build on).

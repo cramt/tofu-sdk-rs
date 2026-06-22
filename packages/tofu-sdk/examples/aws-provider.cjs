@@ -16,6 +16,9 @@ const Bucket = z.object({
   arn: z.string(),
   region: z.string(),
   tags: z.record(z.string(), z.string()).optional(),
+  // A plain optional input; `modifyPlan` (below) force-replaces by rule when it
+  // becomes "gold" — the analog of Rust's `Resource::modify_plan`.
+  tier: z.string().optional(),
 });
 
 const BucketLookup = z.object({
@@ -83,6 +86,12 @@ new Provider()
     async upgrade(_fromVersion, prior) {
       const name = prior?.name ?? prior?.bucket ?? "";
       return { name, arn: `${ARN_PREFIX}${name}`, region };
+    },
+    // Adjust the plan by rule: upgrading `tier` to "gold" forces replacement.
+    async modifyPlan(prior, proposed) {
+      if (prior && proposed.tier === "gold" && prior.tier !== "gold") {
+        return { replace: [["tier"]] };
+      }
     },
     // Reject invalid config early. `name` may be null (unset/unknown), so guard.
     validate(config) {
