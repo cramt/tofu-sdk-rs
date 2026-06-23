@@ -259,6 +259,60 @@ resource "aws_s3_bucket" "test" {
   }
 });
 
+test("projects a resource identity into state", () => {
+  const bin = engine();
+  const { dir, cfg, env } = workspace();
+  try {
+    writeFileSync(
+      join(cfg, "main.tf"),
+      `
+terraform {
+  required_providers {
+    aws = {
+      source = "example/aws"
+    }
+  }
+}
+
+provider "aws" {
+  region = "eu-west-1"
+}
+
+resource "aws_s3_bucket" "test" {
+  name = "id-bucket"
+  tier = "silver"
+  tags = { env = "test" }
+}
+`,
+    );
+
+    // The resource declares `name` as its identity (`identity: ["name"]`). The
+    // engine validates planned-vs-applied identity consistency on apply, then
+    // records the projected identity in state — proving the dynamic-seam identity
+    // schema reached the engine and the runtime projected the identity data off
+    // the returned value.
+    const apply = run(bin, ["apply", "-auto-approve"], cfg, env);
+    assert.equal(apply.status, 0, `apply failed:\n${apply.stdout}\n${apply.stderr}`);
+
+    const show = run(bin, ["show", "-json"], cfg, env);
+    assert.equal(show.status, 0, show.stderr);
+    const state = JSON.parse(show.stdout);
+    const resource = state.values.root_module.resources.find(
+      (r) => r.type === "aws_s3_bucket",
+    );
+    assert.deepEqual(
+      resource.identity,
+      { name: "id-bucket" },
+      "the resource identity was projected into state",
+    );
+    assert.equal(resource.identity_schema_version, 0, "identity is at version 0");
+
+    run(bin, ["destroy", "-auto-approve"], cfg, env);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("migrates state across resource types via a moved block", () => {
   const bin = engine();
   const { dir, cfg, env } = workspace();

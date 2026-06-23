@@ -73,6 +73,8 @@ new Provider()
     version: 1,
     forceNew: ["name"],
     computed: ["arn", "region"],
+    // The bucket's stable identity is its name (import-by-identity, tracking).
+    identity: ["name"],
     async create(planned, ctx) {
       // `ctx` is the TS analog of Rust's `&mut Ctx`: success-path warnings,
       // per-resource private state (`ctx.private`/`ctx.setPrivate`), and

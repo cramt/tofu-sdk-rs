@@ -847,12 +847,32 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
     }
 
     /// Register a managed resource from a hand-built schema `block` and an
-    /// erased [`DynResource`] handler, bypassing facet reflection.
+    /// erased [`DynResource`] handler, bypassing facet reflection. The resource
+    /// carries no identity; use [`ProviderBuilder::dyn_resource_with_identity`] to
+    /// declare one.
     pub fn dyn_resource(
+        self,
+        name: impl Into<String>,
+        version: i64,
+        block: Block,
+        handler: Arc<dyn DynResource>,
+    ) -> Self {
+        self.dyn_resource_with_identity(name, version, block, None, handler)
+    }
+
+    /// Register a managed resource from a hand-built schema `block`, an optional
+    /// [`IdentitySchema`](terraform_ir::IdentitySchema), and an erased
+    /// [`DynResource`] handler — the dynamic-seam counterpart of the reflection
+    /// path's `#[facet(terraform::identity)]` projection (used by non-Rust
+    /// frontends such as the Node binding to declare a resource identity). The
+    /// runtime projects identity data straight off the returned `Value` via the
+    /// identity attribute names, so no extra handler method is needed.
+    pub fn dyn_resource_with_identity(
         mut self,
         name: impl Into<String>,
         version: i64,
         block: Block,
+        identity: Option<terraform_ir::IdentitySchema>,
         handler: Arc<dyn DynResource>,
     ) -> Self {
         let name = name.into();
@@ -860,9 +880,7 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
             name: name.clone(),
             version,
             block,
-            // The dynamic seam carries no identity; identity is a reflection-only
-            // projection today.
-            identity: None,
+            identity,
         });
         self.resources.insert(name, handler);
         self

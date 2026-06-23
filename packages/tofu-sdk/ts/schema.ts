@@ -49,6 +49,13 @@ export interface TfMeta {
   writeOnly?: boolean;
   /** Marked deprecated (a boolean notice). */
   deprecated?: boolean;
+  /**
+   * Part of the resource's **identity** — the stable key Terraform tracks the
+   * resource by (import-by-identity, cross-config tracking). Mirrors Rust's
+   * `#[facet(terraform::identity)]`; usually a computed `id`/`arn` or a
+   * `forceNew` natural key.
+   */
+  identity?: boolean;
   /** Render as a nested HCL block (`name { … }`) instead of an attribute. */
   block?: boolean;
   /**
@@ -100,6 +107,8 @@ export interface Dispositions<S extends z.ZodObject<z.ZodRawShape>> {
   writeOnly?: FieldName<S>[];
   /** Attributes marked deprecated. */
   deprecated?: FieldName<S>[];
+  /** Attributes forming the resource's identity (import-by-identity, tracking). */
+  identity?: FieldName<S>[];
   /** Array fields to derive as unordered cty `set`s rather than lists. */
   set?: FieldName<S>[];
   /** Fields to render as nested blocks (`name { … }`). */
@@ -117,6 +126,7 @@ export interface AttributeJson {
   sensitive: boolean;
   writeOnly: boolean;
   deprecated: boolean;
+  identity: boolean;
 }
 
 /** One nested-block descriptor in the schema JSON. */
@@ -390,6 +400,7 @@ function attributesFromObject(obj: z.ZodType): AttributeJson[] {
       sensitive: meta.sensitive === true,
       writeOnly: meta.writeOnly === true,
       deprecated: meta.deprecated === true,
+      identity: meta.identity === true,
     };
   });
 }
@@ -434,6 +445,7 @@ export function schemaJson(
   const aSensitive = arr(dispositions.sensitive);
   const aWriteOnly = arr(dispositions.writeOnly);
   const aDeprecated = arr(dispositions.deprecated);
+  const aIdentity = arr(dispositions.identity);
   const aSet = arr(dispositions.set);
   const aBlocks = arr(dispositions.blocks);
 
@@ -461,6 +473,7 @@ export function schemaJson(
       sensitive: meta.sensitive === true || aSensitive.has(name),
       writeOnly: meta.writeOnly === true || aWriteOnly.has(name),
       deprecated: meta.deprecated === true || aDeprecated.has(name),
+      identity: meta.identity === true || aIdentity.has(name),
     });
   }
   return JSON.stringify({ attributes, blocks });

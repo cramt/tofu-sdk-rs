@@ -24,7 +24,8 @@ use std::time::{Duration, SystemTime};
 
 use terraform_codec::{decode_json, encode_json};
 use terraform_ir::{
-    AttributeSchema, Block, FunctionSignature, NestedBlock, NestingMode, Parameter,
+    AttributeSchema, Block, FunctionSignature, IdentityAttribute, IdentitySchema, NestedBlock,
+    NestingMode, Parameter,
 };
 use terraform_runtime::{
     async_trait, current_ctx, serve as serve_provider, Diag, Diagnostics, DynConfigure,
@@ -128,6 +129,57 @@ fn block_from_schema_value(parsed: &facet_value::Value) -> std::result::Result<B
         attributes,
         nested_blocks,
     })
+}
+
+/// Build a resource [`IdentitySchema`] from a schema description's top-level
+/// attributes flagged `"identity": true` — the dynamic-seam analog of the
+/// reflection path's `#[facet(terraform::identity)]`. Each becomes a
+/// `required_for_import` identity attribute carrying the attribute's own cty type
+/// (version 0, matching the reflection projection). Returns `None` when no
+/// attribute is flagged, so a resource without identity stays unaffected.
+fn identity_from_schema_json(json: &str) -> std::result::Result<Option<IdentitySchema>, String> {
+    let parsed: facet_value::Value =
+        facet_json::from_slice(json.as_bytes()).map_err(|e| e.to_string())?;
+    let obj = parsed.as_object().ok_or("schema must be a JSON object")?;
+    let Some(attrs) = obj.get("attributes").and_then(|v| v.as_array()) else {
+        return Ok(None);
+    };
+
+    let mut attributes = Vec::new();
+    for attr in attrs.iter() {
+        let ao = attr.as_object().ok_or("each attribute must be an object")?;
+        if !ao
+            .get("identity")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let name = ao
+            .get("name")
+            .and_then(|v| v.as_string())
+            .ok_or("identity attribute is missing a string `name`")?
+            .as_str()
+            .to_string();
+        let ty = cty_type_from(
+            ao.get("type")
+                .ok_or_else(|| format!("identity attribute `{name}` is missing a `type`"))?,
+        )?;
+        attributes.push(IdentityAttribute {
+            name,
+            ty,
+            description: ao
+                .get("description")
+                .and_then(|v| v.as_string())
+                .map(|s| s.as_str().to_string()),
+            required_for_import: true,
+            optional_for_import: false,
+        });
+    }
+    Ok((!attributes.is_empty()).then_some(IdentitySchema {
+        version: 0,
+        attributes,
+    }))
 }
 
 /// Parse one nested-block descriptor:
@@ -761,6 +813,9 @@ struct ResourceReg {
     name: String,
     version: i64,
     block: Block,
+    /// The resource's identity schema (from `identity`-flagged attributes), or
+    /// `None` when the resource declares no identity.
+    identity: Option<IdentitySchema>,
     handler: Arc<dyn DynResource>,
 }
 
@@ -883,11 +938,13 @@ impl Provider {
         move_state: ThreadsafeFunction<String, Promise<String>>,
     ) -> Result<()> {
         let block = block_from_schema_json(&schema_json).map_err(napi_err)?;
+        let identity = identity_from_schema_json(&schema_json).map_err(napi_err)?;
         let ty = block.cty_type();
         self.resources.push(ResourceReg {
             name: type_name,
             version: version as i64,
             block,
+            identity,
             handler: Arc::new(JsResource {
                 ty,
                 create,
@@ -969,10 +1026,11 @@ impl Provider {
                 .dyn_validate_config(Arc::clone(&cfg.validate));
         }
         for r in &self.resources {
-            builder = builder.dyn_resource(
+            builder = builder.dyn_resource_with_identity(
                 r.name.clone(),
                 r.version,
                 r.block.clone(),
+                r.identity.clone(),
                 Arc::clone(&r.handler),
             );
         }

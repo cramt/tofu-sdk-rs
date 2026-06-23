@@ -655,6 +655,7 @@ export class Provider {
       sensitive: false,
       writeOnly: false,
       deprecated: false,
+      identity: false,
     }));
     attributes.push({
       name: "results",
@@ -666,6 +667,7 @@ export class Provider {
       sensitive: false,
       writeOnly: false,
       deprecated: false,
+      identity: false,
     });
 
     const read = ctxAdapt<M, Record<string, unknown>>(def.schema, async (config, ctx) => {

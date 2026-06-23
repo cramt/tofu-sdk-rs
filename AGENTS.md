@@ -117,10 +117,19 @@ sourceState, ctx)` resource hook over the defaulted `DynResource::move_state`
 seam — `JsResource::move_state` sends `{ sourceTypeName, sourceState }` through
 the ctx envelope (`call_with_ctx`) and decodes the handler's result under the
 target model's cty; the source state is forwarded untyped (foreign schema). It is
-the one binding feature with an engine-level (`tofu`) test —
-`test/e2e.test.mjs`'s "migrates state across resource types via a moved block".
-**Still unimplemented in the binding:** `DynListResource`, `DynStateStore`, and
-resource identity (the `dyn_resource` seam carries `identity: None`). The ephemeral seam is the
+verified by an engine-level (`tofu`) test — `test/e2e.test.mjs`'s "migrates state
+across resource types via a moved block". **Resource identity** is wired too: an
+`identity` field disposition (TS `.meta({ identity })` / `identity: [...]` array)
+becomes an `IdentitySchema` the addon builds (`identity_from_schema_json`) and
+passes through the new `ProviderBuilder::dyn_resource_with_identity` seam (which
+replaced `dyn_resource`'s hardcoded `identity: None`). No `DynResource` method is
+added — the runtime projects identity straight off the returned `Value` via the
+identity attribute names (`known_identity_data`), so the seam stays value-only.
+Verified by `test/e2e.test.mjs`'s "projects a resource identity into state" (the
+engine drops identity from `providers schema -json` in 1.12.1, so the test asserts
+the identity `tofu show -json` records in state). **Still unimplemented in the
+binding:** `DynListResource` and `DynStateStore` (both new primitives; neither is
+engine-testable in 1.12.1). The ephemeral seam is the
 one place the binding reaches the ambient `Ctx` (via the public `current_ctx()`):
 `open` returns `{ result, private?, renewAt? }` and the addon writes private/
 renewAt onto the ctx (the service reads them back), while `renew`/`close` receive
@@ -283,8 +292,11 @@ it; keep it static. The preset is exposed via the package.json `exports` subpath
   **only when every identity key is known** — an unknown computed key (e.g.
   plan-on-create) omits the identity, just like a computed attribute. Opt-in (no
   marker → no identity → unaffected). `UpgradeResourceIdentity` is a passthrough
-  (identity stays version 0). Identity is reflection-only; `dyn_resource` carries
-  `identity: None`.
+  (identity stays version 0). The dynamic seam carries identity too:
+  `dyn_resource_with_identity` takes an explicit `Option<IdentitySchema>` (plain
+  `dyn_resource` delegates with `None`), used by the Node binding to declare a
+  resource identity without reflection — the runtime still projects it off the
+  returned `Value`, so no seam handler method is involved.
 - **`Resource::move_state`** backs `MoveResourceState` (cross-type `moved {}`). The
   `source_state` is the *source* resource's raw stored state decoded **untyped**
   (`decode_json_value`, like `upgrade`) — its schema may be foreign — so the

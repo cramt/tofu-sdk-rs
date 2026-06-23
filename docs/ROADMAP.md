@@ -620,21 +620,22 @@ with JS `Set`⇄array marshaling), the handler **`ctx`** (success-path warnings,
 private state, cancellation — threaded via a `{ctx, value}` envelope +
 `run_until_cancelled`), **semantic-equality normalization** (a `z.transform`
 quotient field auto-suppresses diffs through `modifyPlan`'s `keepPrior`, the TS
-mirror of `Canon::harvest`), and **`moveState`** (cross-type `moved {}`): an
+mirror of `Canon::harvest`), **`moveState`** (cross-type `moved {}`): an
 optional `moveState(sourceTypeName, sourceState, ctx)` hook over the defaulted
-`DynResource::move_state` seam. Verified by `test/e2e.test.mjs`'s "migrates state
-across resource types via a moved block" — which is also the **first engine-level
-(`tofu`) test of `MoveResourceState`** in the repo (the Rust side has only
-direct service-call tests, as the scenario needs a two-type multi-step state
-sequence).
+`DynResource::move_state` seam (verified by `test/e2e.test.mjs`'s "migrates state
+across resource types via a moved block" — also the **first engine-level (`tofu`)
+test of `MoveResourceState`** in the repo), and **resource identity** (an
+`identity` field disposition → `IdentitySchema` over the new
+`dyn_resource_with_identity` seam; the runtime projects identity off the returned
+`Value`, so no handler method is added). The identity test asserts `tofu show
+-json` records the projected identity — the engine can't surface identity in
+`providers schema -json` (1.12.1 drops it, like list resources / state stores), so
+the in-state projection stands in.
 
-**Still unimplemented in the binding** (the Rust core supports each; in suggested
-order):
+**Still unimplemented in the binding** (the Rust core supports each):
 1. **State stores** + **list resources** — new primitives over `dyn_state_store` /
-   `dyn_list_resource` (addon + TS; the seams exist).
-2. **Resource identity** — needs a small Rust seam change: `dyn_resource` currently
-   hardcodes `identity: None`, so the seam must learn to carry an identity schema
-   (then addon + TS).
+   `dyn_list_resource` (addon + TS; the seams exist). Not engine-testable yet
+   (OpenTofu 1.12.1 drops both schemas from `providers schema -json`).
 
 **Normalization caveat:** diff suppression via `keepPrior` is cleanest for
 computed / diff-stable values; for a plain required input, Terraform core's

@@ -72,6 +72,19 @@ test("dispositions read from per-field .meta() (algebraic types define everythin
   assert.equal(byName(a, "old").deprecated, true);
 });
 
+test("the `identity` disposition reads from .meta() and the legacy array", () => {
+  const schema = z.object({
+    id: z.string().meta({ computed: true, identity: true }),
+    arn: z.string().meta({ computed: true }),
+  });
+  const a = attrs(schema);
+  assert.equal(byName(a, "id").identity, true, "meta({ identity }) marks the attribute");
+  assert.equal(byName(a, "arn").identity, false, "unmarked attributes are not identity");
+  // The legacy array form is honored and merged in too.
+  const b = attrs(z.object({ name: z.string() }), { identity: ["name"] });
+  assert.equal(byName(b, "name").identity, true, "identity array marks the attribute");
+});
+
 test(".meta() survives wrappers like .optional()", () => {
   const schema = z.object({ note: z.string().meta({ computed: true }).optional() });
   assert.equal(byName(attrs(schema), "note").computed, true);
