@@ -26,6 +26,12 @@ const BucketLookup = z.object({
   arn: z.string(),
 });
 
+// A predecessor resource type that named buckets by `label`. It exists only so a
+// `moved {}` block can migrate its state into `aws_s3_bucket` across types.
+const LegacyBucket = z.object({
+  label: z.string(),
+});
+
 new Provider()
   // Provider configuration: an optional `region`, stashed for the handlers. The
   // `validate` hook rejects an obviously-bad region before configure runs.
@@ -93,6 +99,17 @@ new Provider()
         return { replace: [["tier"]] };
       }
     },
+    // Migrate state from the predecessor `aws_legacy_bucket` (a cross-type
+    // `moved {}`): its `label` becomes our `name`, and the computed fields are
+    // recovered. The source state is untyped (a foreign schema), so we read it
+    // defensively.
+    async moveState(sourceTypeName, sourceState) {
+      if (sourceTypeName !== "aws_legacy_bucket") {
+        throw new Error(`cannot move state from "${sourceTypeName}"`);
+      }
+      const name = sourceState?.label ?? "";
+      return { name, arn: `${ARN_PREFIX}${name}`, region };
+    },
     // Reject invalid config early. `name` may be null (unset/unknown), so guard.
     validate(config) {
       const diagnostics = [];
@@ -104,6 +121,15 @@ new Provider()
         });
       }
       return diagnostics;
+    },
+  })
+  // The predecessor resource type. It only needs to exist so its stored state
+  // can be migrated into `aws_s3_bucket` via a cross-type `moved {}` block (see
+  // the `aws_s3_bucket` `moveState` handler above).
+  .resource("aws_legacy_bucket", {
+    schema: LegacyBucket,
+    async create(planned) {
+      return planned;
     },
   })
   // A singular data source: look a bucket up by name and compute its arn.

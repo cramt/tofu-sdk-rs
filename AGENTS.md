@@ -111,9 +111,16 @@ too) and `apply_modifications` now takes `&prior` to reset those paths.
 quotient type whose cty derives from its input (`ctyFromZod` follows the `pipe`'s
 `in`), and the TS `resource()` wrapper auto-harvests it — running the transform on
 prior vs proposed and adding equal fields to `keepPrior` (the TS mirror of
-`Canon::harvest`; the canonicalizer stays in JS, no async hop). **Still
-unimplemented in the binding:** `DynListResource`, `DynStateStore`, resource
-identity (the `dyn_resource` seam carries `identity: None`), and `move_state`. The ephemeral seam is the
+`Canon::harvest`; the canonicalizer stays in JS, no async hop). **`move_state`**
+(cross-type `moved {}`) is wired too: an optional `moveState(sourceTypeName,
+sourceState, ctx)` resource hook over the defaulted `DynResource::move_state`
+seam — `JsResource::move_state` sends `{ sourceTypeName, sourceState }` through
+the ctx envelope (`call_with_ctx`) and decodes the handler's result under the
+target model's cty; the source state is forwarded untyped (foreign schema). It is
+the one binding feature with an engine-level (`tofu`) test —
+`test/e2e.test.mjs`'s "migrates state across resource types via a moved block".
+**Still unimplemented in the binding:** `DynListResource`, `DynStateStore`, and
+resource identity (the `dyn_resource` seam carries `identity: None`). The ephemeral seam is the
 one place the binding reaches the ambient `Ctx` (via the public `current_ctx()`):
 `open` returns `{ result, private?, renewAt? }` and the addon writes private/
 renewAt onto the ctx (the service reads them back), while `renew`/`close` receive

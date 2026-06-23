@@ -176,9 +176,7 @@ fn get_at_path(value: &Value, steps: &[PathStep]) -> Option<Value> {
         return Some(value.clone());
     };
     match (step, value) {
-        (PathStep::Attribute(name), Value::Object(fields)) => {
-            get_at_path(fields.get(name)?, rest)
-        }
+        (PathStep::Attribute(name), Value::Object(fields)) => get_at_path(fields.get(name)?, rest),
         (PathStep::Index(index), Value::List(items) | Value::Set(items)) => {
             get_at_path(items.get(usize::try_from(*index).ok()?)?, rest)
         }
@@ -473,7 +471,11 @@ mod tests {
             ]),
             &block(),
         );
-        apply_modifications(&mut plan, PlanModifications::new().unknown("arn"), &Value::Null);
+        apply_modifications(
+            &mut plan,
+            PlanModifications::new().unknown("arn"),
+            &Value::Null,
+        );
         assert!(fields(&plan.planned)["arn"].is_unknown());
     }
 
@@ -605,7 +607,11 @@ mod tests {
             ("note", Value::Null),
         ]);
         let mut plan = plan(&prior, proposed, &block());
-        apply_modifications(&mut plan, PlanModifications::new().keep_prior("arn"), &prior);
+        apply_modifications(
+            &mut plan,
+            PlanModifications::new().keep_prior("arn"),
+            &prior,
+        );
         assert_eq!(
             fields(&plan.planned)["arn"],
             Value::String("arn:lower".into()),

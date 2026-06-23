@@ -72,6 +72,7 @@ interface RawProvider {
     upgrade: RawHandler,
     validate: RawHandler,
     modifyPlan: RawHandler,
+    moveState: RawHandler,
   ): void;
   dataSource(typeName: string, schemaJson: string, read: RawHandler, validate: RawHandler): void;
   ephemeral(
@@ -194,6 +195,20 @@ export interface Resource<S extends z.ZodObject<z.ZodRawShape>> extends Disposit
     prior: z.infer<S> | null,
     proposed: z.infer<S>,
   ): Promise<PlanModificationResult | void>;
+  /**
+   * Migrate state from a *different* resource type into this one — the provider
+   * side of a `moved {}` block that crosses resource types (the Rust analog of
+   * `Resource::move_state`). `sourceTypeName` names the source resource and
+   * `sourceState` is its raw stored state (untyped — its schema is foreign, so it
+   * is not parsed against this resource's schema). Typically `switch` on
+   * `sourceTypeName` and map the dynamic value onto this resource's model. Omit
+   * it to reject cross-type moves with a diagnostic.
+   */
+  moveState?(
+    sourceTypeName: string,
+    sourceState: unknown,
+    ctx: HandlerCtx,
+  ): Promise<z.infer<S>>;
 }
 
 /** A singular read-only data source: given a config, produce a state. */
@@ -561,6 +576,23 @@ export class Provider {
       }
       return JSON.stringify({ replace, unknown, keepPrior });
     };
+    // Cross-type state move. The source state is foreign (untyped), so it is *not*
+    // revived against this resource's schema; the handler maps it onto the model.
+    const moveState = ctxAdapt<{ sourceTypeName: string; sourceState: unknown }, M>(
+      undefined,
+      async ({ sourceTypeName, sourceState }, ctx) => {
+        if (!def.moveState) {
+          throw new Error(
+            `resource "${typeName}" does not support moving state from "${sourceTypeName}"`,
+          );
+        }
+        return validateOut(
+          def.schema,
+          await def.moveState(sourceTypeName, sourceState, ctx),
+          `resource ${typeName} moveState`,
+        );
+      },
+    );
     this.raw.resource(
       typeName,
       def.version ?? 0,
@@ -573,6 +605,7 @@ export class Provider {
       upgrade,
       validateAdapter(def.validate, def.schema),
       modifyPlan,
+      moveState,
     );
     return this;
   }

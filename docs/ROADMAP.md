@@ -618,9 +618,15 @@ ephemeral resources, **provider-defined functions** (`function` /
 (single/list/set), **unordered sets** (`z.set` scalar + the `set` disposition,
 with JS `Set`⇄array marshaling), the handler **`ctx`** (success-path warnings,
 private state, cancellation — threaded via a `{ctx, value}` envelope +
-`run_until_cancelled`), and **semantic-equality normalization** (a `z.transform`
+`run_until_cancelled`), **semantic-equality normalization** (a `z.transform`
 quotient field auto-suppresses diffs through `modifyPlan`'s `keepPrior`, the TS
-mirror of `Canon::harvest`).
+mirror of `Canon::harvest`), and **`moveState`** (cross-type `moved {}`): an
+optional `moveState(sourceTypeName, sourceState, ctx)` hook over the defaulted
+`DynResource::move_state` seam. Verified by `test/e2e.test.mjs`'s "migrates state
+across resource types via a moved block" — which is also the **first engine-level
+(`tofu`) test of `MoveResourceState`** in the repo (the Rust side has only
+direct service-call tests, as the scenario needs a two-type multi-step state
+sequence).
 
 **Still unimplemented in the binding** (the Rust core supports each; in suggested
 order):
@@ -629,8 +635,6 @@ order):
 2. **Resource identity** — needs a small Rust seam change: `dyn_resource` currently
    hardcodes `identity: None`, so the seam must learn to carry an identity schema
    (then addon + TS).
-3. **`moveState`** (cross-type `moved {}`) — the defaulted `DynResource::move_state`
-   seam, implementable in the addon.
 
 **Normalization caveat:** diff suppression via `keepPrior` is cleanest for
 computed / diff-stable values; for a plain required input, Terraform core's

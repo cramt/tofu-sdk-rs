@@ -259,6 +259,84 @@ resource "aws_s3_bucket" "test" {
   }
 });
 
+test("migrates state across resource types via a moved block", () => {
+  const bin = engine();
+  const { dir, cfg, env } = workspace();
+  try {
+    writeFileSync(
+      join(cfg, "main.tf"),
+      `
+terraform {
+  required_providers {
+    aws = {
+      source = "example/aws"
+    }
+  }
+}
+
+provider "aws" {
+  region = "eu-west-1"
+}
+
+resource "aws_s3_bucket" "new" {
+  name = "legacy-bucket"
+}
+
+moved {
+  from = aws_legacy_bucket.old
+  to   = aws_s3_bucket.new
+}
+`,
+    );
+    // Pre-seed state with an instance of the predecessor type `aws_legacy_bucket`,
+    // which named the bucket by `label`. The `moved {}` block crosses resource
+    // types, so the engine calls MoveResourceState on the target provider, which
+    // maps `label` -> `name` and recomputes the arn.
+    const priorState = {
+      version: 4,
+      terraform_version: "1.12.0",
+      serial: 1,
+      lineage: "00000000-0000-0000-0000-000000000001",
+      outputs: {},
+      resources: [
+        {
+          mode: "managed",
+          type: "aws_legacy_bucket",
+          name: "old",
+          provider: 'provider["registry.terraform.io/example/aws"]',
+          instances: [{ schema_version: 0, attributes: { label: "legacy-bucket" } }],
+        },
+      ],
+    };
+    writeFileSync(join(cfg, "terraform.tfstate"), JSON.stringify(priorState));
+
+    const apply = run(bin, ["apply", "-auto-approve"], cfg, env);
+    assert.equal(apply.status, 0, `apply failed:\n${apply.stdout}\n${apply.stderr}`);
+
+    const show = run(bin, ["show", "-json"], cfg, env);
+    assert.equal(show.status, 0, show.stderr);
+    const state = JSON.parse(show.stdout);
+    const moved = state.values.root_module.resources.find(
+      (r) => r.type === "aws_s3_bucket" && r.name === "new",
+    ).values;
+    assert.equal(moved.name, "legacy-bucket", "the legacy `label` migrated to `name`");
+    assert.equal(
+      moved.arn,
+      "arn:aws:s3:::legacy-bucket",
+      "the moved resource recomputed its arn",
+    );
+    // The old `aws_legacy_bucket.old` address no longer exists after the move.
+    assert.ok(
+      !state.values.root_module.resources.some((r) => r.type === "aws_legacy_bucket"),
+      "the source resource address was consumed by the move",
+    );
+
+    run(bin, ["destroy", "-auto-approve"], cfg, env);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("rejects invalid config via a validate hook", () => {
   const bin = engine();
   const { dir, cfg, env } = workspace();

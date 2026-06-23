@@ -23,7 +23,9 @@ use napi_derive::napi;
 use std::time::{Duration, SystemTime};
 
 use terraform_codec::{decode_json, encode_json};
-use terraform_ir::{AttributeSchema, Block, FunctionSignature, NestedBlock, NestingMode, Parameter};
+use terraform_ir::{
+    AttributeSchema, Block, FunctionSignature, NestedBlock, NestingMode, Parameter,
+};
 use terraform_runtime::{
     async_trait, current_ctx, serve as serve_provider, Diag, Diagnostics, DynConfigure,
     DynDataSource, DynEphemeral, DynFunction, DynResource, DynValidateConfig, FunctionError, Path,
@@ -184,7 +186,9 @@ fn function_signature_from_json(
 ) -> std::result::Result<FunctionSignature, String> {
     let parsed: facet_value::Value =
         facet_json::from_slice(json.as_bytes()).map_err(|e| e.to_string())?;
-    let obj = parsed.as_object().ok_or("function signature must be an object")?;
+    let obj = parsed
+        .as_object()
+        .ok_or("function signature must be an object")?;
 
     let parse_param = |p: &facet_value::Value| -> std::result::Result<Parameter, String> {
         let po = p.as_object().ok_or("each parameter must be an object")?;
@@ -200,7 +204,10 @@ fn function_signature_from_json(
         Ok(Parameter {
             name: pname,
             ty,
-            allow_null: po.get("allowNull").and_then(|v| v.as_bool()).unwrap_or(false),
+            allow_null: po
+                .get("allowNull")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             // Functions over an unknown argument default to an unknown result.
             allow_unknown: false,
             description: po
@@ -360,15 +367,19 @@ async fn call_with_ctx(
             .map_err(|e| handler_err(op, e))?
     };
     let cancelled = ctx.is_cancelled();
-    let input =
-        format!(r#"{{"ctx":{{"private":{private_json},"cancelled":{cancelled}}},"value":{value_json}}}"#);
+    let input = format!(
+        r#"{{"ctx":{{"private":{private_json},"cancelled":{cancelled}}},"value":{value_json}}}"#
+    );
 
     // Race the JS call against cancellation so `StopProvider` aborts the dispatch
     // promptly (the JS handler keeps running but its result is abandoned),
     // matching the Rust `Ctx::cancelled` semantics.
     let cancel = ctx.cancellation();
     let call = async {
-        let promise = handler.call_async(Ok(input)).await.map_err(|e| handler_err(op, e))?;
+        let promise = handler
+            .call_async(Ok(input))
+            .await
+            .map_err(|e| handler_err(op, e))?;
         promise.await.map_err(|e| handler_err(op, e))
     };
     let out = match cancel.run_until_cancelled(call).await {
@@ -421,6 +432,7 @@ struct JsResource {
     upgrade: Handler,
     validate: Handler,
     modify_plan: Handler,
+    move_state: Handler,
 }
 
 /// Serialize a [`Value`] for a ctx-threaded handler call, mapping the codec error
@@ -522,6 +534,36 @@ impl DynResource for JsResource {
         let out = call_handler(&self.modify_plan, &input, "modify_plan").await?;
         parse_plan_modifications(&out).map_err(|e| handler_err("modify_plan", e))
     }
+
+    async fn move_state(
+        &self,
+        source_type_name: String,
+        source_state: Value,
+    ) -> std::result::Result<Value, Diagnostics> {
+        // The handler sees `{ sourceTypeName, sourceState }`; the source state is
+        // the *source* resource's raw stored state, decoded untyped (its schema may
+        // be foreign), so it is forwarded as-is. The handler maps it onto this
+        // resource's model, decoded back under `self.ty`. Threaded through the ctx
+        // envelope (the service dispatches via its ctx-installing `run` helper).
+        let input = Value::Object(
+            [
+                (
+                    "sourceTypeName".to_string(),
+                    Value::String(source_type_name),
+                ),
+                ("sourceState".to_string(), source_state),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let out = call_with_ctx(
+            &self.move_state,
+            value_json(&input, "move_state")?,
+            "move_state",
+        )
+        .await?;
+        json_to_value(&out, &self.ty).map_err(|e| handler_err("move_state", e))
+    }
 }
 
 /// A data source whose read is one async JS callback. Singular vs plural is
@@ -536,8 +578,12 @@ struct JsDataSource {
 #[async_trait]
 impl DynDataSource for JsDataSource {
     async fn read(&self, config: Value) -> std::result::Result<Value, Diagnostics> {
-        let out = call_with_ctx(&self.read, value_json(&config, "data source read")?, "data source read")
-            .await?;
+        let out = call_with_ctx(
+            &self.read,
+            value_json(&config, "data source read")?,
+            "data source read",
+        )
+        .await?;
         json_to_value(&out, &self.ty).map_err(|e| handler_err("data source read", e))
     }
 
@@ -701,7 +747,9 @@ impl DynFunction for JsFunction {
             .call_async(Ok(input))
             .await
             .map_err(|e| FunctionError::new(e.to_string()))?;
-        let out = promise.await.map_err(|e| FunctionError::new(e.to_string()))?;
+        let out = promise
+            .await
+            .map_err(|e| FunctionError::new(e.to_string()))?;
         json_to_value(&out, &self.return_ty).map_err(FunctionError::new)
     }
 }
@@ -832,6 +880,7 @@ impl Provider {
         upgrade: ThreadsafeFunction<String, Promise<String>>,
         validate: ThreadsafeFunction<String, Promise<String>>,
         modify_plan: ThreadsafeFunction<String, Promise<String>>,
+        move_state: ThreadsafeFunction<String, Promise<String>>,
     ) -> Result<()> {
         let block = block_from_schema_json(&schema_json).map_err(napi_err)?;
         let ty = block.cty_type();
@@ -849,6 +898,7 @@ impl Provider {
                 upgrade,
                 validate,
                 modify_plan,
+                move_state,
             }),
         });
         Ok(())
