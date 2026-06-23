@@ -10,18 +10,19 @@
     };
   };
 
-  outputs =
-    {
-      self,
-      nixpkgs,
-      flake-utils,
-      rust-overlay,
-    }:
+  outputs = {
+    self,
+    nixpkgs,
+    flake-utils,
+    rust-overlay,
+  }:
     flake-utils.lib.eachDefaultSystem (
-      system:
-      let
-        overlays = [ (import rust-overlay) ];
-        pkgs = import nixpkgs { inherit system overlays; };
+      system: let
+        overlays = [(import rust-overlay)];
+        pkgs = import nixpkgs {
+          inherit system overlays;
+          config.allowUnfree = true;
+        };
 
         # Up-to-date stable Rust toolchain with the components we develop against.
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
@@ -32,8 +33,7 @@
             "rustfmt"
           ];
         };
-      in
-      {
+      in {
         devShells.default = pkgs.mkShell {
           name = "tofu-sdk-rs";
 
@@ -55,6 +55,7 @@
 
             # interop / debugging against real Terraform/OpenTofu
             opentofu
+            terraform
 
             # JS toolchain for the @tofu-sdk/core Node binding (packages/tofu-sdk).
             # `napi build` shells out to cargo, so node/pnpm must share this shell
@@ -75,6 +76,7 @@
             echo "  cargo:  $(cargo --version)"
             echo "  protoc: $(protoc --version)"
             echo "  tofu:   $(tofu version 2>/dev/null | head -1)"
+            echo "  tf:     $(terraform version 2>/dev/null | head -1)"
             echo "  node:   $(node --version)  pnpm: $(pnpm --version)"
           '';
         };

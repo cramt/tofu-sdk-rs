@@ -176,6 +176,51 @@ new Provider()
       // A real provider would revoke the token here.
     },
   })
+  // A list resource: enumerate existing buckets matching a query prefix. Shares
+  // the `aws_s3_bucket` type name with the managed resource; each result is
+  // projected to the resource's `name` identity. Driven by `terraform query`.
+  .listResource("aws_s3_bucket", {
+    schema: Bucket,
+    forceNew: ["name"],
+    computed: ["arn", "region"],
+    identity: ["name"],
+    config: z.object({ prefix: z.string().optional() }),
+    async list(query) {
+      const prefix = query.prefix ?? "team";
+      return [`${prefix}-a`, `${prefix}-b`].map((name) => ({
+        displayName: name,
+        resource: { name, arn: `${ARN_PREFIX}${name}`, region },
+      }));
+    },
+  })
+  // A state store: an in-memory Terraform backend keyed by state id. A real one
+  // would talk to S3/GCS/etc.; this keeps state in a Map for the duration of the
+  // provider process.
+  .stateStore("inmem", {
+    schema: z.object({}),
+    async configure() {
+      const states = new Map();
+      let counter = 0;
+      return {
+        async readState(id) {
+          return states.get(id) ?? null;
+        },
+        async writeState(id, data) {
+          states.set(id, data);
+        },
+        async lock() {
+          return `lock-${++counter}`;
+        },
+        async unlock() {},
+        async states() {
+          return [...states.keys()];
+        },
+        async deleteState(id) {
+          states.delete(id);
+        },
+      };
+    },
+  })
   .serve()
   .catch((err) => {
     console.error("provider failed:", err);

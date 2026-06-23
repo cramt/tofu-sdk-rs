@@ -1248,9 +1248,41 @@ impl tfplugin6::provider_server::Provider for ProviderService {
 
     unimplemented_unary! {
         generate_resource_config => generate_resource_config,
-        validate_list_resource_config => validate_list_resource_config,
         plan_action => plan_action,
         validate_action_config => validate_action_config,
+    }
+
+    async fn validate_list_resource_config(
+        &self,
+        request: Request<tfplugin6::validate_list_resource_config::Request>,
+    ) -> Result<Response<tfplugin6::validate_list_resource_config::Response>, Status> {
+        use tfplugin6::validate_list_resource_config::Response as Resp;
+        let req = request.into_inner();
+        tracing::debug!(type_name = %req.type_name, "ValidateListResourceConfig");
+
+        let (Some(schema), Some(handler)) = (
+            self.provider.list_resource_schema(&req.type_name),
+            self.provider.list_resource_handler(&req.type_name),
+        ) else {
+            return Ok(Response::new(Resp {
+                diagnostics: unknown_list_resource(&req.type_name),
+            }));
+        };
+        let config_ty = schema.config.cty_type();
+        let config = match decode_dynamic(&req.config, &config_ty) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to decode list config", e.to_string()),
+                }))
+            }
+        };
+        let (diags, outs) = self
+            .run_diags("validate list resource config", handler.validate(config))
+            .await;
+        Ok(Response::new(Resp {
+            diagnostics: diags_with_warnings(diags, outs),
+        }))
     }
 
     // --- Provider-defined functions ----------------------------------------

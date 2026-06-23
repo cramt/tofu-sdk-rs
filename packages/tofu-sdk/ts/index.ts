@@ -84,6 +84,25 @@ interface RawProvider {
     validate: RawHandler,
   ): void;
   function(name: string, signatureJson: string, call: RawHandler): void;
+  listResource(
+    typeName: string,
+    configJson: string,
+    objectJson: string,
+    list: RawHandler,
+    validate: RawHandler,
+  ): void;
+  stateStore(
+    typeName: string,
+    schemaJson: string,
+    configure: RawHandler,
+    validate: RawHandler,
+    read: RawHandler,
+    write: RawHandler,
+    lock: RawHandler,
+    unlock: RawHandler,
+    states: RawHandler,
+    del: RawHandler,
+  ): void;
   serve(): Promise<void>;
 }
 
@@ -273,6 +292,74 @@ export interface Ephemeral<S extends z.ZodObject<z.ZodRawShape>> extends Disposi
   /** Tear the resource down. Receives the stashed handle. */
   close?(handle: string): Promise<void>;
   /** Validate the configuration, returning diagnostics (or nothing). */
+  validate?: Validate<z.infer<S>>;
+}
+
+/** One result of a list query: the managed-resource model plus a display label. */
+export interface ListItem<M> {
+  /** A human-readable label for the instance (shown in plan/query output). */
+  displayName: string;
+  /** The listed instance as the managed resource's model; the runtime projects
+   * its identity (and, on request, the full object). Must carry known identity
+   * fields. */
+  resource: M;
+}
+
+/**
+ * A **list resource**: a queryable enumeration of existing instances of the
+ * managed resource of the same `typeName`. `schema` is the managed resource's
+ * model (and **must** declare an identity — `.meta({ identity: true })` or the
+ * `identity: [...]` array — since each result is projected to an identity);
+ * `config` is the `list {}` query block. The Rust analog of the `ListResource`
+ * trait. Driven by `terraform query`.
+ */
+export interface ListResource<
+  S extends z.ZodObject<z.ZodRawShape>,
+  C extends z.ZodObject<z.ZodRawShape>,
+> extends Dispositions<S> {
+  /** The managed resource's model (shared with the registered resource). */
+  schema: S;
+  /** The query/filter inputs for the `list {}` block. */
+  config: C;
+  /** Enumerate the instances matching `query`. */
+  list(query: z.infer<C>, ctx: HandlerCtx): Promise<ListItem<z.infer<S>>[]>;
+  /** Validate the query config, returning diagnostics (or nothing). */
+  validate?: Validate<z.infer<C>>;
+}
+
+/**
+ * The connected backend of a {@link StateStore}: the byte- and lock-level
+ * operations over named states ("workspaces"), each keyed by a `stateId`. The
+ * protocol passes only the `stateId` (and, for writes, the data) — never the
+ * config again — so a real backend captures its connection from `configure`.
+ */
+export interface StateBackend {
+  /** Read the full state for `stateId`; `null`/`""` denotes an absent state. */
+  readState(stateId: string): Promise<string | null>;
+  /** Write the full state for `stateId`, replacing any prior state. */
+  writeState(stateId: string, data: string): Promise<void>;
+  /** Acquire a lock for `operation` (e.g. `"plan"`), returning a lock id. */
+  lock(stateId: string, operation: string): Promise<string>;
+  /** Release the lock `lockId` for `stateId`. */
+  unlock(stateId: string, lockId: string): Promise<void>;
+  /** Enumerate the identifiers of every held state ("workspace"). */
+  states(): Promise<string[]>;
+  /** Delete the state `stateId` entirely. */
+  deleteState(stateId: string): Promise<void>;
+}
+
+/**
+ * A **state store**: a provider-defined Terraform backend. `configure` turns the
+ * decoded config block into a connected {@link StateBackend}; the backend's
+ * methods then perform the per-`stateId` byte/lock operations. The Rust analog of
+ * the `StateStore` + `StateBackend` trait split.
+ */
+export interface StateStore<S extends z.ZodObject<z.ZodRawShape>> {
+  /** The backend's configuration block. */
+  schema: S;
+  /** Connect the backend from its decoded config (runs on ConfigureStateStore). */
+  configure(config: z.infer<S>): Promise<StateBackend>;
+  /** Validate the config, returning diagnostics (or nothing). Runs before configure. */
   validate?: Validate<z.infer<S>>;
 }
 
@@ -717,6 +804,92 @@ export class Provider {
       renew,
       close,
       validateAdapter(def.validate, def.schema),
+    );
+    return this;
+  }
+
+  /**
+   * Register a list resource under `typeName`: a queryable enumeration of the
+   * existing instances of the managed resource of the same name. Driven by
+   * `terraform query`. The model `schema` must declare an identity.
+   */
+  listResource<S extends z.ZodObject<z.ZodRawShape>, C extends z.ZodObject<z.ZodRawShape>>(
+    typeName: string,
+    def: ListResource<S, C>,
+  ): this {
+    const list = ctxAdapt<z.infer<C>, ListItem<z.infer<S>>[]>(def.config, async (query, ctx) => {
+      const items = await def.list(query, ctx);
+      return items.map((item, i) => ({
+        displayName: item.displayName,
+        resource: validateOut(def.schema, item.resource, `list resource ${typeName}[${i}]`),
+      }));
+    });
+    this.raw.listResource(
+      typeName,
+      schemaJson(def.config),
+      schemaJson(def.schema, def),
+      list,
+      validateAdapter(def.validate, def.config),
+    );
+    return this;
+  }
+
+  /**
+   * Register a state store (Terraform backend) under `typeName`. `configure`
+   * connects the {@link StateBackend} the byte/lock operations then route to.
+   */
+  stateStore<S extends z.ZodObject<z.ZodRawShape>>(typeName: string, def: StateStore<S>): this {
+    let backend: StateBackend | undefined;
+    const need = (): StateBackend => {
+      if (!backend) throw new Error(`state store "${typeName}" is not configured`);
+      return backend;
+    };
+    const configure = adapt(async (cfg: z.infer<S>) => {
+      backend = await def.configure(cfg);
+      return null;
+    }, def.schema);
+    const read: RawHandler = async (err, input) => {
+      if (err) throw err;
+      const result = await need().readState(JSON.parse(input) as string);
+      return JSON.stringify(result ?? null);
+    };
+    const write: RawHandler = async (err, input) => {
+      if (err) throw err;
+      const { stateId, data } = JSON.parse(input) as { stateId: string; data: string };
+      await need().writeState(stateId, data);
+      return "null";
+    };
+    const lock: RawHandler = async (err, input) => {
+      if (err) throw err;
+      const { stateId, operation } = JSON.parse(input) as { stateId: string; operation: string };
+      return JSON.stringify(await need().lock(stateId, operation));
+    };
+    const unlock: RawHandler = async (err, input) => {
+      if (err) throw err;
+      const { stateId, lockId } = JSON.parse(input) as { stateId: string; lockId: string };
+      await need().unlock(stateId, lockId);
+      return "null";
+    };
+    const states: RawHandler = async (err) => {
+      if (err) throw err;
+      return JSON.stringify(await need().states());
+    };
+    const del: RawHandler = async (err, input) => {
+      if (err) throw err;
+      await need().deleteState(JSON.parse(input) as string);
+      return "null";
+    };
+    this.raw.stateStore(
+      typeName,
+      schemaJson(def.schema),
+      configure,
+      validateAdapter(def.validate, def.schema),
+      read,
+      write,
+      lock,
+      unlock,
+      states,
+      del,
     );
     return this;
   }

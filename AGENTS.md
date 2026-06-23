@@ -27,8 +27,11 @@ nix develop
 ```
 
 It provides Rust 1.96, `protoc` (with `PROTOC` set, for the gRPC codegen),
-OpenTofu 1.12 (`tofu`), and cargo extras (`nextest`, `expand`, `llvm-cov`).
-`.envrc` (`use flake`) auto-loads it with direnv.
+OpenTofu 1.12 (`tofu`), **HashiCorp Terraform 1.15 (`terraform`)** — a second
+interop engine for the newer protocol surfaces (list resources / state stores /
+resource identity) that OpenTofu 1.12 drops from `providers schema -json`; it is
+BSL-licensed, so the flake sets `allowUnfree` — and cargo extras (`nextest`,
+`expand`, `llvm-cov`). `.envrc` (`use flake`) auto-loads it with direnv.
 
 Before committing, keep it green:
 
@@ -127,9 +130,18 @@ added — the runtime projects identity straight off the returned `Value` via th
 identity attribute names (`known_identity_data`), so the seam stays value-only.
 Verified by `test/e2e.test.mjs`'s "projects a resource identity into state" (the
 engine drops identity from `providers schema -json` in 1.12.1, so the test asserts
-the identity `tofu show -json` records in state). **Still unimplemented in the
-binding:** `DynListResource` and `DynStateStore` (both new primitives; neither is
-engine-testable in 1.12.1). The ephemeral seam is the
+the identity `tofu show -json` records in state). **List resources** and **state
+stores** are wired too (`JsListResource`/`dyn_list_resource`,
+`JsStateStore`/`JsStateBackend`/`dyn_state_store`): TS `listResource` (model schema
+→ object type + identity, a `config` Zod object → the `list {}` query block) and
+`stateStore` (`configure` → a `StateBackend` of byte/lock ops). **The binding is
+now at full dynamic-seam parity.** These newer surfaces are verified against
+**HashiCorp Terraform 1.15** (`test/e2e-tf.test.mjs`) — it surfaces
+`list_resource_schemas`/`state_store_schemas`/`resource_identity_schemas` in
+`providers schema -json` and drives `terraform query`, all of which OpenTofu 1.12.1
+drops; the dev shell ships both engines. Driving `terraform query` also required
+the runtime to implement **`ValidateListResourceConfig`** (`service.rs`; was an
+`unimplemented_unary!` stub), which the engine calls before listing. The ephemeral seam is the
 one place the binding reaches the ambient `Ctx` (via the public `current_ctx()`):
 `open` returns `{ result, private?, renewAt? }` and the addon writes private/
 renewAt onto the ctx (the service reads them back), while `renew`/`close` receive
@@ -514,12 +526,18 @@ published as the list's own schema). Registered with
   fine for the bounded result sets list resources return.
 - **The dynamic seam (`dyn_list_resource`) takes the identity + object type
   explicitly** (a hand-built frontend has no `Model` to harvest them from). The
-  Node binding doesn't implement `DynListResource` yet — adding the new erased
-  trait doesn't churn it (it just doesn't register list resources).
-- **Engine can't see it yet:** OpenTofu 1.12.1's `providers schema -json` drops
-  `list_resource_schemas`, so there is no `tofu test`/schema-contract layer for
-  list resources — verification is the direct service-call tests plus a
-  protocol-level `GetProviderSchema` assertion (as with `MoveResourceState`).
+  Node binding implements it (`JsListResource`): the TS `listResource` passes the
+  model schema (→ object type + identity via `identity_from_schema_json`) and a
+  `config` query block.
+- **`ValidateListResourceConfig` is implemented** (`service.rs`; was an
+  `unimplemented_unary!` stub) — the engine calls it before listing, so it was
+  required to drive `terraform query`. It decodes the config under the list
+  schema's `config` block and dispatches `DynListResource::validate`.
+- **Engine coverage:** OpenTofu 1.12.1's `providers schema -json` drops
+  `list_resource_schemas`, but **HashiCorp Terraform 1.15** surfaces it *and*
+  drives the `list {}` query via `terraform query` — so the TS binding's list
+  resource has a real engine test (`test/e2e-tf.test.mjs`), on top of the Rust
+  direct service-call tests and the protocol-level `GetProviderSchema` assertion.
 
 **State stores** (`state_store.rs`) are provider-defined Terraform *backends* — a
 separate primitive again, with their own IR (`StateStoreSchema`,
@@ -554,11 +572,15 @@ config model is a plain `#[derive(Facet)]` struct with no name marker and the
   public constructor — tests drive the core with `tokio_stream::iter`.
 - **Both traits erase to `DynStateStore`/`DynStateBackend`** (the value seam);
   `dyn_state_store` lets a non-Rust frontend register one. The Node binding
-  doesn't implement them yet — the new erased traits don't churn it.
-- **Engine layer deferred** for the same reason as list resources: OpenTofu
-  1.12.1's `providers schema -json` drops `state_store_schemas`, so verification
-  is the direct service-call tests (`state_store_*`) plus the protocol-level
-  `GetProviderSchema`/`GetMetadata` assertion.
+  implements them: TS `stateStore`'s `configure` returns a `StateBackend` whose
+  byte/lock methods the addon (`JsStateStore`/`JsStateBackend`) routes to over
+  plain JSON (state bytes cross as UTF-8 strings).
+- **Engine coverage:** OpenTofu 1.12.1's `providers schema -json` drops
+  `state_store_schemas`, but **HashiCorp Terraform 1.15** surfaces it — so the TS
+  binding's state store has a schema-contract engine test (`test/e2e-tf.test.mjs`),
+  on top of the Rust direct service-call tests (`state_store_*`, which cover the
+  full byte/lock lifecycle) and the protocol-level `GetProviderSchema`/`GetMetadata`
+  assertion.
 
 ## Testing approach
 

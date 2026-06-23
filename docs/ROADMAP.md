@@ -627,15 +627,24 @@ across resource types via a moved block" — also the **first engine-level (`tof
 test of `MoveResourceState`** in the repo), and **resource identity** (an
 `identity` field disposition → `IdentitySchema` over the new
 `dyn_resource_with_identity` seam; the runtime projects identity off the returned
-`Value`, so no handler method is added). The identity test asserts `tofu show
--json` records the projected identity — the engine can't surface identity in
-`providers schema -json` (1.12.1 drops it, like list resources / state stores), so
-the in-state projection stands in.
+`Value`, so no handler method is added; verified by `test/e2e.test.mjs`'s
+"projects a resource identity into state"), **list resources** (`listResource` over
+`dyn_list_resource` — the model `schema` supplies object type + identity, a `config`
+Zod object the `list {}` query block; driven end-to-end by `terraform query` in
+`test/e2e-tf.test.mjs`), and **state stores** (`stateStore` over `dyn_state_store`:
+a `configure` returning a `StateBackend` of byte/lock ops, published as a backend
+schema).
 
-**Still unimplemented in the binding** (the Rust core supports each):
-1. **State stores** + **list resources** — new primitives over `dyn_state_store` /
-   `dyn_list_resource` (addon + TS; the seams exist). Not engine-testable yet
-   (OpenTofu 1.12.1 drops both schemas from `providers schema -json`).
+**The binding is now at full parity** — every dynamic-seam primitive the Rust core
+exposes is wired. The newer surfaces (list resources, state stores, resource
+identity) are verified against **HashiCorp Terraform 1.15** (`test/e2e-tf.test.mjs`),
+which surfaces `list_resource_schemas` / `state_store_schemas` / `resource_identity_
+schemas` in `providers schema -json` and can drive `terraform query` — all of which
+OpenTofu 1.12.1 drops. The dev shell ships both engines (`tofu` for the rest,
+`terraform` for these). Implementing `terraform query` end-to-end also required the
+runtime to implement **`ValidateListResourceConfig`** (`service.rs`; previously an
+`unimplemented_unary!` stub), which the engine calls before listing — so the typed
+Rust list-resource path gained engine coverage too.
 
 **Normalization caveat:** diff suppression via `keepPrior` is cleanest for
 computed / diff-stable values; for a plain required input, Terraform core's

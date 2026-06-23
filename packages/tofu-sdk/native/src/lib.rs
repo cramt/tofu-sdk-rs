@@ -29,8 +29,9 @@ use terraform_ir::{
 };
 use terraform_runtime::{
     async_trait, current_ctx, serve as serve_provider, Diag, Diagnostics, DynConfigure,
-    DynDataSource, DynEphemeral, DynFunction, DynResource, DynValidateConfig, FunctionError, Path,
-    PlanModifications, Provider as RtProvider,
+    DynDataSource, DynEphemeral, DynFunction, DynListItem, DynListResource, DynResource,
+    DynStateBackend, DynStateStore, DynValidateConfig, FunctionError, Path, PlanModifications,
+    Provider as RtProvider,
 };
 use terraform_value::{Type, Value};
 
@@ -806,6 +807,220 @@ impl DynFunction for JsFunction {
     }
 }
 
+/// A list resource backed by JS handlers. It enumerates existing instances of the
+/// managed resource of the same type name; each result carries the resource model
+/// (typed by `object_ty`) from which the runtime projects identity and (on
+/// request) the full object.
+struct JsListResource {
+    /// The managed resource's object type, used to type each listed instance.
+    object_ty: Type,
+    list: Handler,
+    validate: Handler,
+}
+
+#[async_trait]
+impl DynListResource for JsListResource {
+    async fn list(&self, config: Value) -> std::result::Result<Vec<DynListItem>, Diagnostics> {
+        // The service installs the ctx, so `list` rides the ctx envelope (warnings /
+        // cancellation). The handler returns its items as the envelope `value`:
+        // `[ { displayName, resource }, … ]`.
+        let out = call_with_ctx(&self.list, value_json(&config, "list")?, "list").await?;
+        let parsed: facet_value::Value =
+            facet_json::from_slice(out.as_bytes()).map_err(|e| handler_err("list", e))?;
+        let items = parsed
+            .as_array()
+            .ok_or_else(|| handler_err("list", "list must return an array of items"))?;
+        let mut results = Vec::with_capacity(items.len());
+        for item in items {
+            let io = item
+                .as_object()
+                .ok_or_else(|| handler_err("list", "each list item must be an object"))?;
+            let display_name = io
+                .get("displayName")
+                .and_then(|v| v.as_string())
+                .map(|s| s.as_str().to_string())
+                .unwrap_or_default();
+            let resource = io
+                .get("resource")
+                .ok_or_else(|| handler_err("list", "list item is missing `resource`"))?;
+            let resource_json =
+                facet_json::to_string(resource).map_err(|e| handler_err("list", e))?;
+            let object = json_to_value(&resource_json, &self.object_ty)
+                .map_err(|e| handler_err("list", e))?;
+            results.push(DynListItem {
+                display_name,
+                object,
+            });
+        }
+        Ok(results)
+    }
+
+    async fn validate(&self, config: Value) -> Diagnostics {
+        match call_handler(&self.validate, &config, "list validate").await {
+            Ok(out) => parse_diagnostics(&out),
+            Err(diags) => diags,
+        }
+    }
+}
+
+/// Call a JS handler whose input and output are plain JSON strings (no cty
+/// marshalling) — used for the state-store byte/lock operations.
+async fn call_json(
+    handler: &Handler,
+    input: String,
+    op: &str,
+) -> std::result::Result<String, Diagnostics> {
+    let promise = handler
+        .call_async(Ok(input))
+        .await
+        .map_err(|e| handler_err(op, e))?;
+    promise.await.map_err(|e| handler_err(op, e))
+}
+
+/// The six byte/lock backend handlers, shared into a [`JsStateBackend`] (via an
+/// `Arc`) when the store is configured.
+struct JsBackendHandlers {
+    read: Handler,
+    write: Handler,
+    lock: Handler,
+    unlock: Handler,
+    states: Handler,
+    delete: Handler,
+}
+
+/// A provider-defined state store (Terraform backend) backed by JS handlers. The
+/// `configure` handler sets up the JS-side connection; the byte/lock operations
+/// then route to it through the [`JsStateBackend`].
+struct JsStateStore {
+    configure: Handler,
+    validate: Handler,
+    backend: Arc<JsBackendHandlers>,
+}
+
+#[async_trait]
+impl DynStateStore for JsStateStore {
+    async fn validate(&self, config: Value) -> Diagnostics {
+        match call_handler(&self.validate, &config, "state store validate").await {
+            Ok(out) => parse_diagnostics(&out),
+            Err(diags) => diags,
+        }
+    }
+
+    async fn configure(
+        &self,
+        config: Value,
+    ) -> std::result::Result<Arc<dyn DynStateBackend>, Diagnostics> {
+        // Running configure JS-side stashes the connection the op handlers close
+        // over; the returned backend simply routes to those handlers.
+        call_handler(&self.configure, &config, "state store configure").await?;
+        Ok(Arc::new(JsStateBackend {
+            h: Arc::clone(&self.backend),
+        }))
+    }
+}
+
+/// The connected backend: each method routes to its JS handler over plain JSON.
+/// State bytes cross the boundary as UTF-8 strings (Terraform state is JSON text).
+struct JsStateBackend {
+    h: Arc<JsBackendHandlers>,
+}
+
+/// JSON-encode a string for embedding in a request object (quotes + escaping).
+fn json_str(s: &str, op: &str) -> std::result::Result<String, Diagnostics> {
+    facet_json::to_string(&s.to_string()).map_err(|e| handler_err(op, e))
+}
+
+#[async_trait]
+impl DynStateBackend for JsStateBackend {
+    async fn read_state(&self, state_id: String) -> std::result::Result<Vec<u8>, Diagnostics> {
+        let out = call_json(
+            &self.h.read,
+            json_str(&state_id, "read_state")?,
+            "read_state",
+        )
+        .await?;
+        let parsed: facet_value::Value =
+            facet_json::from_slice(out.as_bytes()).map_err(|e| handler_err("read_state", e))?;
+        // A JSON string is the state content; null/absent is an empty state.
+        Ok(parsed
+            .as_string()
+            .map(|s| s.as_str().as_bytes().to_vec())
+            .unwrap_or_default())
+    }
+
+    async fn write_state(
+        &self,
+        state_id: String,
+        data: Vec<u8>,
+    ) -> std::result::Result<(), Diagnostics> {
+        let content = String::from_utf8_lossy(&data).into_owned();
+        let input = format!(
+            r#"{{"stateId":{},"data":{}}}"#,
+            json_str(&state_id, "write_state")?,
+            json_str(&content, "write_state")?
+        );
+        call_json(&self.h.write, input, "write_state").await?;
+        Ok(())
+    }
+
+    async fn lock(
+        &self,
+        state_id: String,
+        operation: String,
+    ) -> std::result::Result<String, Diagnostics> {
+        let input = format!(
+            r#"{{"stateId":{},"operation":{}}}"#,
+            json_str(&state_id, "lock")?,
+            json_str(&operation, "lock")?
+        );
+        let out = call_json(&self.h.lock, input, "lock").await?;
+        let parsed: facet_value::Value =
+            facet_json::from_slice(out.as_bytes()).map_err(|e| handler_err("lock", e))?;
+        Ok(parsed
+            .as_string()
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_default())
+    }
+
+    async fn unlock(
+        &self,
+        state_id: String,
+        lock_id: String,
+    ) -> std::result::Result<(), Diagnostics> {
+        let input = format!(
+            r#"{{"stateId":{},"lockId":{}}}"#,
+            json_str(&state_id, "unlock")?,
+            json_str(&lock_id, "unlock")?
+        );
+        call_json(&self.h.unlock, input, "unlock").await?;
+        Ok(())
+    }
+
+    async fn states(&self) -> std::result::Result<Vec<String>, Diagnostics> {
+        let out = call_json(&self.h.states, "null".to_string(), "states").await?;
+        let parsed: facet_value::Value =
+            facet_json::from_slice(out.as_bytes()).map_err(|e| handler_err("states", e))?;
+        Ok(parsed
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_string().map(|s| s.as_str().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn delete_state(&self, state_id: String) -> std::result::Result<(), Diagnostics> {
+        call_json(
+            &self.h.delete,
+            json_str(&state_id, "delete_state")?,
+            "delete_state",
+        )
+        .await?;
+        Ok(())
+    }
+}
+
 // --- the JS-facing provider -------------------------------------------------
 
 /// A registered resource, ready to hand to the builder at serve time.
@@ -839,6 +1054,23 @@ struct FunctionReg {
     handler: Arc<dyn DynFunction>,
 }
 
+/// A registered list resource: the query `config` block, plus the identity and
+/// object type harvested from the managed resource's schema.
+struct ListResourceReg {
+    name: String,
+    config: Block,
+    identity: IdentitySchema,
+    object_type: Type,
+    handler: Arc<dyn DynListResource>,
+}
+
+/// A registered state store: its config `block` and erased handler.
+struct StateStoreReg {
+    name: String,
+    block: Block,
+    handler: Arc<dyn DynStateStore>,
+}
+
 /// The provider-level config block, its configure handler, and an optional
 /// validate handler (run before configure).
 struct ProviderConfigReg {
@@ -854,6 +1086,8 @@ pub struct Provider {
     data_sources: Vec<DataSourceReg>,
     ephemerals: Vec<EphemeralReg>,
     functions: Vec<FunctionReg>,
+    list_resources: Vec<ListResourceReg>,
+    state_stores: Vec<StateStoreReg>,
     config: Option<ProviderConfigReg>,
 }
 
@@ -873,6 +1107,8 @@ impl Provider {
             data_sources: Vec::new(),
             ephemerals: Vec::new(),
             functions: Vec::new(),
+            list_resources: Vec::new(),
+            state_stores: Vec::new(),
             config: None,
         }
     }
@@ -1013,6 +1249,85 @@ impl Provider {
         Ok(())
     }
 
+    /// Register a list resource under `type_name`: a queryable enumeration of
+    /// existing instances of the managed resource of the same name. `config_json`
+    /// describes the `list {}` query block; `object_json` is the managed resource's
+    /// own schema, from which the object type and the identity schema (its
+    /// `identity`-flagged attributes) are harvested. The `list` handler returns the
+    /// matching instances; `validate` checks the query config.
+    #[napi]
+    pub fn list_resource(
+        &mut self,
+        type_name: String,
+        config_json: String,
+        object_json: String,
+        list: ThreadsafeFunction<String, Promise<String>>,
+        validate: ThreadsafeFunction<String, Promise<String>>,
+    ) -> Result<()> {
+        let config = block_from_schema_json(&config_json).map_err(napi_err)?;
+        let object_block = block_from_schema_json(&object_json).map_err(napi_err)?;
+        let object_type = object_block.cty_type();
+        let identity = identity_from_schema_json(&object_json)
+            .map_err(napi_err)?
+            .ok_or_else(|| {
+                napi_err(format!(
+                    "list resource \"{type_name}\" needs an identity: mark at least one model \
+                     attribute `identity` (the listed instances are projected to identities)"
+                ))
+            })?;
+        self.list_resources.push(ListResourceReg {
+            name: type_name,
+            config,
+            identity,
+            object_type: object_type.clone(),
+            handler: Arc::new(JsListResource {
+                object_ty: object_type,
+                list,
+                validate,
+            }),
+        });
+        Ok(())
+    }
+
+    /// Register a state store (Terraform backend) under `type_name`: `schema_json`
+    /// is its config block; `configure` connects the backend; `validate` checks the
+    /// config; and the six byte/lock handlers (`read`/`write`/`lock`/`unlock`/
+    /// `states`/`delete`) perform the per-`state_id` operations.
+    #[napi]
+    #[allow(clippy::too_many_arguments)]
+    pub fn state_store(
+        &mut self,
+        type_name: String,
+        schema_json: String,
+        configure: ThreadsafeFunction<String, Promise<String>>,
+        validate: ThreadsafeFunction<String, Promise<String>>,
+        read: ThreadsafeFunction<String, Promise<String>>,
+        write: ThreadsafeFunction<String, Promise<String>>,
+        lock: ThreadsafeFunction<String, Promise<String>>,
+        unlock: ThreadsafeFunction<String, Promise<String>>,
+        states: ThreadsafeFunction<String, Promise<String>>,
+        delete: ThreadsafeFunction<String, Promise<String>>,
+    ) -> Result<()> {
+        let block = block_from_schema_json(&schema_json).map_err(napi_err)?;
+        self.state_stores.push(StateStoreReg {
+            name: type_name,
+            block,
+            handler: Arc::new(JsStateStore {
+                configure,
+                validate,
+                backend: Arc::new(JsBackendHandlers {
+                    read,
+                    write,
+                    lock,
+                    unlock,
+                    states,
+                    delete,
+                }),
+            }),
+        });
+        Ok(())
+    }
+
     /// Serve the provider over the Terraform plugin protocol. Performs the
     /// go-plugin handshake on stdout and runs until SIGTERM, so the returned
     /// promise stays pending for the provider's lifetime.
@@ -1044,6 +1359,19 @@ impl Provider {
         }
         for f in &self.functions {
             builder = builder.dyn_function(f.signature.clone(), Arc::clone(&f.handler));
+        }
+        for l in &self.list_resources {
+            builder = builder.dyn_list_resource(
+                l.name.clone(),
+                l.config.clone(),
+                l.identity.clone(),
+                l.object_type.clone(),
+                Arc::clone(&l.handler),
+            );
+        }
+        for s in &self.state_stores {
+            builder =
+                builder.dyn_state_store(s.name.clone(), s.block.clone(), Arc::clone(&s.handler));
         }
         let provider = builder.build().map_err(napi_err)?;
         serve_provider(provider).await.map_err(napi_err)
