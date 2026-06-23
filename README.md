@@ -153,11 +153,13 @@ impl VariadicFunction for Join {
 
 ## Status
 
-The original 5-phase MVP is complete and has grown well past it: a plain Rust
-struct plus a `Resource` impl is a working provider, exercised end-to-end against
-**real OpenTofu** (`apply` / `plan` / `destroy` / replacement). The full lifecycle
-plus data sources, functions, nested blocks, a handler context, and lossless
-64-bit numbers are in (see below). It is not yet battle-tested in production.
+The SDK implements the **entire tfplugin6 protocol surface** — from the core
+resource lifecycle through ephemeral resources, list resources, state stores,
+resource identity, provider-defined functions, and actions (the last primitive).
+A plain Rust struct plus a `Resource` impl is a working provider, exercised
+end-to-end against **real OpenTofu and Terraform 1.15** (`apply` / `plan` /
+`destroy` / replacement / `query` / actions). A second frontend writes providers
+in **TypeScript** at full parity. It is not yet battle-tested in production.
 
 - **Phase 1 ✅** — reflection → provider IR → `tfplugin6` schema emission
 - **Phase 2 ✅** — `tfplugin6` gRPC server, go-plugin handshake, auto-mTLS,
@@ -257,14 +259,44 @@ plus data sources, functions, nested blocks, a handler context, and lossless
   `PlanAction`, and the server-streaming `InvokeAction`. See the `aws_publish`
   example. This completes the tfplugin6 protocol surface.
 
-### Not yet implemented
+- **Semantic equality / normalization ✅** — *quotient types*, not a diff-suppress
+  closure. Model a value as a newtype whose constructor canonicalizes
+  (`#[facet(opaque, proxy = String)]` with a canonicalizing `TryFrom`) and `==` on
+  the representative is the equality; the planner keeps the prior value when a
+  change stays within the equivalence class. Zero-wiring: `Resource::semantic_equality`
+  auto-harvests the canonicalizers from the model's `SHAPE`. Verified by a service
+  test driving `PlanResourceChange` (a case-only change to a `force_new` attr plans
+  as no-change)
 
-There is no dedicated
-semantic-equality / normalization hook for suppressing spurious diffs — though
-modeling structured data as structured types (sets as sets, nested blocks as
-blocks) plus `cty`'s native unordered-set semantics avoids most of the need.
-Numbers fit `i64`/`u64`/`f64` (no arbitrary precision beyond 64-bit). Not all
-`cty` corner cases are covered.
+- **Cross-type state move ✅** — `Resource::move_state(source_type_name,
+  source_state)` backs `MoveResourceState`, the provider side of a `moved {}` block
+  that crosses resource types; the source state arrives untyped (its schema may be
+  foreign) and the handler maps it onto the target model — engine-verified on the
+  TS side (`moved {}` across types)
+
+- **Resource identity ✅** — `#[facet(terraform::identity)]` marks the attributes
+  forming a resource's stable identity (import-by-identity, cross-config tracking);
+  the runtime projects identity data onto plan/apply/read/import off the returned
+  value. Opt-in — verified by a real `tofu` apply/destroy and by Terraform 1.15's
+  identity schema
+
+- **List resources ✅** — a queryable enumeration of existing instances of the
+  managed resource of the same type name. Implement `ListResource`
+  (`list(config) -> Vec<ListItem<Model>>`) over the resource's `Model` (so identity
+  + object type line up by construction) plus a `Config` query block; registered
+  with `ProviderBuilder::list_resource` / `list_resource_with` (or `dyn_list_resource`).
+  Verified end-to-end by **HashiCorp Terraform 1.15**'s `terraform query`
+
+The SDK now implements the **entire tfplugin6 protocol surface** — the feature
+list above is complete through Actions, the last protocol primitive.
+
+### Known limits
+
+- Numbers fit `i64`/`u64`/`f64` (no arbitrary precision beyond 64-bit) — matching
+  the JSON value layer's own ceiling.
+- `GenerateResourceConfig` (config generation for `plan -generate-config-out`) is
+  the one RPC left stubbed; it is optional and not a capability gap.
+- Not yet battle-tested in production.
 
 ## Workspace layout
 
@@ -279,11 +311,14 @@ Numbers fit `i64`/`u64`/`f64` (no arbitrary precision beyond 64-bit). Not all
 | `terraform-provider` | The public, author-facing facade |
 | `terraform-codec` | `DynamicValue` codec (cty msgpack/JSON) + typed encode/decode |
 | `terraform-macros` | Reserved for convenience derives |
-| `example-aws` | A minimal example provider + the OpenTofu `tofu test` e2e suite |
+| `example-aws` | The reference provider — every primitive — plus the OpenTofu `tofu test` and Terraform 1.15 e2e suites |
+| `example-fs` | A side-effecting provider (writes resource JSON files); subject of the TS iteration-sequence harness |
+| `example-postgres` | A production-shaped template over a real PostgreSQL pool (roles/databases/schemas/tables + data sources); contract suite drives `tofu test` against Dockerized Postgres |
 
-| Package | Role |
-|---------|------|
-| `packages/tofu-sdk` (`@tofu-sdk/core`) | Write providers in **TypeScript** — a napi-rs Node addon over the dynamic seam (`native/`) plus a typed wrapper |
+| Package / dir | Role |
+|---------------|------|
+| `packages/tofu-sdk` (`@tofu-sdk/core`) | Write providers in **TypeScript** — a napi-rs Node addon over the dynamic seam (`native/`) plus a typed Zod-based wrapper (`ts/`) |
+| `harness/` | A TS (Vitest) iteration-sequence harness over `example-fs`: applies ordered config folders into one shared-state workspace and asserts the JSON the provider writes |
 
 ## Writing a provider in TypeScript
 
@@ -382,32 +417,42 @@ await new Provider()
   .serve();
 ```
 
-Covered today, at parity with the Rust frontend: resources (full lifecycle +
-`upgrade`/`import`/`validate` + `modifyPlan`), singular and plural data sources
-(`dataSource` / `dataSourceList`), provider config (with its own `validate`),
-**ephemeral resources**, **provider-defined functions** (`function` /
-`functionVariadic`), nested blocks, sets, every disposition via `.meta()`, the
-handler `ctx` (warnings / private state / cancellation), and semantic-equality
-normalization (a `z.transform` quotient field auto-suppresses diffs). Not yet
-wired to the Node binding: list resources, state stores, resource identity, and
-`moveState`. A complete, *real-backend* example — a Cloudflare provider talking to
-the live `cloudflare` SDK — is in
+**The TypeScript frontend is at full parity with the Rust core** — every
+dynamic-seam primitive is wired: resources (full lifecycle +
+`upgrade`/`import`/`validate` + `modifyPlan` + `moveState`), singular and plural
+data sources (`dataSource` / `dataSourceList`), provider config (with its own
+`validate`), **ephemeral resources**, **provider-defined functions** (`function` /
+`functionVariadic`), **list resources** (`listResource`, driven by `terraform
+query`), **state stores** (`stateStore`), **resource identity** (the `identity`
+disposition), **actions** (`action`, streaming progress via `ctx.progress`),
+nested blocks, sets, every disposition via `.meta()`, the handler `ctx` (warnings /
+private state / cancellation), and semantic-equality normalization (a
+`z.transform` quotient field auto-suppresses diffs). A complete, *real-backend*
+example — a Cloudflare provider talking to the live `cloudflare` SDK — is in
 [`packages/tofu-sdk/examples/cloudflare-provider.ts`](packages/tofu-sdk/examples/cloudflare-provider.ts).
 Build and test with `pnpm build` / `pnpm test` (drives a real `tofu`).
 
 ## Developing
 
-A Nix flake provides the full toolchain (Rust, `protoc`, OpenTofu):
+A Nix flake provides the full toolchain — Rust, `protoc`, **OpenTofu 1.12**
+(`tofu`), **HashiCorp Terraform 1.15** (`terraform`), and the Node toolchain for
+the TypeScript frontend:
 
 ```bash
 nix develop
-cargo test --workspace
+cargo test --workspace                     # Rust + the engine-backed suites
+cd packages/tofu-sdk && pnpm test          # the @tofu-sdk/core binding
 ```
 
-The e2e suite in `example-aws` runs the engine's native `tofu test` framework
-(`tests/tofu/*.tftest.hcl`) plus a schema contract test, driving a real
-`tofu`/`terraform` binary — so it requires one on `PATH` (provided by the dev
-shell).
+The e2e suites drive a **real engine** over the plugin protocol, so one must be on
+`PATH` (the dev shell provides both):
+
+- `example-aws/tests/tofu/*.tftest.hcl` + the schema contract test run against
+  **OpenTofu** (`tofu test`).
+- `example-aws/tests/terraform_engine.rs` runs the newer surfaces — list resources
+  (`terraform query`), state stores, resource identity, and actions — against
+  **Terraform 1.15**, which surfaces schemas OpenTofu 1.12 drops.
+- `packages/tofu-sdk/test/*.test.mjs` drives the TS provider through both engines.
 
 ## License
 

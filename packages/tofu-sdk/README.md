@@ -121,16 +121,22 @@ are available for the Rust build.
 
 ## Status
 
-Early but functional. Resources (CRUD + `force_new` replacement + `import` +
-`version`/`upgrade` state migrations + a resource `validate` hook), provider
-configuration (`config`, with its own `validate` hook), **provider-defined
+**At full parity with the Rust core** — every dynamic-seam primitive is wired.
+Resources (CRUD + `force_new` replacement + `import` + `version`/`upgrade` state
+migrations + a resource `validate` hook + `moveState` for cross-type `moved {}`),
+provider configuration (`config`, with its own `validate` hook), **provider-defined
 functions** (`function`, and `functionVariadic` for a uniform trailing tail —
 pure, called as `provider::p::name(…)`), both singular (`dataSource`) and plural
-(`dataSourceList`) data sources,
-**ephemeral resources** (`ephemeral` — an `open`/`renew`/`close` lifecycle, never
-persisted to state), HCL nested **blocks**, and single-file packaging (the
-`@tofu-sdk/core/tsdown` preset) all work end-to-end against real OpenTofu — see
-`test/e2e.test.mjs`.
+(`dataSourceList`) data sources, **ephemeral resources** (`ephemeral` — an
+`open`/`renew`/`close` lifecycle, never persisted to state), **list resources**
+(`listResource`, driven by `terraform query`), **state stores** (`stateStore` — a
+provider-defined backend), **resource identity** (the `identity` disposition), and
+**actions** (`action` — an imperative operation that streams progress via
+`ctx.progress`), HCL nested **blocks**, and single-file packaging (the
+`@tofu-sdk/core/tsdown` preset). The core lifecycle is verified against real
+OpenTofu (`test/e2e.test.mjs`); the newer surfaces — list resources, state stores,
+identity, actions — against HashiCorp Terraform 1.15 (`test/e2e-tf.test.mjs`),
+which surfaces schemas OpenTofu 1.12 drops.
 
 Resource and data-source handlers receive a **`ctx`** (final argument) — the TS
 analog of Rust's `&mut Ctx`: `ctx.warn(...)` for success-path warnings,
@@ -146,7 +152,6 @@ the TS mirror of Rust's quotient + `Canon::harvest`. (Diff suppression is cleane
 for computed / diff-stable values; for a plain required input, Terraform's
 plan-consistency check still compares the planned value to config.)
 
-Not yet wired up (the Rust core supports these; the Node binding doesn't expose
-them yet): **list resources**, **state stores**, **resource identity**, and
-`move_state`. Also: prebuilt multi-platform addons (the preset inlines the addon
-for the platform you build on).
+Not yet provided: prebuilt multi-platform addons (the `tsdown` preset inlines the
+addon for the platform you build on, so a provider shipped to other platforms
+needs a per-platform build).
