@@ -656,9 +656,12 @@ test of `MoveResourceState`** in the repo), and **resource identity** (an
 "projects a resource identity into state"), **list resources** (`listResource` over
 `dyn_list_resource` — the model `schema` supplies object type + identity, a `config`
 Zod object the `list {}` query block; driven end-to-end by `terraform query` in
-`test/e2e-tf.test.mjs`), and **state stores** (`stateStore` over `dyn_state_store`:
+`test/e2e-tf.test.mjs`), **state stores** (`stateStore` over `dyn_state_store`:
 a `configure` returning a `StateBackend` of byte/lock ops, published as a backend
-schema).
+schema), and **actions** (`action` over `dyn_action`: a `Config` schema +
+`validate`/`plan`/`invoke`, where `invoke` streams progress via the new
+`ctx.progress(...)`; driven end-to-end by a `terraform apply` with an
+`action_trigger` in `test/e2e-tf.test.mjs`).
 
 **The binding is now at full parity** — every dynamic-seam primitive the Rust core
 exposes is wired. The newer surfaces (list resources, state stores, resource

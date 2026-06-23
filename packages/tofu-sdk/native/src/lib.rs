@@ -28,10 +28,10 @@ use terraform_ir::{
     NestingMode, Parameter,
 };
 use terraform_runtime::{
-    async_trait, current_ctx, serve as serve_provider, Diag, Diagnostics, DynConfigure,
+    async_trait, current_ctx, serve as serve_provider, Diag, Diagnostics, DynAction, DynConfigure,
     DynDataSource, DynEphemeral, DynFunction, DynListItem, DynListResource, DynResource,
     DynStateBackend, DynStateStore, DynValidateConfig, FunctionError, Path, PlanModifications,
-    Provider as RtProvider,
+    Provider as RtProvider, Severity,
 };
 use terraform_value::{Type, Value};
 
@@ -462,6 +462,12 @@ async fn call_with_ctx(
             let ws_json = facet_json::to_string(ws).map_err(|e| handler_err(op, e))?;
             for diag in parse_diagnostics(&ws_json) {
                 sink.warning(diag);
+            }
+        }
+        // Action `invoke` progress messages stream back as `InvokeAction` events.
+        if let Some(ps) = ctx_obj.get("progress").and_then(|v| v.as_array()) {
+            for msg in ps.iter().filter_map(|v| v.as_string()) {
+                sink.progress(msg.as_str().to_string());
             }
         }
     }
@@ -1021,6 +1027,49 @@ impl DynStateBackend for JsStateBackend {
     }
 }
 
+/// A provider-defined action backed by JS handlers. The service decodes the
+/// config under the action's block, so the handlers receive an already-typed
+/// value; `invoke` streams progress via the ctx envelope (`ctx.progress`).
+struct JsAction {
+    validate: Handler,
+    plan: Handler,
+    invoke: Handler,
+}
+
+#[async_trait]
+impl DynAction for JsAction {
+    async fn validate(&self, config: Value) -> Diagnostics {
+        match call_handler(&self.validate, &config, "action validate").await {
+            Ok(out) => parse_diagnostics(&out),
+            Err(diags) => diags,
+        }
+    }
+
+    async fn plan(&self, config: Value) -> std::result::Result<(), Diagnostics> {
+        // The plan handler returns a diagnostics array; any error fails the plan.
+        let out = call_handler(&self.plan, &config, "action plan").await?;
+        let diags = parse_diagnostics(&out);
+        if diags.iter().any(|d| d.severity == Severity::Error) {
+            Err(diags)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn invoke(&self, config: Value) -> std::result::Result<(), Diagnostics> {
+        // Ride the ctx envelope so `ctx.progress(...)` messages drain into the
+        // ambient context (the service emits them as InvokeAction events). The
+        // returned `value` is unused — an action has no result.
+        call_with_ctx(
+            &self.invoke,
+            value_json(&config, "action invoke")?,
+            "action invoke",
+        )
+        .await?;
+        Ok(())
+    }
+}
+
 // --- the JS-facing provider -------------------------------------------------
 
 /// A registered resource, ready to hand to the builder at serve time.
@@ -1071,6 +1120,13 @@ struct StateStoreReg {
     handler: Arc<dyn DynStateStore>,
 }
 
+/// A registered action: its config `block` and erased handler.
+struct ActionReg {
+    name: String,
+    block: Block,
+    handler: Arc<dyn DynAction>,
+}
+
 /// The provider-level config block, its configure handler, and an optional
 /// validate handler (run before configure).
 struct ProviderConfigReg {
@@ -1088,6 +1144,7 @@ pub struct Provider {
     functions: Vec<FunctionReg>,
     list_resources: Vec<ListResourceReg>,
     state_stores: Vec<StateStoreReg>,
+    actions: Vec<ActionReg>,
     config: Option<ProviderConfigReg>,
 }
 
@@ -1109,6 +1166,7 @@ impl Provider {
             functions: Vec::new(),
             list_resources: Vec::new(),
             state_stores: Vec::new(),
+            actions: Vec::new(),
             config: None,
         }
     }
@@ -1328,6 +1386,33 @@ impl Provider {
         Ok(())
     }
 
+    /// Register a provider-defined action under `type_name`: `schema_json`
+    /// describes its config block; `validate` checks the config; `plan` is a dry
+    /// run (returns a diagnostics array — any error fails the plan); and `invoke`
+    /// performs the side effect, streaming progress via the ctx envelope's
+    /// `progress` array.
+    #[napi]
+    pub fn action(
+        &mut self,
+        type_name: String,
+        schema_json: String,
+        validate: ThreadsafeFunction<String, Promise<String>>,
+        plan: ThreadsafeFunction<String, Promise<String>>,
+        invoke: ThreadsafeFunction<String, Promise<String>>,
+    ) -> Result<()> {
+        let block = block_from_schema_json(&schema_json).map_err(napi_err)?;
+        self.actions.push(ActionReg {
+            name: type_name,
+            block,
+            handler: Arc::new(JsAction {
+                validate,
+                plan,
+                invoke,
+            }),
+        });
+        Ok(())
+    }
+
     /// Serve the provider over the Terraform plugin protocol. Performs the
     /// go-plugin handshake on stdout and runs until SIGTERM, so the returned
     /// promise stays pending for the provider's lifetime.
@@ -1372,6 +1457,9 @@ impl Provider {
         for s in &self.state_stores {
             builder =
                 builder.dyn_state_store(s.name.clone(), s.block.clone(), Arc::clone(&s.handler));
+        }
+        for a in &self.actions {
+            builder = builder.dyn_action(a.name.clone(), a.block.clone(), Arc::clone(&a.handler));
         }
         let provider = builder.build().map_err(napi_err)?;
         serve_provider(provider).await.map_err(napi_err)

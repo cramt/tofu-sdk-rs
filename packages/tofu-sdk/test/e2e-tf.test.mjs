@@ -97,6 +97,47 @@ test("Terraform 1.15: list resource + state store appear in the schema", { skip:
   }
 });
 
+test("Terraform 1.15: apply invokes a provider-defined action", { skip: !terraform() }, () => {
+  const bin = terraform();
+  const { dir, cfg, env } = workspace();
+  try {
+    writeFileSync(
+      join(cfg, "main.tf"),
+      `${MAIN_TF}
+action "aws_publish" "notify" {
+  config {
+    topic   = "deploys"
+    message = "hello-world"
+  }
+}
+
+resource "aws_s3_bucket" "b" {
+  name = "action-bucket"
+  tier = "silver"
+  tags = { env = "test" }
+  lifecycle {
+    action_trigger {
+      events  = [after_create]
+      actions = [action.aws_publish.notify]
+    }
+  }
+}
+`,
+    );
+
+    // `apply` creates the bucket, then the action_trigger runs PlanAction +
+    // the streaming InvokeAction; the handler's `ctx.progress` messages appear.
+    const apply = run(bin, ["apply", "-auto-approve"], cfg, env);
+    assert.equal(apply.status, 0, `apply failed:\n${apply.stdout}\n${apply.stderr}`);
+    assert.match(apply.stdout, /publishing to deploys/, `expected progress 1:\n${apply.stdout}`);
+    assert.match(apply.stdout, /published: hello-world/, `expected progress 2:\n${apply.stdout}`);
+
+    run(bin, ["destroy", "-auto-approve"], cfg, env);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("Terraform 1.15: terraform query lists existing instances", { skip: !terraform() }, () => {
   const bin = terraform();
   const { dir, cfg, env } = workspace();

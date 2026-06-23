@@ -221,6 +221,22 @@ new Provider()
       };
     },
   })
+  // A provider-defined action: an imperative, stateless operation triggered from
+  // configuration (an `action {}` block run by a resource's action_trigger).
+  // `invoke` streams progress via `ctx.progress`.
+  .action("aws_publish", {
+    schema: z.object({ topic: z.string(), message: z.string() }),
+    validate(config) {
+      if (config.topic === "") {
+        return [{ severity: "error", summary: "topic must not be empty", attribute: ["topic"] }];
+      }
+      return [];
+    },
+    async invoke(config, ctx) {
+      ctx.progress(`publishing to ${config.topic}`);
+      ctx.progress(`published: ${config.message}`);
+    },
+  })
   .serve()
   .catch((err) => {
     console.error("provider failed:", err);

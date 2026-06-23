@@ -607,9 +607,13 @@ Gotchas:
   a `terraform apply` with an `action_trigger` drives `PlanAction` then the
   streaming `InvokeAction`, and the `ctx.progress` messages appear in the output.
   OpenTofu 1.12 has no actions, so this is Terraform-only (dev shell ships both).
-- **The Node binding does not implement actions yet** — `DynAction` is a new erased
-  trait; adding it doesn't churn the binding (it just registers none). A follow-up
-  like the other dynamic-seam primitives.
+- **The Node binding implements actions** (`JsAction`/`dyn_action`): TS `action`
+  passes the config schema + `validate`/`plan`/`invoke` handlers. `invoke` rides
+  the ctx envelope, and `ctx.progress(msg)` (added to `HandlerCtx`) threads back as
+  a `progress` array that `call_with_ctx` drains into the ambient `Ctx::progress`,
+  so the service emits the InvokeAction events. Verified by `test/e2e-tf.test.mjs`'s
+  "apply invokes a provider-defined action". **The binding is at full parity** —
+  every dynamic-seam primitive is wired.
 
 ## Testing approach
 

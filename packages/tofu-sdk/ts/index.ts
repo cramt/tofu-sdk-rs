@@ -103,6 +103,13 @@ interface RawProvider {
     states: RawHandler,
     del: RawHandler,
   ): void;
+  action(
+    typeName: string,
+    schemaJson: string,
+    validate: RawHandler,
+    plan: RawHandler,
+    invoke: RawHandler,
+  ): void;
   serve(): Promise<void>;
 }
 
@@ -149,6 +156,12 @@ export interface HandlerCtx {
   warn(summary: string, detail?: string): void;
   /** Emit a prebuilt warning diagnostic (e.g. pointed at an attribute). */
   warning(diag: Diagnostic): void;
+  /**
+   * Emit a progress message from an action's `invoke` — the host prints each as
+   * the action runs. Collected and surfaced as `InvokeAction` progress events; a
+   * no-op outside an action invocation.
+   */
+  progress(message: string): void;
   /** Whether `StopProvider` had been received when the handler started. */
   readonly cancelled: boolean;
   /**
@@ -363,6 +376,23 @@ export interface StateStore<S extends z.ZodObject<z.ZodRawShape>> {
   validate?: Validate<z.infer<S>>;
 }
 
+/**
+ * A **provider-defined action**: an imperative, stateless operation triggered
+ * from configuration (an `action "<type>" "<label>" {}` block run during apply
+ * via a resource's `lifecycle { action_trigger { … } }`). `schema` is the config
+ * block (the action's inputs). The Rust analog of the `Action` trait.
+ */
+export interface Action<S extends z.ZodObject<z.ZodRawShape>> {
+  /** The action's configuration block. */
+  schema: S;
+  /** Validate the config, returning diagnostics (or nothing). */
+  validate?: Validate<z.infer<S>>;
+  /** A dry run during planning — throw to fail the plan. Defaults to a no-op. */
+  plan?(config: z.infer<S>): Promise<void>;
+  /** Perform the side effect. Stream progress with `ctx.progress(...)`. */
+  invoke(config: z.infer<S>, ctx: HandlerCtx): Promise<void>;
+}
+
 /** Provider-level configuration; `configure` runs once at `ConfigureProvider`. */
 export interface ProviderConfig<S extends z.ZodObject<z.ZodRawShape>> {
   schema: S;
@@ -437,13 +467,14 @@ interface CtxIn {
 
 /** A live [`HandlerCtx`] plus a private accessor to drain its side effects. */
 interface DrainableCtx extends HandlerCtx {
-  drain(): { private?: string; warnings: Diagnostic[] };
+  drain(): { private?: string; warnings: Diagnostic[]; progress: string[] };
 }
 
 /** Build a [`HandlerCtx`] from the addon's incoming ctx data, collecting the
  * handler's `setPrivate`/`warn` calls to thread back out. */
 function makeCtx(input?: CtxIn): DrainableCtx {
   const warnings: Diagnostic[] = [];
+  const progress: string[] = [];
   let outPrivate: string | undefined;
   const controller = new AbortController();
   const cancelled = input?.cancelled === true;
@@ -461,8 +492,11 @@ function makeCtx(input?: CtxIn): DrainableCtx {
     warning(diag) {
       warnings.push({ ...diag, severity: diag.severity ?? "warning" });
     },
+    progress(message) {
+      progress.push(message);
+    },
     drain() {
-      return { private: outPrivate, warnings };
+      return { private: outPrivate, warnings, progress };
     },
   };
 }
@@ -485,7 +519,14 @@ function ctxAdapt<V, R>(
     const result = await fn(value, ctx);
     const drained = ctx.drain();
     return JSON.stringify(
-      { value: result ?? null, ctx: { private: drained.private, warnings: drained.warnings } },
+      {
+        value: result ?? null,
+        ctx: {
+          private: drained.private,
+          warnings: drained.warnings,
+          progress: drained.progress,
+        },
+      },
       setReplacer,
     );
   };
@@ -890,6 +931,41 @@ export class Provider {
       unlock,
       states,
       del,
+    );
+    return this;
+  }
+
+  /**
+   * Register a provider-defined action under `typeName`: an imperative operation
+   * triggered from configuration. `invoke` performs the side effect and may stream
+   * progress via `ctx.progress(...)`; `plan` (optional) is a dry run that throws to
+   * fail planning.
+   */
+  action<S extends z.ZodObject<z.ZodRawShape>>(typeName: string, def: Action<S>): this {
+    type M = z.infer<S>;
+    // `plan` reports failure as a diagnostics array (a thrown error becomes one).
+    const plan: RawHandler = async (err, input) => {
+      if (err) throw err;
+      if (!def.plan) return "[]";
+      const config = reviveSets<M>(def.schema, JSON.parse(input));
+      try {
+        await def.plan(config);
+        return "[]";
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        return JSON.stringify([{ severity: "error", summary: message }]);
+      }
+    };
+    const invoke = ctxAdapt<M, null>(def.schema, async (config, ctx) => {
+      await def.invoke(config, ctx);
+      return null;
+    });
+    this.raw.action(
+      typeName,
+      schemaJson(def.schema),
+      validateAdapter(def.validate, def.schema),
+      plan,
+      invoke,
     );
     return this;
   }
