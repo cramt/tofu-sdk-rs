@@ -29,6 +29,31 @@ pub fn engine() -> String {
     );
 }
 
+/// Find a HashiCorp **Terraform >= 1.14** specifically, or `None` if unavailable.
+/// The newer protocol surfaces — list resources (`terraform query`), state stores,
+/// and resource-identity schemas in `providers schema -json` — need it; OpenTofu
+/// 1.12 drops them. Tests that exercise those surfaces probe this and skip when it
+/// is missing (the Nix dev shell provides Terraform 1.15).
+pub fn terraform() -> Option<String> {
+    let output = Command::new("terraform")
+        .args(["version", "-json"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = json(&output.stdout)
+        .as_object()?
+        .get("terraform_version")?
+        .as_string()?
+        .as_str()
+        .to_string();
+    let mut parts = version.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    (major > 1 || (major == 1 && minor >= 14)).then(|| "terraform".to_string())
+}
+
 /// A self-cleaning temp directory.
 pub struct TempDir(PathBuf);
 

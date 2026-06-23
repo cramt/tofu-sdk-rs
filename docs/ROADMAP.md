@@ -551,10 +551,13 @@ All are stubbed in `service.rs` (`unimplemented_unary!` or streaming stubs).
   service-call layer (`list_resource_*` tests in `terraform-runtime/tests/
   service.rs`: filtered stream + identity, `resource_object` on request, `limit`,
   unknown-type diagnostic) and a protocol schema-contract test
-  (`list_resource_is_published_in_schema_and_metadata`). **Engine layers (2/3)
-  deferred:** OpenTofu 1.12.1's `providers schema -json` drops `list_resource_
-  schemas` entirely (the surface is too new to drive `tofu`), so the protocol
-  assertion against our own `GetProviderSchema` stands in — like `MoveResourceState`.
+  (`list_resource_is_published_in_schema_and_metadata`). **Engine-verified on
+  HashiCorp Terraform 1.15** (`example-aws/tests/terraform_engine.rs`): a
+  `terraform query` drives the `list {}` block end-to-end (the engine calls
+  `ValidateListResourceConfig` then `ListResource`, and the lockers stream back
+  projected to their `name` identity), plus a schema-contract assertion on
+  `list_resource_schemas`. OpenTofu 1.12.1 drops `list_resource_schemas` and can't
+  run `terraform query`, so the dev shell ships Terraform 1.15 as a second engine.
 - ~~**Resource identity**~~ ✅ **DONE** (`GetResourceIdentitySchemas` /
   `UpgradeResourceIdentity`). Type-driven: a model marks identity fields with
   `#[facet(terraform::identity)]` and `reflect_resource` projects them into an
@@ -591,10 +594,13 @@ All are stubbed in `service.rs` (`unimplemented_unary!` or streaming stubs).
   **Verified** by direct service tests (`state_store_*` in
   `terraform-runtime/tests/service.rs`: full lifecycle, chunked read, validate
   rejection, read-before-configure, unknown-type, schema/metadata publication), a
-  reflect unit test, and the protocol schema-contract assertion. **Engine layer
-  deferred:** OpenTofu 1.12.1's `providers schema -json` drops
-  `state_store_schemas` (too new to drive `tofu`), so the protocol assertion
-  against our own `GetProviderSchema` stands in — like list resources.
+  reflect unit test, and the protocol schema-contract assertion — plus a
+  **HashiCorp Terraform 1.15** schema-contract test
+  (`example-aws/tests/terraform_engine.rs`) asserting the `inmem` store appears in
+  `state_store_schemas`. OpenTofu 1.12.1 drops `state_store_schemas`, so the dev
+  shell ships Terraform 1.15 as a second engine. (Driving the byte/lock lifecycle
+  through the engine needs the pluggable-state-storage workflow; the direct
+  service tests cover that path.)
 - **Actions** (`PlanAction`/`InvokeAction`/`ValidateActionConfig`). The last
   unimplemented protocol surface — Terraform's imperative-action primitive. Its
   own IR + RPCs, like state stores; defer unless wanted.
