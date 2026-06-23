@@ -34,9 +34,9 @@ use std::time::Duration;
 use facet::Facet;
 use terraform_provider::terraform;
 use terraform_runtime::{
-    async_trait, serve, Ctx, DataSource, DataSourceError, DataSourceList, Ephemeral,
-    EphemeralError, Function, FunctionError, ListError, ListItem, ListResource, Provider, Resource,
-    ResourceError, StateBackend, StateStore, StateStoreError, VariadicFunction,
+    async_trait, serve, Action, ActionError, Ctx, DataSource, DataSourceError, DataSourceList,
+    Ephemeral, EphemeralError, Function, FunctionError, ListError, ListItem, ListResource,
+    Provider, Resource, ResourceError, StateBackend, StateStore, StateStoreError, VariadicFunction,
 };
 
 /// Provider-level configuration.
@@ -226,6 +226,49 @@ impl ListResource for LockerList {
                 )
             })
             .collect())
+    }
+}
+
+/// Config for the `aws_publish` action: a message to publish to a named topic.
+/// An action's config is a plain block — no state, no computed results.
+#[derive(Facet)]
+#[allow(dead_code)]
+struct PublishConfig {
+    /// The topic to publish to.
+    topic: String,
+    /// The message body.
+    message: String,
+}
+
+/// The `aws_publish` action: a provider-defined imperative operation. It has no
+/// state — `invoke` performs a side effect (here, a synthesized "publish") and
+/// streams progress back to the host.
+struct Publish;
+
+#[async_trait]
+impl Action for Publish {
+    type Config = PublishConfig;
+
+    async fn validate(
+        &self,
+        _ctx: &mut Ctx,
+        config: PublishConfig,
+    ) -> Vec<terraform_runtime::Diag> {
+        if config.topic.is_empty() {
+            return vec![terraform_runtime::Diag::error(
+                "topic must not be empty",
+                "set a non-empty `topic` for the publish action",
+            )];
+        }
+        Vec::new()
+    }
+
+    async fn invoke(&self, ctx: &mut Ctx, config: PublishConfig) -> Result<(), ActionError> {
+        // A real action would call the remote API; emit progress so the host shows
+        // the work, then report success.
+        ctx.progress(format!("publishing to {}", config.topic));
+        ctx.progress(format!("published: {}", config.message));
+        Ok(())
     }
 }
 
@@ -517,6 +560,7 @@ async fn main() {
         .function("arn_for", ArnFor)
         .function_variadic("join", Join)
         .state_store("inmem", InMemStore::default())
+        .action("aws_publish", Publish)
         .build()
         .expect("provider definition is valid");
 

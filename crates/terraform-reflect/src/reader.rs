@@ -3,7 +3,7 @@
 use facet::{Def, Facet, Field, PrimitiveType, Shape, Type as FType, UserType};
 use terraform_attrs::Attr as TfAttr;
 use terraform_ir::{
-    AttributeSchema, Block, DataSourceSchema, EphemeralSchema, FunctionSignature,
+    ActionSchema, AttributeSchema, Block, DataSourceSchema, EphemeralSchema, FunctionSignature,
     IdentityAttribute, IdentitySchema, ListResourceSchema, NestedBlock, NestingMode, Parameter,
     ResourceSchema, StateStoreSchema,
 };
@@ -340,6 +340,19 @@ pub fn reflect_state_store<T: Facet<'static>>(
     name: impl Into<String>,
 ) -> Result<StateStoreSchema, ReflectError> {
     Ok(StateStoreSchema {
+        name: name.into(),
+        block: reflect_block::<T>()?,
+    })
+}
+
+/// Reflect a Rust type into an [`ActionSchema`]. The action's config type is
+/// projected as a plain block (its fields are the action's inputs); like a state
+/// store, the `name` is supplied at registration, since an action's type name is
+/// not tied to a model identity.
+pub fn reflect_action<T: Facet<'static>>(
+    name: impl Into<String>,
+) -> Result<ActionSchema, ReflectError> {
+    Ok(ActionSchema {
         name: name.into(),
         block: reflect_block::<T>()?,
     })

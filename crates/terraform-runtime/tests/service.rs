@@ -11,10 +11,10 @@ use std::sync::Arc;
 use facet::Facet;
 use terraform_attrs as terraform;
 use terraform_runtime::{
-    async_trait, ConfigureError, Ctx, DataSource, DataSourceError, DataSourceList, Diag, Ephemeral,
-    EphemeralError, EphemeralFromResource, ListError, ListItem, ListResource, Path,
-    PlanModifications, Provider, ProviderService, Resource, ResourceError, StateBackend,
-    StateStore, StateStoreError, Timeouts,
+    async_trait, Action, ActionError, ConfigureError, Ctx, DataSource, DataSourceError,
+    DataSourceList, Diag, Ephemeral, EphemeralError, EphemeralFromResource, ListError, ListItem,
+    ListResource, Path, PlanModifications, Provider, ProviderService, Resource, ResourceError,
+    StateBackend, StateStore, StateStoreError, Timeouts,
 };
 use terraform_tfplugin6::tfplugin6::{self, provider_server::Provider as _};
 use tonic::codegen::tokio_stream::StreamExt as _;
@@ -270,11 +270,14 @@ async fn get_metadata_lists_type_names() {
 #[tokio::test]
 async fn unimplemented_rpc_returns_unimplemented() {
     let svc = service();
-    // Actions are not implemented yet (a still-stubbed RPC).
+    // `GenerateResourceConfig` is still a stubbed RPC (config generation for
+    // import is not implemented).
     let status = svc
-        .plan_action(Request::new(tfplugin6::plan_action::Request::default()))
+        .generate_resource_config(Request::new(
+            tfplugin6::generate_resource_config::Request::default(),
+        ))
         .await
-        .expect_err("plan_action is not implemented yet");
+        .expect_err("generate_resource_config is not implemented yet");
     assert_eq!(status.code(), Code::Unimplemented);
 }
 
@@ -3354,5 +3357,214 @@ async fn state_store_published_in_schema_and_metadata() {
     assert!(
         metadata.state_stores.iter().any(|s| s.type_name == "vault"),
         "the state store appears in GetMetadata.state_stores"
+    );
+}
+
+// --- Actions ----------------------------------------------------------------
+
+/// Config for the test action: a topic and a message to publish.
+#[derive(Facet)]
+struct PublishConfig {
+    topic: String,
+    message: String,
+}
+
+/// A test action: validates a non-empty topic, plans cleanly, and on invoke emits
+/// two progress messages before succeeding.
+struct Publish;
+
+#[async_trait]
+impl Action for Publish {
+    type Config = PublishConfig;
+
+    async fn validate(&self, _ctx: &mut Ctx, config: PublishConfig) -> Vec<Diag> {
+        if config.topic.is_empty() {
+            return vec![Diag::error("topic must not be empty", "")];
+        }
+        Vec::new()
+    }
+
+    async fn invoke(&self, ctx: &mut Ctx, config: PublishConfig) -> Result<(), ActionError> {
+        ctx.progress(format!("publishing to {}", config.topic));
+        ctx.progress(format!("published: {}", config.message));
+        Ok(())
+    }
+}
+
+fn action_service() -> ProviderService {
+    let provider = Provider::builder()
+        .action("aws_publish", Publish)
+        .build()
+        .expect("provider builds");
+    ProviderService::new(provider)
+}
+
+/// Encode a `{topic, message}` action config as a `DynamicValue`.
+fn publish_dv(topic: &str, message: &str) -> tfplugin6::DynamicValue {
+    use terraform_value::{ObjectAttr, Type, Value};
+    let ty = Type::Object(vec![
+        ObjectAttr {
+            name: "topic".to_string(),
+            ty: Type::String,
+            optional: false,
+        },
+        ObjectAttr {
+            name: "message".to_string(),
+            ty: Type::String,
+            optional: false,
+        },
+    ]);
+    let mut obj = std::collections::BTreeMap::new();
+    obj.insert("topic".to_string(), Value::String(topic.to_string()));
+    obj.insert("message".to_string(), Value::String(message.to_string()));
+    tfplugin6::DynamicValue {
+        msgpack: terraform_codec::encode_msgpack(&Value::Object(obj), &ty).expect("encode"),
+        json: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn action_is_published_in_schema_and_metadata() {
+    let svc = action_service();
+    let schema = svc
+        .get_provider_schema(Request::new(tfplugin6::get_provider_schema::Request {}))
+        .await
+        .expect("GetProviderSchema")
+        .into_inner();
+    let action = schema
+        .action_schemas
+        .get("aws_publish")
+        .expect("action present in action_schemas");
+    let attrs = &action
+        .schema
+        .as_ref()
+        .unwrap()
+        .block
+        .as_ref()
+        .unwrap()
+        .attributes;
+    assert!(attrs.iter().any(|a| a.name == "topic" && a.required));
+    assert!(attrs.iter().any(|a| a.name == "message" && a.required));
+
+    let metadata = svc
+        .get_metadata(Request::new(tfplugin6::get_metadata::Request {}))
+        .await
+        .expect("GetMetadata")
+        .into_inner();
+    assert!(
+        metadata
+            .actions
+            .iter()
+            .any(|a| a.type_name == "aws_publish"),
+        "the action appears in GetMetadata.actions"
+    );
+}
+
+#[tokio::test]
+async fn validate_action_config_rejects_empty_topic() {
+    let svc = action_service();
+    let bad = svc
+        .validate_action_config(Request::new(tfplugin6::validate_action_config::Request {
+            type_name: "aws_publish".to_string(),
+            config: Some(publish_dv("", "hi")),
+        }))
+        .await
+        .expect("ValidateActionConfig")
+        .into_inner();
+    assert!(
+        bad.diagnostics
+            .iter()
+            .any(|d| d.summary.contains("topic must not be empty")),
+        "empty topic should be rejected"
+    );
+
+    let ok = svc
+        .validate_action_config(Request::new(tfplugin6::validate_action_config::Request {
+            type_name: "aws_publish".to_string(),
+            config: Some(publish_dv("deploys", "hi")),
+        }))
+        .await
+        .expect("ValidateActionConfig")
+        .into_inner();
+    assert!(ok.diagnostics.is_empty(), "a valid config plans clean");
+}
+
+#[tokio::test]
+async fn plan_action_succeeds_by_default() {
+    let svc = action_service();
+    let resp = svc
+        .plan_action(Request::new(tfplugin6::plan_action::Request {
+            action_type: "aws_publish".to_string(),
+            config: Some(publish_dv("deploys", "hi")),
+            client_capabilities: None,
+        }))
+        .await
+        .expect("PlanAction")
+        .into_inner();
+    assert!(resp.diagnostics.is_empty(), "the default plan is clean");
+}
+
+#[tokio::test]
+async fn invoke_action_streams_progress_then_completes() {
+    use tfplugin6::invoke_action::event::Type;
+    let svc = action_service();
+    let resp = svc
+        .invoke_action(Request::new(tfplugin6::invoke_action::Request {
+            action_type: "aws_publish".to_string(),
+            config: Some(publish_dv("deploys", "hello-world")),
+            client_capabilities: None,
+        }))
+        .await
+        .expect("InvokeAction");
+
+    let mut stream = resp.into_inner();
+    let mut progress = Vec::new();
+    let mut completed_diags = None;
+    while let Some(event) = stream.next().await {
+        match event.expect("stream item is Ok").r#type {
+            Some(Type::Progress(p)) => progress.push(p.message),
+            Some(Type::Completed(c)) => completed_diags = Some(c.diagnostics),
+            None => {}
+        }
+    }
+    assert_eq!(
+        progress,
+        vec![
+            "publishing to deploys".to_string(),
+            "published: hello-world".to_string()
+        ],
+        "both progress messages stream in order"
+    );
+    assert_eq!(
+        completed_diags.expect("a terminal Completed event").len(),
+        0,
+        "the invocation completed without diagnostics"
+    );
+}
+
+#[tokio::test]
+async fn invoke_unknown_action_yields_diagnostic() {
+    use tfplugin6::invoke_action::event::Type;
+    let svc = action_service();
+    let resp = svc
+        .invoke_action(Request::new(tfplugin6::invoke_action::Request {
+            action_type: "nope".to_string(),
+            config: Some(publish_dv("t", "m")),
+            client_capabilities: None,
+        }))
+        .await
+        .expect("InvokeAction");
+    let mut stream = resp.into_inner();
+    let mut diags = Vec::new();
+    while let Some(event) = stream.next().await {
+        if let Some(Type::Completed(c)) = event.expect("ok").r#type {
+            diags = c.diagnostics;
+        }
+    }
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.summary.contains("unknown action type")),
+        "an unregistered action type is reported on the stream"
     );
 }

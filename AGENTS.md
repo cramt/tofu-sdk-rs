@@ -582,6 +582,35 @@ config model is a plain `#[derive(Facet)]` struct with no name marker and the
   full byte/lock lifecycle) and the protocol-level `GetProviderSchema`/`GetMetadata`
   assertion.
 
+**Actions** (`action.rs`) are Terraform's imperative-action primitive — an
+`action "<type>" "<label>" {}` block triggered by a resource's `lifecycle {
+action_trigger { events = [after_create], actions = [action.<type>.<label>] } }`.
+**This was the last unimplemented protocol surface; the SDK now covers all of
+tfplugin6.** A single typed `Action` trait over a `Config` model (the action's
+inputs — no state, no diff): `validate` + a defaulted `plan` (a dry run; raise a
+diagnostic to fail planning) + a required `invoke` (the side effect). Like a
+function / state store, the **type name is supplied at registration**, so the
+config model is a plain `#[derive(Facet)]` struct. New IR `ActionSchema`
+(`ProviderSchema.actions`), `reflect_action` (config block only), `emit.rs`
+publishes `action_schemas` (GetProviderSchema, wrapped as `ActionSchema { schema }`)
++ `actions` (GetMetadata). `service.rs` implements `ValidateActionConfig` /
+`PlanAction` (unary) / the **server-streaming `InvokeAction`**. Registered with
+`ProviderBuilder::action` / `action_with` / `dyn_action`; erased behind `DynAction`.
+Gotchas:
+- **`invoke` streams progress** via the new `Ctx::progress(msg)`. This rides the
+  same buffered `CtxSink` as `warn`/`set_private` — the messages are drained from
+  `CtxOutputs.progress` *after* the handler returns and emitted as `InvokeAction`
+  Progress events ahead of the terminal Completed event. So progress is
+  materialize-then-stream, not live (the same trade-off list resources make); a
+  genuinely live stream would need an mpsc channel on `Ctx`.
+- **Engine-verified on HashiCorp Terraform 1.15** (`example-aws/tests/terraform_engine.rs`):
+  a `terraform apply` with an `action_trigger` drives `PlanAction` then the
+  streaming `InvokeAction`, and the `ctx.progress` messages appear in the output.
+  OpenTofu 1.12 has no actions, so this is Terraform-only (dev shell ships both).
+- **The Node binding does not implement actions yet** — `DynAction` is a new erased
+  trait; adding it doesn't churn the binding (it just registers none). A follow-up
+  like the other dynamic-seam primitives.
+
 ## Testing approach
 
 Three layers, deliberately:

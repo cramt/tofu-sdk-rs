@@ -41,6 +41,7 @@ struct CtxSink {
     warnings: Vec<Diag>,
     private_out: Option<Vec<u8>>,
     renew_at: Option<SystemTime>,
+    progress: Vec<String>,
 }
 
 /// The context handed to every handler call as `&mut Ctx`.
@@ -109,6 +110,13 @@ impl Ctx {
         self.set_renew_at(SystemTime::now() + after);
     }
 
+    /// Emit a progress message from a provider-defined action's `invoke`. Each is
+    /// surfaced to the host as an `InvokeAction` progress event. Outside an action
+    /// invocation the message is collected but never read (a harmless no-op).
+    pub fn progress(&mut self, message: impl Into<String>) {
+        self.lock().progress.push(message.into());
+    }
+
     /// Whether `StopProvider` has been received — poll this in long loops.
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
@@ -136,6 +144,7 @@ impl Ctx {
             warnings: std::mem::take(&mut sink.warnings),
             private_out: sink.private_out.take(),
             renew_at: sink.renew_at.take(),
+            progress: std::mem::take(&mut sink.progress),
         }
     }
 }
@@ -148,6 +157,9 @@ pub(crate) struct CtxOutputs {
     /// When set by an ephemeral `open`/`renew`, the absolute time Terraform
     /// should next renew the ephemeral resource.
     pub renew_at: Option<SystemTime>,
+    /// Progress messages emitted by an action's `invoke`, surfaced as
+    /// `InvokeAction` progress events.
+    pub progress: Vec<String>,
 }
 
 /// Run `fut` with `ctx` installed as the ambient handler context, returning the

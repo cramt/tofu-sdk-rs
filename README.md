@@ -248,6 +248,15 @@ plus data sources, functions, nested blocks, a handler context, and lossless
   eight-RPC protocol — chunked `ReadStateBytes`/`WriteStateBytes`,
   lock/unlock/list/delete — over whole byte vectors. See the `inmem` example.
 
+- **Actions ✅** — provider-defined imperative operations (an `action "<type>"
+  "<label>" {}` block triggered by a resource's `lifecycle { action_trigger { … }
+  }`). Implement the `Action` trait over a `Config` model: `validate` + a defaulted
+  `plan` (dry run) + a required `invoke` (the side effect), which streams progress
+  to the host via `ctx.progress(...)`. Registered with `ProviderBuilder::action` /
+  `action_with` / `dyn_action`. The runtime drives `ValidateActionConfig`,
+  `PlanAction`, and the server-streaming `InvokeAction`. See the `aws_publish`
+  example. This completes the tfplugin6 protocol surface.
+
 ### Not yet implemented
 
 There is no dedicated

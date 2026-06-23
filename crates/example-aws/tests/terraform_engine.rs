@@ -126,3 +126,100 @@ list "aws_locker" "all" {
         );
     }
 }
+
+/// The action surfaces in `providers schema -json` under `action_schemas`.
+#[test]
+fn terraform_surfaces_action_schema() {
+    let Some(engine) = common::terraform() else {
+        eprintln!("skipping: Terraform >= 1.14 not on PATH");
+        return;
+    };
+    let ws = common::workspace(CONFIG);
+
+    let output = common::run(&engine, &["providers", "schema", "-json"], &ws);
+    common::assert_ok("terraform providers schema -json", &output);
+    let schema = common::json(&output.stdout);
+    let (_, provider) = common::get(&schema, &["provider_schemas"])
+        .as_object()
+        .expect("provider_schemas object")
+        .iter()
+        .find(|(k, _)| k.as_str().ends_with("example/aws"))
+        .expect("our provider is present");
+
+    assert_eq!(
+        common::get(
+            provider,
+            &[
+                "action_schemas",
+                "aws_publish",
+                "block",
+                "attributes",
+                "topic",
+                "required",
+            ],
+        )
+        .as_bool(),
+        Some(true),
+        "the action's `topic` input is published as required",
+    );
+}
+
+/// `terraform apply` triggers the action after a resource is created
+/// (`action_trigger`), running `PlanAction` then the streaming `InvokeAction`:
+/// the progress messages the handler emits via `ctx.progress` reach the output.
+#[test]
+fn terraform_apply_invokes_a_triggered_action() {
+    let Some(engine) = common::terraform() else {
+        eprintln!("skipping: Terraform >= 1.14 not on PATH");
+        return;
+    };
+    let ws = common::workspace(
+        r#"
+terraform {
+  required_providers {
+    aws = {
+      source = "example/aws"
+    }
+  }
+}
+
+provider "aws" {
+  region = "eu-west-1"
+}
+
+action "aws_publish" "notify" {
+  config {
+    topic   = "deploys"
+    message = "hello-world"
+  }
+}
+
+resource "aws_s3_bucket" "b" {
+  name = "trigger-bucket"
+  tags = { env = "test" }
+  lifecycle {
+    action_trigger {
+      events  = [after_create]
+      actions = [action.aws_publish.notify]
+    }
+  }
+}
+"#,
+    );
+
+    let apply = common::run(&engine, &["apply", "-auto-approve"], &ws);
+    common::assert_ok("terraform apply", &apply);
+    let stdout = String::from_utf8_lossy(&apply.stdout);
+    // Both progress messages the action streamed via `ctx.progress` appear, and
+    // the invocation completed.
+    assert!(
+        stdout.contains("publishing to deploys"),
+        "the action's first progress message reached the output:\n{stdout}",
+    );
+    assert!(
+        stdout.contains("published: hello-world"),
+        "the action's second progress message reached the output:\n{stdout}",
+    );
+
+    common::run(&engine, &["destroy", "-auto-approve"], &ws);
+}

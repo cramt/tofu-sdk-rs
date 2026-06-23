@@ -601,9 +601,28 @@ All are stubbed in `service.rs` (`unimplemented_unary!` or streaming stubs).
   shell ships Terraform 1.15 as a second engine. (Driving the byte/lock lifecycle
   through the engine needs the pluggable-state-storage workflow; the direct
   service tests cover that path.)
-- **Actions** (`PlanAction`/`InvokeAction`/`ValidateActionConfig`). The last
-  unimplemented protocol surface — Terraform's imperative-action primitive. Its
-  own IR + RPCs, like state stores; defer unless wanted.
+- ~~**Actions** (`PlanAction`/`InvokeAction`/`ValidateActionConfig`).~~ ✅ **DONE** —
+  Terraform's imperative-action primitive (an `action "<type>" "<label>" {}` block
+  triggered by a resource `lifecycle { action_trigger { … } }`). Typed `Action`
+  trait (`action.rs`): a `Config` model (the action's inputs) + `validate` /
+  defaulted `plan` / required `invoke`. `invoke` streams progress via the new
+  `Ctx::progress(msg)` (collected into `CtxOutputs.progress`, emitted as
+  `InvokeAction` Progress events ahead of the terminal Completed event). New IR
+  `ActionSchema` (`ProviderSchema.actions`), `reflect_action` (config block only,
+  name supplied at registration like a function / state store), `emit.rs` publishes
+  `action_schemas` (GetProviderSchema, as `ActionSchema { schema }`) + `actions`
+  (GetMetadata). `service.rs` implements all three RPCs (`ValidateActionConfig`,
+  `PlanAction` unary, the server-streaming `InvokeAction`). Registered with
+  `ProviderBuilder::action` / `action_with` / `dyn_action` (eager, meta-backed, and
+  dynamic seam — full parity with the other primitives). Erased behind `DynAction`.
+  Example: `example-aws`'s `aws_publish`. **Verified** by direct service tests
+  (`action_*` in `terraform-runtime/tests/service.rs`: schema/metadata, validate
+  rejection, plan, streaming-progress invoke, unknown-type) **and engine-level on
+  HashiCorp Terraform 1.15** (`example-aws/tests/terraform_engine.rs`): a
+  `terraform apply` with an `action_trigger` runs `PlanAction` then the streaming
+  `InvokeAction`, and the handler's `ctx.progress` messages reach the apply output.
+  **This was the last unimplemented protocol surface — the SDK now covers the
+  entire tfplugin6 protocol.**
 
 ---
 

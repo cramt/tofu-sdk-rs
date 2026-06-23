@@ -70,7 +70,18 @@ pub fn emit_provider_schema(schema: &ProviderSchema) -> get_provider_schema::Res
             .iter()
             .map(|s| (s.name.clone(), emit_schema(&s.block, 0)))
             .collect(),
-        action_schemas: HashMap::new(),
+        action_schemas: schema
+            .actions
+            .iter()
+            .map(|a| {
+                (
+                    a.name.clone(),
+                    tfplugin6::ActionSchema {
+                        schema: Some(emit_schema(&a.block, 0)),
+                    },
+                )
+            })
+            .collect(),
         diagnostics: Vec::new(),
         provider_meta: None,
         server_capabilities: Some(server_capabilities()),
@@ -166,7 +177,13 @@ pub fn emit_metadata(schema: &ProviderSchema) -> get_metadata::Response {
                 type_name: s.name.clone(),
             })
             .collect(),
-        actions: Vec::new(),
+        actions: schema
+            .actions
+            .iter()
+            .map(|a| get_metadata::ActionMetadata {
+                type_name: a.name.clone(),
+            })
+            .collect(),
     }
 }
 

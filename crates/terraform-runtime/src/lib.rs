@@ -8,6 +8,7 @@
 //! Phase 2 wires up the schema-discovery RPCs, the go-plugin handshake, and
 //! auto-mTLS. Resource CRUD and planning arrive in later phases.
 
+mod action;
 mod builder;
 mod ctx;
 mod data_source;
@@ -28,6 +29,7 @@ mod timeouts;
 mod tls;
 mod write_only;
 
+pub use action::{Action, ActionError};
 pub use builder::{
     BuildError, ConfigureError, DynConfigure, DynValidateConfig, IntoConfigured, Provider,
     ProviderBuilder,
@@ -47,6 +49,7 @@ pub use timeouts::Timeouts;
 /// the dynamic seam used by non-Rust frontends (paired with
 /// [`ProviderBuilder::dyn_resource`] / [`ProviderBuilder::dyn_data_source`]);
 /// Rust authors use the typed [`Resource`] / [`DataSource`] traits instead.
+pub use action::DynAction;
 pub use ctx::current_ctx;
 pub use data_source::DynDataSource;
 pub use ephemeral::DynEphemeral;

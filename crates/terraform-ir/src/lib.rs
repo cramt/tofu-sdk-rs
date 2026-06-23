@@ -35,6 +35,9 @@ pub struct ProviderSchema {
     /// State stores keyed by type name (e.g. `s3`): provider-defined Terraform
     /// state backends that read/write raw state bytes and manage locks.
     pub state_stores: Vec<StateStoreSchema>,
+    /// Actions keyed by type name: provider-defined imperative operations
+    /// (`validate`/`plan`/`invoke`) triggered from configuration.
+    pub actions: Vec<ActionSchema>,
     /// Provider-defined functions, callable from HCL as `provider::<p>::<name>`.
     pub functions: Vec<FunctionSignature>,
 }
@@ -180,6 +183,20 @@ pub struct StateStoreSchema {
     /// Fully-qualified type name, e.g. `s3`.
     pub name: String,
     /// The state store's configuration block.
+    pub block: Block,
+}
+
+/// A provider-defined action: an imperative operation triggered from
+/// configuration (an `action "<name>" "<label>" {}` block), invoked during apply.
+///
+/// Structurally just a name plus a config [`Block`] (the action's inputs), like a
+/// [`StateStoreSchema`]. The `validate`/`plan`/`invoke` lifecycle is runtime
+/// behavior, not schema, so it does not appear here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActionSchema {
+    /// Fully-qualified type name, e.g. `aws_lambda_invoke`.
+    pub name: String,
+    /// The action's configuration block.
     pub block: Block,
 }
 

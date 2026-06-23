@@ -1248,8 +1248,77 @@ impl tfplugin6::provider_server::Provider for ProviderService {
 
     unimplemented_unary! {
         generate_resource_config => generate_resource_config,
-        plan_action => plan_action,
-        validate_action_config => validate_action_config,
+    }
+
+    async fn validate_action_config(
+        &self,
+        request: Request<tfplugin6::validate_action_config::Request>,
+    ) -> Result<Response<tfplugin6::validate_action_config::Response>, Status> {
+        use tfplugin6::validate_action_config::Response as Resp;
+        let req = request.into_inner();
+        tracing::debug!(type_name = %req.type_name, "ValidateActionConfig");
+
+        let (Some(ty), Some(handler)) = (
+            self.provider.action_cty(&req.type_name),
+            self.provider.action_handler(&req.type_name),
+        ) else {
+            return Ok(Response::new(Resp {
+                diagnostics: unknown_action(&req.type_name),
+            }));
+        };
+        let config = match decode_dynamic(&req.config, &ty) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to decode action config", e.to_string()),
+                }))
+            }
+        };
+        let (diags, outs) = self
+            .run_diags("validate action config", handler.validate(config))
+            .await;
+        Ok(Response::new(Resp {
+            diagnostics: diags_with_warnings(diags, outs),
+        }))
+    }
+
+    async fn plan_action(
+        &self,
+        request: Request<tfplugin6::plan_action::Request>,
+    ) -> Result<Response<tfplugin6::plan_action::Response>, Status> {
+        use tfplugin6::plan_action::Response as Resp;
+        let req = request.into_inner();
+        tracing::debug!(action_type = %req.action_type, "PlanAction");
+
+        let (Some(ty), Some(handler)) = (
+            self.provider.action_cty(&req.action_type),
+            self.provider.action_handler(&req.action_type),
+        ) else {
+            return Ok(Response::new(Resp {
+                diagnostics: unknown_action(&req.action_type),
+                ..Default::default()
+            }));
+        };
+        let config = match decode_dynamic(&req.config, &ty) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::new(Resp {
+                    diagnostics: error_diag("failed to decode action config", e.to_string()),
+                    ..Default::default()
+                }))
+            }
+        };
+        let (outcome, outs) = self
+            .run("plan action", Vec::new(), handler.plan(config))
+            .await;
+        let diagnostics = match outcome {
+            Ok(()) => diags_with_warnings(Vec::new(), outs),
+            Err(diags) => diags_with_warnings(diags, outs),
+        };
+        Ok(Response::new(Resp {
+            diagnostics,
+            ..Default::default()
+        }))
     }
 
     async fn validate_list_resource_config(
@@ -1765,12 +1834,77 @@ impl tfplugin6::provider_server::Provider for ProviderService {
     type InvokeActionStream = BoxStream<tfplugin6::invoke_action::Event>;
     async fn invoke_action(
         &self,
-        _request: Request<tfplugin6::invoke_action::Request>,
+        request: Request<tfplugin6::invoke_action::Request>,
     ) -> Result<Response<Self::InvokeActionStream>, Status> {
-        Err(Status::unimplemented(
-            "invoke_action is not implemented yet",
-        ))
+        use tfplugin6::invoke_action::event::{Completed, Progress, Type};
+        use tfplugin6::invoke_action::Event;
+        let req = request.into_inner();
+        tracing::debug!(action_type = %req.action_type, "InvokeAction");
+
+        let completed = |diagnostics| Event {
+            r#type: Some(Type::Completed(Completed { diagnostics })),
+        };
+
+        let (Some(ty), Some(handler)) = (
+            self.provider.action_cty(&req.action_type),
+            self.provider.action_handler(&req.action_type),
+        ) else {
+            return Ok(Response::new(invoke_event_stream(vec![completed(
+                unknown_action(&req.action_type),
+            )])));
+        };
+        let config = match decode_dynamic(&req.config, &ty) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::new(invoke_event_stream(vec![completed(
+                    error_diag("failed to decode action config", e.to_string()),
+                )])))
+            }
+        };
+
+        let (outcome, outs) = self
+            .run("invoke action", Vec::new(), handler.invoke(config))
+            .await;
+
+        // Progress messages emitted via `ctx.progress(...)` stream first, then a
+        // terminal Completed event carrying any error/warning diagnostics. (The
+        // handler runs to completion before events are sent — the same
+        // materialize-then-stream trade-off list resources make.)
+        let mut events: Vec<Event> = outs
+            .progress
+            .iter()
+            .map(|message| Event {
+                r#type: Some(Type::Progress(Progress {
+                    message: message.clone(),
+                })),
+            })
+            .collect();
+        let diagnostics = match outcome {
+            Ok(()) => pb_diagnostics(outs.warnings),
+            Err(diags) => diags_with_warnings(diags, outs),
+        };
+        events.push(completed(diagnostics));
+
+        Ok(Response::new(invoke_event_stream(events)))
     }
+}
+
+/// Box a materialized vector of `InvokeAction` events into the server-streaming
+/// response (progress events followed by a terminal Completed event).
+fn invoke_event_stream(
+    events: Vec<tfplugin6::invoke_action::Event>,
+) -> BoxStream<tfplugin6::invoke_action::Event> {
+    use futures_util::stream::StreamExt;
+    futures_util::stream::iter(events.into_iter().map(Ok)).boxed()
+}
+
+/// The diagnostics for an `InvokeAction`/`PlanAction` against an unregistered
+/// action type.
+fn unknown_action(type_name: &str) -> Vec<tfplugin6::Diagnostic> {
+    error_diag(
+        "unknown action type",
+        format!("the provider has no action named \"{type_name}\""),
+    )
 }
 
 /// Best-effort extraction of a panic message from its boxed payload. Takes the

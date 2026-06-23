@@ -27,20 +27,21 @@ use std::sync::Arc;
 use facet::Facet;
 use terraform_codec::from_value;
 use terraform_ir::{
-    Block, DataSourceSchema, EphemeralSchema, FunctionSignature, ListResourceSchema,
+    ActionSchema, Block, DataSourceSchema, EphemeralSchema, FunctionSignature, ListResourceSchema,
     ProviderSchema, ResourceSchema, StateStoreSchema,
 };
 use terraform_reflect::{
-    data_source_list_name, data_source_name, ephemeral_name, reflect_block, reflect_data_source,
-    reflect_data_source_list, reflect_ephemeral, reflect_function, reflect_list_resource,
-    reflect_resource, reflect_state_store, reflect_variadic_function, resource_name,
-    PluralDataSource, ReflectError,
+    data_source_list_name, data_source_name, ephemeral_name, reflect_action, reflect_block,
+    reflect_data_source, reflect_data_source_list, reflect_ephemeral, reflect_function,
+    reflect_list_resource, reflect_resource, reflect_state_store, reflect_variadic_function,
+    resource_name, PluralDataSource, ReflectError,
 };
 use terraform_value::{Type, Value};
 use tokio::sync::OnceCell;
 
 use async_trait::async_trait;
 
+use crate::action::{Action, ActionAdapter, DynAction};
 use crate::data_source::{
     DataSource, DataSourceAdapter, DataSourceList, DataSourceListAdapter, DynDataSource,
 };
@@ -181,6 +182,9 @@ type ListResourceMap = HashMap<String, Arc<dyn DynListResource>>;
 /// The set of state store handlers keyed by type name.
 type StateStoreMap = HashMap<String, Arc<dyn DynStateStore>>;
 
+/// The set of action handlers keyed by type name.
+type ActionMap = HashMap<String, Arc<dyn DynAction>>;
+
 /// The set of function handlers keyed by name. Functions are pure (no provider
 /// meta), so they are always eager.
 type FunctionMap = HashMap<String, Arc<dyn DynFunction>>;
@@ -193,6 +197,7 @@ struct Configured {
     ephemerals: EphemeralMap,
     list_resources: ListResourceMap,
     state_stores: StateStoreMap,
+    actions: ActionMap,
 }
 
 /// Builds the shared meta `Arc<M>` from the decoded provider config value.
@@ -217,6 +222,10 @@ type ListResourceFactory<M> = Box<dyn Fn(Arc<M>) -> Arc<dyn DynListResource> + S
 /// Builds one state store handler from the shared meta. Stored per registered
 /// `state_store_with` until the meta exists at configure time.
 type StateStoreFactory<M> = Box<dyn Fn(Arc<M>) -> Arc<dyn DynStateStore> + Send + Sync>;
+
+/// Builds one action handler from the shared meta. Stored per registered
+/// `action_with` until the meta exists at configure time.
+type ActionFactory<M> = Box<dyn Fn(Arc<M>) -> Arc<dyn DynAction> + Send + Sync>;
 
 /// The fully-erased configure step: decode-and-build the meta, then construct
 /// every meta-backed handler. `M` has been erased away by this point.
@@ -256,6 +265,8 @@ pub struct Provider {
     eager_list: Arc<ListResourceMap>,
     /// State store handlers that need no provider meta; available now.
     eager_state_store: Arc<StateStoreMap>,
+    /// Action handlers that need no provider meta; available now.
+    eager_action: Arc<ActionMap>,
     /// Function handlers (pure; always available, even before configure).
     functions: Arc<FunctionMap>,
     /// The `cty` type of the provider config block, for decoding `ConfigureProvider`.
@@ -353,6 +364,27 @@ impl Provider {
             .iter()
             .find(|s| s.name == name)
             .map(|s| s.block.cty_type())
+    }
+
+    /// The handler for action type `name`, if registered. Configured (meta-backed)
+    /// handlers take precedence over eager ones.
+    pub(crate) fn action_handler(&self, name: &str) -> Option<Arc<dyn DynAction>> {
+        if let Some(configured) = self.configured.get() {
+            if let Some(handler) = configured.actions.get(name) {
+                return Some(Arc::clone(handler));
+            }
+        }
+        self.eager_action.get(name).map(Arc::clone)
+    }
+
+    /// The `cty` type of action `name`'s config block, for decoding
+    /// `ValidateActionConfig` / `PlanAction` / `InvokeAction`.
+    pub(crate) fn action_cty(&self, name: &str) -> Option<Type> {
+        self.schema
+            .actions
+            .iter()
+            .find(|a| a.name == name)
+            .map(|a| a.block.cty_type())
     }
 
     /// The handler for function `name`, if registered.
@@ -456,12 +488,14 @@ pub struct ProviderBuilder<M = ()> {
     ephemerals: EphemeralMap,
     list_resources: ListResourceMap,
     state_stores: StateStoreMap,
+    actions: ActionMap,
     functions: FunctionMap,
     factories: Vec<(String, ResourceFactory<M>)>,
     data_factories: Vec<(String, DataSourceFactory<M>)>,
     ephemeral_factories: Vec<(String, EphemeralFactory<M>)>,
     list_factories: Vec<(String, ListResourceFactory<M>)>,
     state_store_factories: Vec<(String, StateStoreFactory<M>)>,
+    action_factories: Vec<(String, ActionFactory<M>)>,
     configure: Option<MetaFn<M>>,
     dyn_configure: Option<Arc<dyn DynConfigure>>,
     validate_config: Option<Arc<dyn DynValidateConfig>>,
@@ -478,12 +512,14 @@ impl<M> Default for ProviderBuilder<M> {
             ephemerals: HashMap::new(),
             list_resources: HashMap::new(),
             state_stores: HashMap::new(),
+            actions: HashMap::new(),
             functions: HashMap::new(),
             factories: Vec::new(),
             data_factories: Vec::new(),
             ephemeral_factories: Vec::new(),
             list_factories: Vec::new(),
             state_store_factories: Vec::new(),
+            action_factories: Vec::new(),
             configure: None,
             dyn_configure: None,
             validate_config: None,
@@ -789,6 +825,49 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
         self
     }
 
+    /// Register a provider-defined action under `name` with its `handler`. Use
+    /// this for actions that need no provider configuration; for ones that need
+    /// the configured meta, use [`ProviderBuilder::action_with`].
+    ///
+    /// The type name is supplied explicitly (like a function / state store), since
+    /// an action's name is not tied to a model identity. The config schema is
+    /// reflected from the handler's `Config` type.
+    pub fn action<A: Action>(mut self, name: impl Into<String>, handler: A) -> Self {
+        let name = name.into();
+        match reflect_action::<A::Config>(name.clone()) {
+            Ok(action) => {
+                self.schema.actions.push(action);
+                self.actions.insert(name, ActionAdapter::erased(handler));
+            }
+            Err(source) => self.record(name, source),
+        }
+        self
+    }
+
+    /// Register an action whose handler is built from the configured provider
+    /// meta. `factory` receives the shared `Arc<M>` produced by
+    /// [`ProviderBuilder::configure`] and returns the action handler.
+    ///
+    /// Requires a [`ProviderBuilder::configure`] step (which fixes `M`); building
+    /// without one is a [`BuildError::MissingConfigure`].
+    pub fn action_with<A, F>(mut self, name: impl Into<String>, factory: F) -> Self
+    where
+        A: Action,
+        F: Fn(Arc<M>) -> A + Send + Sync + 'static,
+    {
+        let name = name.into();
+        match reflect_action::<A::Config>(name.clone()) {
+            Ok(action) => {
+                self.schema.actions.push(action);
+                let make: ActionFactory<M> =
+                    Box::new(move |meta: Arc<M>| ActionAdapter::erased(factory(meta)));
+                self.action_factories.push((name, make));
+            }
+            Err(source) => self.record(name, source),
+        }
+        self
+    }
+
     // --- Dynamic seam ------------------------------------------------------
     //
     // The methods above are the facet *frontend*: a Rust `Model` is reflected
@@ -964,6 +1043,24 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
         self
     }
 
+    /// Register an action from a hand-built config `block` and an erased
+    /// [`DynAction`] handler, bypassing facet reflection (the dynamic seam for
+    /// non-Rust frontends).
+    pub fn dyn_action(
+        mut self,
+        name: impl Into<String>,
+        block: Block,
+        handler: Arc<dyn DynAction>,
+    ) -> Self {
+        let name = name.into();
+        self.schema.actions.push(ActionSchema {
+            name: name.clone(),
+            block,
+        });
+        self.actions.insert(name, handler);
+        self
+    }
+
     /// Register a provider-defined function under `name` with its `handler`.
     /// Functions are pure (no provider configuration or state), so this needs no
     /// `configure` step. The signature is reflected from the handler's `Params`
@@ -1029,6 +1126,7 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
                 let ephemeral_factories = Arc::new(self.ephemeral_factories);
                 let list_factories = Arc::new(self.list_factories);
                 let state_store_factories = Arc::new(self.state_store_factories);
+                let action_factories = Arc::new(self.action_factories);
                 let configure: Arc<ConfigureFn> = Arc::new(move |config: Value| {
                     let meta_fn = Arc::clone(&meta_fn);
                     let factories = Arc::clone(&factories);
@@ -1036,6 +1134,7 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
                     let ephemeral_factories = Arc::clone(&ephemeral_factories);
                     let list_factories = Arc::clone(&list_factories);
                     let state_store_factories = Arc::clone(&state_store_factories);
+                    let action_factories = Arc::clone(&action_factories);
                     Box::pin(async move {
                         let meta = meta_fn(config).await?;
                         let mut resources = ResourceMap::with_capacity(factories.len());
@@ -1060,12 +1159,17 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
                         for (name, make) in state_store_factories.iter() {
                             state_stores.insert(name.clone(), make(Arc::clone(&meta)));
                         }
+                        let mut actions = ActionMap::with_capacity(action_factories.len());
+                        for (name, make) in action_factories.iter() {
+                            actions.insert(name.clone(), make(Arc::clone(&meta)));
+                        }
                         Ok(Configured {
                             resources,
                             data_sources,
                             ephemerals,
                             list_resources,
                             state_stores,
+                            actions,
                         })
                     }) as BoxFuture<Result<Configured, Diagnostics>>
                 });
@@ -1077,7 +1181,8 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
                 || !self.data_factories.is_empty()
                 || !self.ephemeral_factories.is_empty()
                 || !self.list_factories.is_empty()
-                || !self.state_store_factories.is_empty() =>
+                || !self.state_store_factories.is_empty()
+                || !self.action_factories.is_empty() =>
             {
                 return Err(BuildError::MissingConfigure)
             }
@@ -1091,6 +1196,7 @@ impl<M: Send + Sync + 'static> ProviderBuilder<M> {
             eager_ephemeral: Arc::new(self.ephemerals),
             eager_list: Arc::new(self.list_resources),
             eager_state_store: Arc::new(self.state_stores),
+            eager_action: Arc::new(self.actions),
             functions: Arc::new(self.functions),
             config_ty,
             configure,
@@ -1152,12 +1258,14 @@ impl ProviderBuilder<()> {
             ephemerals: self.ephemerals,
             list_resources: self.list_resources,
             state_stores: self.state_stores,
+            actions: self.actions,
             functions: self.functions,
             factories: Vec::new(),
             data_factories: Vec::new(),
             ephemeral_factories: Vec::new(),
             list_factories: Vec::new(),
             state_store_factories: Vec::new(),
+            action_factories: Vec::new(),
             configure: Some(meta_fn),
             dyn_configure: self.dyn_configure,
             validate_config: self.validate_config,
