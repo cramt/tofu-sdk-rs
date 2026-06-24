@@ -176,19 +176,22 @@ names object / array-of-object / set-marked-array fields to emit as nested
 `block_from_schema_json` parses the `blocks` JSON into IR `NestedBlock`s). So the
 TS frontend gets HCL `name { … }` blocks without the facet `terraform::block`
 marker — see `examples/cloudflare-provider.ts` (every disposition on its field).
-- **Gap — quotient types / semantic equality don't reach TS yet.** The other
-  half of the design law (a *quotient* type whose constructor canonicalizes, so
-  `==` on the representative is the equality — `#[facet(opaque, proxy = String)]`
-  on the Rust side) has **no TS path**: `.transform`/`z.codec` (the natural Zod
-  expression of "parse, don't validate") throws in `z.toJSONSchema` *and*
-  `ctyFromZod` rejects it with a clear error, because suppressing the resulting
-  spurious diffs needs the runtime normalization seam (`normalize.rs`'s
-  `keep_prior`/`Canon`) which `DynResource::semantic_equality` only defaults for
-  the dynamic seam — the Node binding never builds a `Canon`. Wiring it would mean
-  letting the addon declare per-attribute canonicalizers (a `normalize`
-  disposition) and making the `keep_prior` pre-pass able to call an **async** JS
-  canonicalizer through the threadsafe-function seam. Deferred; tracked as a
-  follow-up.
+- **Quotient types / semantic equality reach TS too** (the other half of the
+  design law — a *quotient* type whose constructor canonicalizes, so `==` on the
+  representative is the equality — `#[facet(opaque, proxy = String)]` on the Rust
+  side). The Zod expression is **a `z.transform` used as the tail of a pipe**
+  (`z.string().transform(...)` — parse-don't-validate); its cty derives from the
+  pipe's `in` (`ctyFromZod` follows `d.in`), so the quotient is a real schema
+  field. A bare standalone `.transform` (no `in`) is still rejected by
+  `ctyFromZod` with a clear "use it as the tail of a pipe" error. Diff
+  suppression rides **`modify_plan`, entirely in TS** — deliberately *not* the
+  Rust `Canon`/`keep_prior` seam, so there is no async hop into JS: the TS
+  `resource()` wrapper auto-harvests quotient fields (`transformFields` in
+  `ts/schema.ts`) and, in its `modifyPlan` shim (`ts/index.ts`), runs the
+  transform on prior vs proposed and pushes equal fields onto `keepPrior` (the TS
+  mirror of `Canon::harvest`; `PlanModifications` gained `keep_prior` so the
+  dynamic seam can express it). The canonicalizer stays in JS and runs
+  synchronously, so the threadsafe-function seam is untouched.
 
 **Packaging is a single self-contained file.** A provider needs to be an
 executable named `terraform-provider-<name>`; for Node that's a shebang'd JS file
