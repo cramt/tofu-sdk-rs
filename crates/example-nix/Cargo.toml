@@ -1,0 +1,38 @@
+[package]
+name = "example-nix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+# A provider for the "nix stuff": a `nix_build` data source that realises a flake
+# attribute (returning its store path) and a `nix_deploy` resource that copies
+# that closure to a target host and activates it. Built with this SDK; intended
+# to eventually replace the nixos-anywhere modules used by infra-dev-toolbox.
+
+[[bin]]
+name = "example-nix"
+path = "src/main.rs"
+
+[dependencies]
+facet = { workspace = true }
+terraform-provider = { workspace = true }
+terraform-runtime = { workspace = true }
+# `resource("nix_deploy")` is a struct-payload attribute whose expansion names
+# the `terraform_attrs` crate by path, so it must be a direct dependency.
+terraform-attrs = { workspace = true }
+# The `nix_build` data source uses the dynamic seam: a hand-built IR `Block`
+# (terraform-ir), the dynamic `Value`/`Type` (terraform-value), and the codec to
+# marshal the typed model (terraform-codec).
+terraform-ir = { workspace = true }
+terraform-value = { workspace = true }
+terraform-codec = { workspace = true }
+# `nix flake prefetch --json` is parsed dynamically with facet-json/facet-value.
+facet-json = { workspace = true }
+facet-value = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util"] }
+
+[lints]
+workspace = true

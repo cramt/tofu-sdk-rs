@@ -398,6 +398,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-nix"
+version = "0.0.0"
+dependencies = [
+ "facet",
+ "facet-json",
+ "facet-value",
+ "terraform-attrs",
+ "terraform-codec",
+ "terraform-ir",
+ "terraform-provider",
+ "terraform-runtime",
+ "terraform-value",
+ "tokio",
+]
+
+[[package]]
 name = "example-postgres"
 version = "0.0.0"
 dependencies = [
